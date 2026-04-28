@@ -1,6 +1,6 @@
 CC      = gcc
 CFLAGS  ?= -O3 -march=native -Wall -Wextra -Wno-unused-parameter -std=c11
-LDFLAGS ?=
+LDFLAGS ?= -lz
 
 SRC = src/zxle.c
 BIN = zxle$(if $(filter Windows_NT,$(OS)),.exe,)
