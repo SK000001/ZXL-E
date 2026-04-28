@@ -4,20 +4,22 @@ Single source of truth for where ZXL-E is, where it's going, and what not to ret
 
 ---
 
-## Current state (2026-04-29, M1 shipped)
+## Current state (2026-04-29, M2 shipped)
 
-M1 walking skeleton works end-to-end. Round-trip OK on the full 8-file corpus. Solid `zxle` is within ~3.7% of xz-9e on this corpus, as expected for an opaque-bytes baseline.
+M1 walking skeleton + M2 ZIP-family unwrap both work end-to-end. Round-trip OK across the full 8-file corpus and the pe-deflate.zip fixture.
 
-**M1 bench (2026-04-29, 8-file mixed corpus, total 6,910,547 B):**
+**Headline M2 result:** `zxle` is **−15.04% vs xz-9e** on a DEFLATE-9 ZIP of 3 PE DLLs (2,265,566 B → 1,923,274 B). All 3 entries re-deflate byte-identically with zlib L9/mem8/default-strategy, so they enter the solid zstd-19 stream as raw bytes.
+
+**Bench (2026-04-29, 8-file mixed corpus, 6,910,547 B):**
 
 | Codec | Ratio vs orig |
 |---|---|
 | zxle (per-file)  | 0.3721 |
 | zstd-19          | 0.3721 |
 | xz-9e            | 0.3524 |
-| **zxle solid**   | **0.3655** (1.78% smaller than per-file) |
+| zxle solid       | 0.3655 (1.78% smaller than per-file) |
 
-zxle solid trails xz-9e by ~3.7% — acceptable for M1 since both are opaque-bytes general codecs and xz has a stronger entropy stage. Wins arrive once M2 unwraps containers.
+The 8-file corpus contains no containers, so M2 doesn't change these numbers vs M1 — only adds 1 byte of overhead per file (the kind tag).
 
 **Phase-0 measurements (2026-04-29)** taken before scaffolding:
 
@@ -50,14 +52,14 @@ Four-stage pipeline, each stage known in isolation; integrated product is the no
 - Magic `ZXLE` + ver + flags header.
 - Round-trip OK on full corpus; solid ratio 0.3655 vs xz-9e 0.3524.
 
-### M2 — ZIP-family unwrap handler
-**Branch:** `feat/m2-zip-unwrap` · **Expected:** −15 to −25% on ZIP-family inputs.
+### M2 — ZIP-family unwrap handler (shipped 2026-04-29)
+- ZIP detection + CD parsing in C, zlib link.
+- Per-entry: try re-deflate at zlib L9/mem8/default-strategy, byte-compare to original. Match → raw bytes go to solid; mismatch → original deflate stream verbatim in recipe.
+- Container format: bumped to v2. Per-entry kind byte (0=opaque, 1=zip-unwrap). For kind=1 the manifest also carries a recipe of STRUCT/REDEFLATE/STORE ops.
+- Out of scope this milestone: ZIP64, encryption, DEFLATE64/BZIP2/LZMA, prefix bytes (self-extractors). All trigger fallback to KIND_OPAQUE so round-trip is preserved.
+- Result: **−15.04% vs xz-9e** on pe-deflate.zip; mixed corpus unaffected.
 
-Detect ZIP magic. Parse central directory. Extract per-entry compressed bytes + local file headers + CD entries verbatim into the recipe. Decompress entry payloads to raw bytes for the solid pass. On unpack: re-DEFLATE each entry with same params, verify CRC matches CD, fall back to storing original compressed bytes if not byte-identical.
-
-Covers: `.zip`, `.docx`, `.xlsx`, `.pptx`, `.jar`, `.apk`, `.epub`, `.odt`.
-
-Failure mode: DEFLATE encoder nondeterminism. zlib's level-9 output is reproducible from same input given same zlib version, but third-party deflators (7-zip, kzip, AdvanceCOMP) produce different bytes. Mitigation: store original compressed bytes when re-DEFLATE-then-CRC-mismatch.
+Real-world DEFLATE drift (third-party deflators like 7-zip, kzip, AdvanceCOMP not matching zlib's L9 output) will reduce the win on those archives — store-orig fallback ensures correctness, not size. Confirm with a wider ZIP fixture set in M3.
 
 ### M3 — Per-stream format-aware recompressors
 **Branch:** `feat/m3-recompressors` · **Expected:** large wins per stream.
