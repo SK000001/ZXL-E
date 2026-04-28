@@ -1,0 +1,9 @@
+zxle
+zxle.exe
+*.o
+*.tmp
+*.zxle
+tests/corpus/
+tests/unpacked/
+tests/baseline/
+logs/
