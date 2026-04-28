@@ -4,9 +4,20 @@ Single source of truth for where ZXL-E is, where it's going, and what not to ret
 
 ---
 
-## Current state (2026-04-29, project inception — walking skeleton)
+## Current state (2026-04-29, M1 shipped)
 
-No bench numbers yet. The walking skeleton (M1) ships first; numbers land with it.
+M1 walking skeleton works end-to-end. Round-trip OK on the full 8-file corpus. Solid `zxle` is within ~3.7% of xz-9e on this corpus, as expected for an opaque-bytes baseline.
+
+**M1 bench (2026-04-29, 8-file mixed corpus, total 6,910,547 B):**
+
+| Codec | Ratio vs orig |
+|---|---|
+| zxle (per-file)  | 0.3721 |
+| zstd-19          | 0.3721 |
+| xz-9e            | 0.3524 |
+| **zxle solid**   | **0.3655** (1.78% smaller than per-file) |
+
+zxle solid trails xz-9e by ~3.7% — acceptable for M1 since both are opaque-bytes general codecs and xz has a stronger entropy stage. Wins arrive once M2 unwraps containers.
 
 **Phase-0 measurements (2026-04-29)** taken before scaffolding:
 
@@ -34,17 +45,10 @@ Four-stage pipeline, each stage known in isolation; integrated product is the no
 
 ## Roadmap
 
-### M1 — Walking skeleton (in progress)
-**Branch:** `feat/m1-skeleton` (will be the first feature branch on the new repo).
-
-Scope:
-- `zxle pack <out.zxle> <files...>` and `zxle unpack <in.zxle> <outdir>`.
-- File format: `[magic "ZXLE"][ver][flags][manifest_size][manifest][zstd-19 payload]`.
-- Manifest stores file name, size, mode for each entry; payload is the solid concatenation passed through `zstd -19 --long=27`.
-- Round-trip: extract files byte-identical to inputs.
-- No format-aware unwrap yet. Treats every input as opaque bytes.
-
-Success criterion: round-trip OK on the existing ZXL test corpus + the python-built `pe-deflate.zip`. Ratio should match xz-9e within a few percent on similar files.
+### M1 — Walking skeleton (shipped 2026-04-29)
+- `zxle pack` / `zxle unpack` working, manifest + solid zstd-19 payload.
+- Magic `ZXLE` + ver + flags header.
+- Round-trip OK on full corpus; solid ratio 0.3655 vs xz-9e 0.3524.
 
 ### M2 — ZIP-family unwrap handler
 **Branch:** `feat/m2-zip-unwrap` · **Expected:** −15 to −25% on ZIP-family inputs.

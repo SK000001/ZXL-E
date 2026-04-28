@@ -4,18 +4,16 @@ Recursive format-aware transform pipeline for general-purpose compression.
 
 Goal: be the smallest archive across **every** file type, not just one. Sister project to [ZXL](../Zxl) (which targets PE binaries specifically). ZXL-E uses ZXL as one of its backends when it detects PE streams.
 
-## Status (2026-04-29, walking skeleton)
+## Status (2026-04-29, M1 shipped)
 
 | Stage | Status |
 |---|---|
 | M0 Phase-0 measurement | done — ZIP unwrap saves 20.45% over opaque-xz-9e on a 3-DLL test ZIP |
-| M1 Walking skeleton (manifest + solid zstd-19) | in progress |
-| M2 ZIP-family unwrap handler | pending |
+| M1 Walking skeleton (manifest + solid zstd-19) | shipped — solid 0.3655 vs xz-9e 0.3524 on 8-file corpus |
+| M2 ZIP-family unwrap handler | next |
 | M3 Per-stream recompressors (brunsli, cjxl, reflate) | pending |
 | M4 Cross-stream content-defined ordering | pending |
 | M5 Neural residual fallback | pending |
-
-No benchmark numbers yet — first numbers land with M1.
 
 ## Architecture (target)
 
@@ -48,5 +46,4 @@ M1 packs arbitrary files with a manifest and a single solid zstd-19 payload — 
 ## See also
 
 - [roadmap.md](roadmap.md) — current state, what's shipped, what's next, tried-and-reverted graveyard.
-- [workflow.md](workflow.md) — read first when starting a new session.
 - [tests/bench.sh](tests/bench.sh) — bench script.
