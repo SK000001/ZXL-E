@@ -77,9 +77,9 @@ Route each stream to its strongest recompressor. Tracked as sub-milestones.
 #### M3b — pending sub-milestones
 **Branch:** `feat/m3-*` · **Expected:** large wins per stream.
 
-- JPEG streams: brunsli (−22%).
+- JPEG streams: brunsli (−22%). Picked next — already-compressed wall means no solid-mode benefit is given up.
 - PNG: cjxl lossless (−10 to −30%).
-- PE streams (.exe / .dll detected by MZ + PE signature): shell out to ZXL.
+- ~~PE streams via ZXL~~ — see "Tried and reverted"; revisit once ZXL has a multi-stream/solid mode.
 - MP3: packMP3 (−25%).
 
 Each recompressor lives behind an availability check; missing recompressors fall through to opaque-zstd.
@@ -98,7 +98,21 @@ Small autoregressive byte predictor (NNCP-class). Default-off due to slowdown; u
 
 ## Tried and reverted
 
-(empty — project just started)
+### PE-via-ZXL routing as an M3 sub-milestone (2026-04-30, abandoned pre-implementation)
+
+Plan: detect PE streams (top-level files and ZIP entries after unwrap) and route the inflated bytes through the sister project ZXL instead of the solid zstd-19 stream.
+
+**Measured per-file ZXL on the 3 corpus DLLs:**
+- ntdll.dll: 990,630 (vs zstd-19 1,012,264 → −2.14%)
+- kernel32.dll: 336,175 (vs 336,518 → −0.10%)
+- user32.dll: 612,924 (vs 620,237 → −1.18%)
+- Sum ZXL 1,939,729 vs sum zstd-19 1,969,019 → −1.49% per-file.
+
+**Why it regresses on the headline numbers:** the headlines are solid-mode (whole corpus or whole ZIP fed to zstd-19 `--long=27`), and solid mode captures cross-DLL similarity that per-file ZXL cannot. On the M2 fixture `pe-deflate.zip`, current zxle = 1,923,274 B (3 inflated DLLs concatenated into solid). Routing them out into per-entry ZXL blobs gives 1,939,729 B — **~0.85% regression** vs M3a baseline. Same shape on `pe-deflate-l6.zip` and the 8-file mixed corpus solid (estimated ~0.6% regression).
+
+**Structural reason:** zstd-19 long-window-27 on concatenated similar PE files is already very strong. ZXL's per-file PE modeling beats per-file zstd-19 by 1–2%, but loses to solid-zstd-19 which sees all PEs at once.
+
+**Don't retry until:** ZXL itself gains a solid/multi-stream input mode (a change in `../Zxl`, not here), or the corpus grows past what solid mode can hold in one pass.
 
 ---
 
