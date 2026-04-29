@@ -9,8 +9,11 @@
  *     u16 path_len, path bytes,
  *     u64 original_size,
  *     u32 mode,
- *     u8  kind                    -- 0=opaque, 1=zip-unwrap
+ *     u8  kind                    -- 0=opaque, 1=zip-unwrap, 2=jpeg-brunsli
  *     [if kind==1] u32 recipe_len, recipe_bytes
+ *     [if kind==2] u32 brn_len,    brn_bytes      -- brunsli blob; entry
+ *                                                    contributes nothing to
+ *                                                    the solid stream
  *   zstd-19 payload: solid concatenation of "raw input bytes" (kind=0) or
  *     "raw entry bytes from re-deflatable / stored ZIP entries" (kind=1),
  *     in manifest order.
@@ -41,8 +44,10 @@
 #ifdef _WIN32
 #include <direct.h>
 #define ZXLE_MKDIR(p) _mkdir(p)
+#define ZXLE_DEVNULL "NUL"
 #else
 #define ZXLE_MKDIR(p) mkdir((p), 0755)
+#define ZXLE_DEVNULL "/dev/null"
 #endif
 
 #define ZXLE_MAGIC "ZXLE"
@@ -50,6 +55,7 @@
 
 #define KIND_OPAQUE 0
 #define KIND_ZIP    1
+#define KIND_JPEG   2
 
 #define OP_STRUCT    0x00
 #define OP_REDEFLATE 0x01
@@ -84,6 +90,10 @@ static void run(const char *cmd) {
     int rc = system(cmd);
     if (rc != 0) { fprintf(stderr, "zxle: command failed (%d): %s\n", rc, cmd); exit(1); }
 }
+
+/* Quietly try a command. Returns 0 on success, non-zero rc otherwise.
+ * Used for availability checks and best-effort routing. */
+static int try_run(const char *cmd) { return system(cmd); }
 
 static long long fsize(const char *path) {
     struct stat st;
@@ -454,7 +464,43 @@ typedef struct {
     uint32_t    mode;
     uint8_t     kind;
     Buf         recipe;     /* kind=1 only */
+    Buf         brn;        /* kind=2 only */
 } PackEntry;
+
+/* Try brunsli on a JPEG. Returns 0 on success and fills *out (caller frees
+ * via buf_free). Returns -1 on detection miss or if cbrunsli/dbrunsli are
+ * unavailable / refuse the file / round-trip fails. tmp_prefix is used to
+ * derive scratch paths so concurrent packs don't collide. */
+static int pack_jpeg(const uint8_t *p, size_t n, const char *src_path,
+                     const char *tmp_prefix, Buf *out) {
+    if (n < 4 || p[0] != 0xFF || p[1] != 0xD8 || p[2] != 0xFF) return -1;
+
+    char tmp_brn[1024], tmp_jpg[1024], cmd[4096];
+    snprintf(tmp_brn, sizeof(tmp_brn), "%s.brn.tmp", tmp_prefix);
+    snprintf(tmp_jpg, sizeof(tmp_jpg), "%s.brnrt.tmp", tmp_prefix);
+
+    snprintf(cmd, sizeof(cmd), "cbrunsli \"%s\" \"%s\" >%s 2>&1", src_path, tmp_brn, ZXLE_DEVNULL);
+    if (try_run(cmd) != 0) return -1;
+
+    /* Verify round-trip: dbrunsli back to JPEG, cmp to original. */
+    snprintf(cmd, sizeof(cmd), "dbrunsli \"%s\" \"%s\" >%s 2>&1", tmp_brn, tmp_jpg, ZXLE_DEVNULL);
+    if (try_run(cmd) != 0) { unlink(tmp_brn); return -1; }
+    size_t rt_n = 0;
+    uint8_t *rt = read_whole_file(tmp_jpg, &rt_n);
+    int ok = (rt_n == n && memcmp(rt, p, n) == 0);
+    free(rt);
+    unlink(tmp_jpg);
+    if (!ok) { unlink(tmp_brn); return -1; }
+
+    size_t brn_n = 0;
+    uint8_t *brn = read_whole_file(tmp_brn, &brn_n);
+    unlink(tmp_brn);
+    /* Only commit if the brunsli blob is actually smaller than the JPEG. */
+    if (brn_n >= n) { free(brn); return -1; }
+    buf_append(out, brn, brn_n);
+    free(brn);
+    return 0;
+}
 
 static int do_pack(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: zxle pack <out.zxle> <files...>\n"); return 1; }
@@ -477,11 +523,20 @@ static int do_pack(int argc, char **argv) {
         ents[i].orig_size = fsz;
         ents[i].mode      = (uint32_t)st.st_mode;
         buf_init(&ents[i].recipe);
+        buf_init(&ents[i].brn);
 
         int unwrapped = 0;
         if (fsz >= 22 && fb[0]==0x50 && fb[1]==0x4B) {
             if (pack_zip(fb, fsz, &ents[i].recipe, &solid) == 0) {
                 ents[i].kind = KIND_ZIP;
+                unwrapped = 1;
+            }
+        }
+        if (!unwrapped && fsz >= 4 && fb[0]==0xFF && fb[1]==0xD8 && fb[2]==0xFF) {
+            char tmp_prefix[1024];
+            snprintf(tmp_prefix, sizeof(tmp_prefix), "%s.%d", out, i);
+            if (pack_jpeg(fb, fsz, files[i], tmp_prefix, &ents[i].brn) == 0) {
+                ents[i].kind = KIND_JPEG;
                 unwrapped = 1;
             }
         }
@@ -511,7 +566,8 @@ static int do_pack(int argc, char **argv) {
     size_t mlen = 0;
     for (int i = 0; i < n; i++) {
         mlen += 2 + strlen(ents[i].name) + 8 + 4 + 1;
-        if (ents[i].kind == KIND_ZIP) mlen += 4 + ents[i].recipe.n;
+        if (ents[i].kind == KIND_ZIP)  mlen += 4 + ents[i].recipe.n;
+        if (ents[i].kind == KIND_JPEG) mlen += 4 + ents[i].brn.n;
     }
 
     FILE *o = fopen(out, "wb");
@@ -531,6 +587,10 @@ static int do_pack(int argc, char **argv) {
             wu32(o, (uint32_t)ents[i].recipe.n);
             if (ents[i].recipe.n > 0)
                 fwrite(ents[i].recipe.p, 1, ents[i].recipe.n, o);
+        } else if (ents[i].kind == KIND_JPEG) {
+            wu32(o, (uint32_t)ents[i].brn.n);
+            if (ents[i].brn.n > 0)
+                fwrite(ents[i].brn.p, 1, ents[i].brn.n, o);
         }
     }
     FILE *zf = fopen(tmp_zst, "rb");
@@ -543,7 +603,7 @@ static int do_pack(int argc, char **argv) {
 
     unlink(tmp_concat);
     unlink(tmp_zst);
-    for (int i = 0; i < n; i++) buf_free(&ents[i].recipe);
+    for (int i = 0; i < n; i++) { buf_free(&ents[i].recipe); buf_free(&ents[i].brn); }
     buf_free(&solid);
     free(ents);
 
@@ -561,6 +621,8 @@ typedef struct {
     uint8_t  kind;
     uint8_t *recipe;        /* points into manifest buffer */
     uint32_t recipe_len;
+    uint8_t *brn;           /* points into manifest buffer */
+    uint32_t brn_len;
 } UnpackEntry;
 
 static int do_unpack(int argc, char **argv) {
@@ -596,15 +658,20 @@ static int do_unpack(int argc, char **argv) {
         ents[count].orig_size = (uint64_t)r32(manifest + mp) | ((uint64_t)r32(manifest + mp + 4) << 32); mp += 8;
         ents[count].mode = r32(manifest + mp); mp += 4;
         ents[count].kind = manifest[mp]; mp += 1;
+        ents[count].recipe = NULL; ents[count].recipe_len = 0;
+        ents[count].brn    = NULL; ents[count].brn_len    = 0;
         if (ents[count].kind == KIND_ZIP) {
             if (mp + 4 > mlen) die("recipe len truncated");
             ents[count].recipe_len = r32(manifest + mp); mp += 4;
             if (mp + ents[count].recipe_len > mlen) die("recipe overflow");
             ents[count].recipe = manifest + mp;
             mp += ents[count].recipe_len;
-        } else {
-            ents[count].recipe = NULL;
-            ents[count].recipe_len = 0;
+        } else if (ents[count].kind == KIND_JPEG) {
+            if (mp + 4 > mlen) die("brn len truncated");
+            ents[count].brn_len = r32(manifest + mp); mp += 4;
+            if (mp + ents[count].brn_len > mlen) die("brn overflow");
+            ents[count].brn = manifest + mp;
+            mp += ents[count].brn_len;
         }
         count++;
     }
@@ -641,14 +708,27 @@ static int do_unpack(int argc, char **argv) {
             if (solid_pos + ents[i].orig_size > solid_len) die("opaque overflow");
             if (ents[i].orig_size > 0 && fwrite(solid + solid_pos, 1, ents[i].orig_size, of) != ents[i].orig_size) die("fwrite opaque");
             solid_pos += ents[i].orig_size;
+            fclose(of);
         } else if (ents[i].kind == KIND_ZIP) {
             unpack_recipe(ents[i].recipe, ents[i].recipe_len,
                           solid, solid_len, &solid_pos,
                           of, ents[i].orig_size);
+            fclose(of);
+        } else if (ents[i].kind == KIND_JPEG) {
+            /* Write brn blob to a temp, dbrunsli to the output path. */
+            fclose(of);
+            char tmp_brn[2048], cmd[4096];
+            snprintf(tmp_brn, sizeof(tmp_brn), "%s.brn.tmp", p);
+            FILE *bf = fopen(tmp_brn, "wb");
+            if (!bf) die("fopen tmp brn");
+            if (ents[i].brn_len > 0 && fwrite(ents[i].brn, 1, ents[i].brn_len, bf) != ents[i].brn_len) die("fwrite tmp brn");
+            fclose(bf);
+            snprintf(cmd, sizeof(cmd), "dbrunsli \"%s\" \"%s\" >%s 2>&1", tmp_brn, p, ZXLE_DEVNULL);
+            run(cmd);
+            unlink(tmp_brn);
         } else {
             die("unknown kind");
         }
-        fclose(of);
     }
     if (solid_pos != solid_len) die("solid stream not fully consumed");
 

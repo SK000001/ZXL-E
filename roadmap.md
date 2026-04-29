@@ -4,9 +4,11 @@ Single source of truth for where ZXL-E is, where it's going, and what not to ret
 
 ---
 
-## Current state (2026-04-30, M3-preflate shipped)
+## Current state (2026-04-30, M3b shipped)
 
-M1 + M2 + the first M3 sub-milestone (preflate-backed DEFLATE recompressor) ship end-to-end. Round-trip OK across the 8-file corpus and both ZIP fixtures.
+M1 + M2 + M3a (preflate) + M3b (brunsli) ship end-to-end. Round-trip OK across the 8-file corpus, both ZIP fixtures, and the JPEG fixture.
+
+**Headline M3b result:** `zxle` is **−27.15% vs xz-9e** on a 162,822 B JPEG (synth.jpg → 117,473 B). Top-level JPEG files are detected by SOI marker, routed through `cbrunsli`, verified by round-trip `dbrunsli` + cmp at pack time, and stored as a brunsli blob in the manifest (bypassing solid mode entirely — JPEGs hit the already-compressed wall under zstd, so no solid benefit is given up).
 
 **Headline M3a result:** `zxle` is **−15.39% vs xz-9e** on a zlib-L6 ZIP of 3 PE DLLs (2,276,846 B → 1,924,666 B). All 3 entries miss M2's L9-redeflate fast path, get split via preflate (215 B reconstruction info on the largest stream), and the unpacked bytes flow into the solid zstd-19 stream.
 
@@ -74,13 +76,21 @@ Route each stream to its strongest recompressor. Tracked as sub-milestones.
 - Measured: −15.39% vs xz-9e on `pe-deflate-l6.zip` (zlib-L6 ZIP that completely misses M2's fast path); existing M2 fixture preserved at −15.04%.
 - Build dep: `make preflate-deps` clones + patches + builds preflate via cmake/MinGW. Without it the static lib is missing and the main `make` errors.
 
-#### M3b — pending sub-milestones
+#### M3b — JPEG via brunsli (shipped 2026-04-30)
+- Vendored `third_party/brunsli` (Google brunsli, with brotli + highway via FetchContent). Built static via cmake/MinGW. `cbrunsli` / `dbrunsli` CLI wrapped by `system()` shell-out (same pattern as `zstd`/`xz`).
+- New container kind `KIND_JPEG = 2`. Manifest entry: `(u32 brn_len)(brn_bytes)`. Solid stream is not consumed.
+- Detection at top level: SOI marker `FF D8 FF`. Pack: `cbrunsli`, then verify by `dbrunsli` + cmp before committing. Any failure (binary missing, format unsupported, round-trip mismatch, blob ≥ original) → fall through to KIND_OPAQUE.
+- Measured: −27.15% vs xz-9e on `synth.jpg` (1024×768 RGB JPEG q=85). All other bench numbers preserved exactly.
+- Build dep: `make brunsli-deps`. Runtime dep: `cbrunsli`/`dbrunsli` on PATH (bench.sh auto-prepends the locally-built copies).
+- Out of scope this milestone: JPEGs inside ZIPs (top-level only); progressive JPEG variants brunsli rejects fall through automatically.
+
+#### M3c — pending sub-milestones
 **Branch:** `feat/m3-*` · **Expected:** large wins per stream.
 
-- JPEG streams: brunsli (−22%). Picked next — already-compressed wall means no solid-mode benefit is given up.
 - PNG: cjxl lossless (−10 to −30%).
 - ~~PE streams via ZXL~~ — see "Tried and reverted"; revisit once ZXL has a multi-stream/solid mode.
 - MP3: packMP3 (−25%).
+- JPEGs *inside* ZIP entries (extending M3b detection through the unwrap path).
 
 Each recompressor lives behind an availability check; missing recompressors fall through to opaque-zstd.
 

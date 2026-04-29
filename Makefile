@@ -41,7 +41,19 @@ preflate-deps:
 	@cd $(PREFLATE_DIR)/build && cmake -G "MinGW Makefiles" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ..
 	@cd $(PREFLATE_DIR)/build && mingw32-make preflate || true
 
+BRUNSLI_DIR = third_party/brunsli
+
+brunsli-deps:
+	@if [ ! -d $(BRUNSLI_DIR) ]; then \
+	  mkdir -p third_party && \
+	  git clone --depth 1 --recurse-submodules https://github.com/google/brunsli.git $(BRUNSLI_DIR); \
+	fi
+	@mkdir -p $(BRUNSLI_DIR)/build
+	@cd $(BRUNSLI_DIR)/build && cmake -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ..
+	@cd $(BRUNSLI_DIR)/build && mingw32-make -j4 cbrunsli dbrunsli
+	@echo "brunsli built. Add $(PWD)/$(BRUNSLI_DIR)/build/artifacts to PATH, or use tests/bench.sh which auto-detects."
+
 clean:
 	rm -f $(BIN) src/*.o tests/*.zxle tests/*.tmp
 
-.PHONY: all clean preflate-deps
+.PHONY: all clean preflate-deps brunsli-deps

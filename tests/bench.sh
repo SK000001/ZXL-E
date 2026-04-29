@@ -20,6 +20,13 @@ FILES="${ZXLE_FILES:-$DEFAULT_FILES}"
 mkdir -p tests/baseline tests/unpacked
 make -s all
 
+# Auto-discover locally-built brunsli binaries so JPEG routing engages.
+if [ -x third_party/brunsli/build/artifacts/cbrunsli.exe ] || \
+   [ -x third_party/brunsli/build/artifacts/cbrunsli ]; then
+    PATH="$PWD/third_party/brunsli/build/artifacts:$PATH"
+    export PATH
+fi
+
 BIN=./zxle
 [ -x ./zxle.exe ] && BIN=./zxle.exe
 
@@ -103,3 +110,22 @@ bench_zip() {
 
 bench_zip "M2 ZIP-unwrap"       tests/corpus/pe-deflate.zip
 bench_zip "M3 preflate (L6 ZIP)" tests/corpus/pe-deflate-l6.zip
+
+# M3b: JPEG via brunsli. Same shape as bench_zip, but compares brunsli-routed
+# zxle against xz-9e (which hits the already-compressed wall).
+JPG=tests/corpus/synth.jpg
+if [ -f "$JPG" ]; then
+    base=$(basename "$JPG")
+    echo
+    echo "M3b brunsli (JPEG) ($base):"
+    "$BIN" pack "tests/baseline/$base.zxle" "$JPG" >/dev/null 2>&1
+    rm -rf "tests/unpacked/$base.d" && mkdir -p "tests/unpacked/$base.d"
+    "$BIN" unpack "tests/baseline/$base.zxle" "tests/unpacked/$base.d" >/dev/null 2>&1
+    if cmp -s "$JPG" "tests/unpacked/$base.d/$base"; then JRT=OK; else JRT=FAIL; fi
+    J_ORIG=$(stat -c%s "$JPG")
+    J_ZXLE=$(stat -c%s "tests/baseline/$base.zxle")
+    J_XZ=$(xz -9e -c "$JPG" 2>/dev/null | wc -c)
+    J_ZSTD=$(zstd -19 -q -c "$JPG" 2>/dev/null | wc -c)
+    printf "  orig=%d  zxle=%d  zstd-19=%d  xz-9e=%d  rt=%s\n" "$J_ORIG" "$J_ZXLE" "$J_ZSTD" "$J_XZ" "$JRT"
+    printf "  zxle vs xz-9e: %s\n" "$(awk -v a="$J_ZXLE" -v b="$J_XZ" 'BEGIN{printf "%.2f%%", (a-b)*100/b}')"
+fi
