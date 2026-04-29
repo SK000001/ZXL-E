@@ -83,18 +83,23 @@ echo "solid (one zxle archive, all files):"
 printf "  zxle solid         %d  ratio=%s  rt=%s\n" "$SOLID_SZ" "$(ratio "$SOLID_SZ" "$SUM_ORIG")" "$SOLID_RT"
 printf "  vs sum-individual  %s smaller\n" "$(awk -v a="$SOLID_SZ" -v b="$SUM_ZXLE" 'BEGIN{printf "%.2f%%", (b-a)*100/b}')"
 
-# M2: ZIP-family unwrap. If a ZIP is present, bench it explicitly.
-ZIP=tests/corpus/pe-deflate.zip
-if [ -f "$ZIP" ]; then
+bench_zip() {
+    local label="$1" ZIP="$2"
+    [ -f "$ZIP" ] || return
+    local base; base=$(basename "$ZIP")
     echo
-    echo "M2 ZIP-unwrap (pe-deflate.zip):"
-    "$BIN" pack tests/baseline/pe-deflate.zip.zxle "$ZIP" >/dev/null 2>&1
-    "$BIN" unpack tests/baseline/pe-deflate.zip.zxle tests/unpacked/pe-deflate >/dev/null 2>&1
-    if cmp -s "$ZIP" tests/unpacked/pe-deflate/pe-deflate.zip; then ZRT=OK; else ZRT=FAIL; fi
+    echo "$label ($base):"
+    "$BIN" pack "tests/baseline/$base.zxle" "$ZIP" >/dev/null 2>&1
+    "$BIN" unpack "tests/baseline/$base.zxle" "tests/unpacked/$base.d" >/dev/null 2>&1
+    if cmp -s "$ZIP" "tests/unpacked/$base.d/$base"; then ZRT=OK; else ZRT=FAIL; fi
+    local Z_ORIG Z_ZXLE Z_XZ Z_ZSTD
     Z_ORIG=$(stat -c%s "$ZIP")
-    Z_ZXLE=$(stat -c%s tests/baseline/pe-deflate.zip.zxle)
+    Z_ZXLE=$(stat -c%s "tests/baseline/$base.zxle")
     Z_XZ=$(xz -9e -c "$ZIP" 2>/dev/null | wc -c)
     Z_ZSTD=$(zstd -19 --long=27 -q -c "$ZIP" 2>/dev/null | wc -c)
     printf "  orig=%d  zxle=%d  zstd-19=%d  xz-9e=%d  rt=%s\n" "$Z_ORIG" "$Z_ZXLE" "$Z_ZSTD" "$Z_XZ" "$ZRT"
     printf "  zxle vs xz-9e: %s\n" "$(awk -v a="$Z_ZXLE" -v b="$Z_XZ" 'BEGIN{printf "%.2f%%", (a-b)*100/b}')"
-fi
+}
+
+bench_zip "M2 ZIP-unwrap"       tests/corpus/pe-deflate.zip
+bench_zip "M3 preflate (L6 ZIP)" tests/corpus/pe-deflate-l6.zip

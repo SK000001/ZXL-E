@@ -21,6 +21,9 @@
  *   0x01 REDEFLATE  -- consume `len` bytes from solid stream, raw-deflate at
  *                      level 9 default strategy, write the deflate stream
  *   0x02 STORE      -- copy `len` bytes from solid stream to output verbatim
+ *   0x03 PREFLATE   -- (u32 diff_len)(diff_bytes); consume `len` bytes from
+ *                      solid stream, call preflate_reencode(unp, diff) to
+ *                      reproduce the original deflate stream byte-identically.
  *
  * ZIP unwrap scope: zlib-DEFLATE / stored entries; ZIP64 / encryption /
  * DEFLATE64 / BZIP2 / LZMA / prefix bytes -> falls back to KIND_OPAQUE.
@@ -51,6 +54,17 @@
 #define OP_STRUCT    0x00
 #define OP_REDEFLATE 0x01
 #define OP_STORE     0x02
+#define OP_PREFLATE  0x03
+
+/* Defined in preflate_shim.cpp; both return 1 on success, 0 on failure.
+ * Out buffers are malloc'd; release with zxle_preflate_free. */
+int  zxle_preflate_split(const uint8_t *deflate, size_t n,
+                         uint8_t **out_unp, size_t *out_unp_n,
+                         uint8_t **out_diff, size_t *out_diff_n);
+int  zxle_preflate_join (const uint8_t *unp, size_t unp_n,
+                         const uint8_t *diff, size_t diff_n,
+                         uint8_t **out_def, size_t *out_def_n);
+void zxle_preflate_free (void *p);
 
 static void die(const char *msg) {
     fprintf(stderr, "zxle: %s", msg);
@@ -287,7 +301,7 @@ static int pack_zip(const uint8_t *p, size_t n, Buf *recipe, Buf *solid) {
     if (zip_parse(p, n, &ents, &count, &cd_off, &cd_len, &eocd_off, &eocd_len) != 0) return -1;
 
     size_t cursor = 0;
-    int redeflated = 0, store_orig = 0, stored_method = 0;
+    int redeflated = 0, preflated = 0, store_orig = 0, stored_method = 0;
 
     for (uint32_t i = 0; i < count; i++) {
         ZipEntry *e = &ents[i];
@@ -326,14 +340,41 @@ static int pack_zip(const uint8_t *p, size_t n, Buf *recipe, Buf *solid) {
                     buf_u32(recipe, e->raw_size);
                     buf_append(solid, raw, e->raw_size);
                     redeflated++;
+                    free(redef);
+                    free(raw);
                 } else {
-                    buf_u8(recipe, OP_STRUCT);
-                    buf_u32(recipe, e->comp_size);
-                    buf_append(recipe, p + e->payload_off, e->comp_size);
-                    store_orig++;
+                    free(redef);
+                    /* Try preflate split + verify-by-rejoin. */
+                    uint8_t *unp = NULL, *diff = NULL, *rejoin = NULL;
+                    size_t unp_n = 0, diff_n = 0, rejoin_n = 0;
+                    int pf_ok = 0;
+                    if (zxle_preflate_split(p + e->payload_off, e->comp_size,
+                                            &unp, &unp_n, &diff, &diff_n)) {
+                        if (unp_n == e->raw_size &&
+                            zxle_preflate_join(unp, unp_n, diff, diff_n,
+                                               &rejoin, &rejoin_n) &&
+                            rejoin_n == e->comp_size &&
+                            memcmp(rejoin, p + e->payload_off, e->comp_size) == 0) {
+                            buf_u8(recipe, OP_PREFLATE);
+                            buf_u32(recipe, e->raw_size);
+                            buf_u32(recipe, (uint32_t)diff_n);
+                            buf_append(recipe, diff, diff_n);
+                            buf_append(solid, unp, e->raw_size);
+                            preflated++;
+                            pf_ok = 1;
+                        }
+                    }
+                    zxle_preflate_free(unp);
+                    zxle_preflate_free(diff);
+                    zxle_preflate_free(rejoin);
+                    if (!pf_ok) {
+                        buf_u8(recipe, OP_STRUCT);
+                        buf_u32(recipe, e->comp_size);
+                        buf_append(recipe, p + e->payload_off, e->comp_size);
+                        store_orig++;
+                    }
+                    free(raw);
                 }
-                free(redef);
-                free(raw);
             }
         }
         cursor = e->payload_off + e->comp_size;
@@ -346,8 +387,8 @@ static int pack_zip(const uint8_t *p, size_t n, Buf *recipe, Buf *solid) {
         buf_append(recipe, p + cursor, n - cursor);
     }
 
-    fprintf(stderr, "    zip: %u entries (%d redeflate, %d store-orig, %d stored)\n",
-            count, redeflated, store_orig, stored_method);
+    fprintf(stderr, "    zip: %u entries (%d redeflate, %d preflate, %d store-orig, %d stored)\n",
+            count, redeflated, preflated, store_orig, stored_method);
 
     free(ents);
     return 0;
@@ -383,6 +424,20 @@ static void unpack_recipe(const uint8_t *recipe, size_t rlen,
             if (fwrite(solid + *solid_pos, 1, len, out) != len) die("fwrite STORE");
             *solid_pos += len;
             written += len;
+        } else if (op == OP_PREFLATE) {
+            if (r + 4 > rlen) die("recipe PREFLATE diff_len truncated");
+            uint32_t diff_len = r32(recipe + r); r += 4;
+            if (r + diff_len > rlen) die("recipe PREFLATE diff overflow");
+            if (*solid_pos + len > solid_len) die("solid PREFLATE overflow");
+            uint8_t *def = NULL; size_t def_n = 0;
+            if (!zxle_preflate_join(solid + *solid_pos, len,
+                                    recipe + r, diff_len,
+                                    &def, &def_n)) die("preflate_reencode");
+            if (fwrite(def, 1, def_n, out) != def_n) die("fwrite PREFLATE");
+            zxle_preflate_free(def);
+            r += diff_len;
+            *solid_pos += len;
+            written += def_n;
         } else {
             die("unknown recipe op");
         }

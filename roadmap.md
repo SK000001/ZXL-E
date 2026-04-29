@@ -4,11 +4,13 @@ Single source of truth for where ZXL-E is, where it's going, and what not to ret
 
 ---
 
-## Current state (2026-04-29, M2 shipped)
+## Current state (2026-04-30, M3-preflate shipped)
 
-M1 walking skeleton + M2 ZIP-family unwrap both work end-to-end. Round-trip OK across the full 8-file corpus and the pe-deflate.zip fixture.
+M1 + M2 + the first M3 sub-milestone (preflate-backed DEFLATE recompressor) ship end-to-end. Round-trip OK across the 8-file corpus and both ZIP fixtures.
 
-**Headline M2 result:** `zxle` is **−15.04% vs xz-9e** on a DEFLATE-9 ZIP of 3 PE DLLs (2,265,566 B → 1,923,274 B). All 3 entries re-deflate byte-identically with zlib L9/mem8/default-strategy, so they enter the solid zstd-19 stream as raw bytes.
+**Headline M3a result:** `zxle` is **−15.39% vs xz-9e** on a zlib-L6 ZIP of 3 PE DLLs (2,276,846 B → 1,924,666 B). All 3 entries miss M2's L9-redeflate fast path, get split via preflate (215 B reconstruction info on the largest stream), and the unpacked bytes flow into the solid zstd-19 stream.
+
+**Headline M2 result (preserved):** `zxle` is **−15.04% vs xz-9e** on a DEFLATE-9 ZIP of 3 PE DLLs (2,265,566 B → 1,923,274 B). All 3 entries re-deflate byte-identically with zlib L9/mem8/default-strategy, so they enter the solid zstd-19 stream as raw bytes.
 
 **Bench (2026-04-29, 8-file mixed corpus, 6,910,547 B):**
 
@@ -62,10 +64,19 @@ Four-stage pipeline, each stage known in isolation; integrated product is the no
 Real-world DEFLATE drift (third-party deflators like 7-zip, kzip, AdvanceCOMP not matching zlib's L9 output) will reduce the win on those archives — store-orig fallback ensures correctness, not size. Confirm with a wider ZIP fixture set in M3.
 
 ### M3 — Per-stream format-aware recompressors
-**Branch:** `feat/m3-recompressors` · **Expected:** large wins per stream.
 
-Route each stream to its strongest recompressor:
-- DEFLATE streams (inside ZIP, PDF, PNG, gzip): reflate / grittibanzli (~25%).
+Route each stream to its strongest recompressor. Tracked as sub-milestones.
+
+#### M3a — DEFLATE via preflate (shipped 2026-04-30)
+- Vendored `third_party/preflate` (deus-libri 0.3.5; patched `<cstdint>` include in `preflate_seq_chain.h`). Built statically, linked via a small C ABI shim (`src/preflate_shim.cpp`).
+- New recipe op `OP_PREFLATE` (0x03): per ZIP entry, when zlib-L9 byte-redeflate fails, try `preflate_decode` and verify by `preflate_reencode` cmp. Success → unpacked bytes go to solid; reconstruction blob (typically <300 B for MB-scale streams) goes in the recipe.
+- ZIP entries that preflate also can't handle (rare) fall through to the existing STRUCT-store-orig path.
+- Measured: −15.39% vs xz-9e on `pe-deflate-l6.zip` (zlib-L6 ZIP that completely misses M2's fast path); existing M2 fixture preserved at −15.04%.
+- Build dep: `make preflate-deps` clones + patches + builds preflate via cmake/MinGW. Without it the static lib is missing and the main `make` errors.
+
+#### M3b — pending sub-milestones
+**Branch:** `feat/m3-*` · **Expected:** large wins per stream.
+
 - JPEG streams: brunsli (−22%).
 - PNG: cjxl lossless (−10 to −30%).
 - PE streams (.exe / .dll detected by MZ + PE signature): shell out to ZXL.

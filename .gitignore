@@ -7,4 +7,6 @@ zxle.exe
 tests/corpus/
 tests/unpacked/
 tests/baseline/
+tests/scratch/
 logs/
+third_party/
