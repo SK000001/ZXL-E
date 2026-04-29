@@ -27,6 +27,9 @@
  *   0x03 PREFLATE   -- (u32 diff_len)(diff_bytes); consume `len` bytes from
  *                      solid stream, call preflate_reencode(unp, diff) to
  *                      reproduce the original deflate stream byte-identically.
+ *   0x04 JPEG_STORE -- (u32 brn_len)(brn_bytes); brunsli-decode brn to `len`
+ *                      JPEG bytes, write to output. Solid not consumed. Used
+ *                      for STORED ZIP entries whose payload is a JPEG.
  *
  * ZIP unwrap scope: zlib-DEFLATE / stored entries; ZIP64 / encryption /
  * DEFLATE64 / BZIP2 / LZMA / prefix bytes -> falls back to KIND_OPAQUE.
@@ -57,10 +60,11 @@
 #define KIND_ZIP    1
 #define KIND_JPEG   2
 
-#define OP_STRUCT    0x00
-#define OP_REDEFLATE 0x01
-#define OP_STORE     0x02
-#define OP_PREFLATE  0x03
+#define OP_STRUCT     0x00
+#define OP_REDEFLATE  0x01
+#define OP_STORE      0x02
+#define OP_PREFLATE   0x03
+#define OP_JPEG_STORE 0x04
 
 /* Defined in preflate_shim.cpp; both return 1 on success, 0 on failure.
  * Out buffers are malloc'd; release with zxle_preflate_free. */
@@ -263,6 +267,8 @@ static int zip_parse(const uint8_t *p, size_t n,
     return 0;
 }
 
+static int try_brunsli_buf(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *out);
+
 /* Raw-inflate `comp_size` bytes at src into a freshly allocated buffer of
  * exactly raw_size bytes. Returns NULL on failure. */
 static uint8_t *raw_inflate(const uint8_t *src, uint32_t comp_size, uint32_t raw_size) {
@@ -304,14 +310,14 @@ static uint8_t *raw_deflate_l9(const uint8_t *raw, uint32_t raw_size, size_t *ou
 /* On success: builds recipe in *recipe and appends raw entry bytes to *solid.
  * Returns 0 on success, -1 if input isn't a usable ZIP (caller falls back to
  * opaque). */
-static int pack_zip(const uint8_t *p, size_t n, Buf *recipe, Buf *solid) {
+static int pack_zip(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *recipe, Buf *solid) {
     ZipEntry *ents = NULL;
     uint32_t count = 0;
     size_t cd_off = 0, cd_len = 0, eocd_off = 0, eocd_len = 0;
     if (zip_parse(p, n, &ents, &count, &cd_off, &cd_len, &eocd_off, &eocd_len) != 0) return -1;
 
     size_t cursor = 0;
-    int redeflated = 0, preflated = 0, store_orig = 0, stored_method = 0;
+    int redeflated = 0, preflated = 0, store_orig = 0, stored_method = 0, jpeg_stored = 0;
 
     for (uint32_t i = 0; i < count; i++) {
         ZipEntry *e = &ents[i];
@@ -327,12 +333,32 @@ static int pack_zip(const uint8_t *p, size_t n, Buf *recipe, Buf *solid) {
         buf_append(recipe, p + e->lfh_off, lfh_size);
 
         if (e->method == 0) {
-            /* Stored: raw bytes are the payload bytes. */
+            /* Stored: raw bytes are the payload bytes. Try brunsli for JPEGs. */
             if (e->raw_size != e->comp_size) { free(ents); return -1; }
-            buf_u8(recipe, OP_STORE);
-            buf_u32(recipe, e->raw_size);
-            buf_append(solid, p + e->payload_off, e->raw_size);
-            stored_method++;
+            int handled = 0;
+            if (e->raw_size >= 4 &&
+                p[e->payload_off]   == 0xFF &&
+                p[e->payload_off+1] == 0xD8 &&
+                p[e->payload_off+2] == 0xFF) {
+                char tp[2048];
+                snprintf(tp, sizeof(tp), "%s.zj.%u", tmp_prefix, i);
+                Buf brn; buf_init(&brn);
+                if (try_brunsli_buf(p + e->payload_off, e->raw_size, tp, &brn) == 0) {
+                    buf_u8(recipe, OP_JPEG_STORE);
+                    buf_u32(recipe, e->raw_size);
+                    buf_u32(recipe, (uint32_t)brn.n);
+                    buf_append(recipe, brn.p, brn.n);
+                    jpeg_stored++;
+                    handled = 1;
+                }
+                buf_free(&brn);
+            }
+            if (!handled) {
+                buf_u8(recipe, OP_STORE);
+                buf_u32(recipe, e->raw_size);
+                buf_append(solid, p + e->payload_off, e->raw_size);
+                stored_method++;
+            }
         } else {
             /* Deflate: try re-deflate L9 default strategy. */
             uint8_t *raw = raw_inflate(p + e->payload_off, e->comp_size, e->raw_size);
@@ -397,8 +423,8 @@ static int pack_zip(const uint8_t *p, size_t n, Buf *recipe, Buf *solid) {
         buf_append(recipe, p + cursor, n - cursor);
     }
 
-    fprintf(stderr, "    zip: %u entries (%d redeflate, %d preflate, %d store-orig, %d stored)\n",
-            count, redeflated, preflated, store_orig, stored_method);
+    fprintf(stderr, "    zip: %u entries (%d redeflate, %d preflate, %d store-orig, %d stored, %d jpeg-store)\n",
+            count, redeflated, preflated, store_orig, stored_method, jpeg_stored);
 
     free(ents);
     return 0;
@@ -408,7 +434,8 @@ static int pack_zip(const uint8_t *p, size_t n, Buf *recipe, Buf *solid) {
 
 static void unpack_recipe(const uint8_t *recipe, size_t rlen,
                           const uint8_t *solid, size_t solid_len, size_t *solid_pos,
-                          FILE *out, uint64_t expected_size) {
+                          FILE *out, uint64_t expected_size,
+                          const char *tmp_prefix) {
     size_t r = 0;
     uint64_t written = 0;
     while (r < rlen) {
@@ -433,6 +460,28 @@ static void unpack_recipe(const uint8_t *recipe, size_t rlen,
             if (*solid_pos + len > solid_len) die("solid STORE overflow");
             if (fwrite(solid + *solid_pos, 1, len, out) != len) die("fwrite STORE");
             *solid_pos += len;
+            written += len;
+        } else if (op == OP_JPEG_STORE) {
+            if (r + 4 > rlen) die("recipe JPEG_STORE brn_len truncated");
+            uint32_t brn_len = r32(recipe + r); r += 4;
+            if (r + brn_len > rlen) die("recipe JPEG_STORE brn overflow");
+            char tmp_brn[2048], tmp_jpg[2048], cmd[4096];
+            snprintf(tmp_brn, sizeof(tmp_brn), "%s.uj.brn.tmp", tmp_prefix);
+            snprintf(tmp_jpg, sizeof(tmp_jpg), "%s.uj.jpg.tmp", tmp_prefix);
+            FILE *bf = fopen(tmp_brn, "wb");
+            if (!bf) die("fopen tmp brn");
+            if (brn_len > 0 && fwrite(recipe + r, 1, brn_len, bf) != brn_len) die("fwrite tmp brn");
+            fclose(bf);
+            snprintf(cmd, sizeof(cmd), "dbrunsli \"%s\" \"%s\" >%s 2>&1", tmp_brn, tmp_jpg, ZXLE_DEVNULL);
+            run(cmd);
+            unlink(tmp_brn);
+            size_t got_n = 0;
+            uint8_t *got = read_whole_file(tmp_jpg, &got_n);
+            unlink(tmp_jpg);
+            if (got_n != len) die("JPEG_STORE size mismatch");
+            if (fwrite(got, 1, got_n, out) != got_n) die("fwrite JPEG_STORE");
+            free(got);
+            r += brn_len;
             written += len;
         } else if (op == OP_PREFLATE) {
             if (r + 4 > rlen) die("recipe PREFLATE diff_len truncated");
@@ -467,22 +516,26 @@ typedef struct {
     Buf         brn;        /* kind=2 only */
 } PackEntry;
 
-/* Try brunsli on a JPEG. Returns 0 on success and fills *out (caller frees
- * via buf_free). Returns -1 on detection miss or if cbrunsli/dbrunsli are
- * unavailable / refuse the file / round-trip fails. tmp_prefix is used to
- * derive scratch paths so concurrent packs don't collide. */
-static int pack_jpeg(const uint8_t *p, size_t n, const char *src_path,
-                     const char *tmp_prefix, Buf *out) {
+/* Run cbrunsli on a JPEG buffer; verify by dbrunsli + cmp; append the brunsli
+ * blob to *out. Returns 0 on success, -1 on detection miss / tooling failure /
+ * round-trip mismatch / blob >= original. tmp_prefix derives scratch paths. */
+static int try_brunsli_buf(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *out) {
     if (n < 4 || p[0] != 0xFF || p[1] != 0xD8 || p[2] != 0xFF) return -1;
 
-    char tmp_brn[1024], tmp_jpg[1024], cmd[4096];
-    snprintf(tmp_brn, sizeof(tmp_brn), "%s.brn.tmp", tmp_prefix);
-    snprintf(tmp_jpg, sizeof(tmp_jpg), "%s.brnrt.tmp", tmp_prefix);
+    char tmp_in[1024], tmp_brn[1024], tmp_jpg[1024], cmd[4096];
+    snprintf(tmp_in,  sizeof(tmp_in),  "%s.in.jpg.tmp", tmp_prefix);
+    snprintf(tmp_brn, sizeof(tmp_brn), "%s.brn.tmp",    tmp_prefix);
+    snprintf(tmp_jpg, sizeof(tmp_jpg), "%s.brnrt.tmp",  tmp_prefix);
 
-    snprintf(cmd, sizeof(cmd), "cbrunsli \"%s\" \"%s\" >%s 2>&1", src_path, tmp_brn, ZXLE_DEVNULL);
-    if (try_run(cmd) != 0) return -1;
+    FILE *jf = fopen(tmp_in, "wb");
+    if (!jf) return -1;
+    if (n > 0 && fwrite(p, 1, n, jf) != n) { fclose(jf); unlink(tmp_in); return -1; }
+    fclose(jf);
 
-    /* Verify round-trip: dbrunsli back to JPEG, cmp to original. */
+    snprintf(cmd, sizeof(cmd), "cbrunsli \"%s\" \"%s\" >%s 2>&1", tmp_in, tmp_brn, ZXLE_DEVNULL);
+    if (try_run(cmd) != 0) { unlink(tmp_in); return -1; }
+    unlink(tmp_in);
+
     snprintf(cmd, sizeof(cmd), "dbrunsli \"%s\" \"%s\" >%s 2>&1", tmp_brn, tmp_jpg, ZXLE_DEVNULL);
     if (try_run(cmd) != 0) { unlink(tmp_brn); return -1; }
     size_t rt_n = 0;
@@ -495,7 +548,6 @@ static int pack_jpeg(const uint8_t *p, size_t n, const char *src_path,
     size_t brn_n = 0;
     uint8_t *brn = read_whole_file(tmp_brn, &brn_n);
     unlink(tmp_brn);
-    /* Only commit if the brunsli blob is actually smaller than the JPEG. */
     if (brn_n >= n) { free(brn); return -1; }
     buf_append(out, brn, brn_n);
     free(brn);
@@ -527,7 +579,9 @@ static int do_pack(int argc, char **argv) {
 
         int unwrapped = 0;
         if (fsz >= 22 && fb[0]==0x50 && fb[1]==0x4B) {
-            if (pack_zip(fb, fsz, &ents[i].recipe, &solid) == 0) {
+            char tp[1024];
+            snprintf(tp, sizeof(tp), "%s.%d", out, i);
+            if (pack_zip(fb, fsz, tp, &ents[i].recipe, &solid) == 0) {
                 ents[i].kind = KIND_ZIP;
                 unwrapped = 1;
             }
@@ -535,7 +589,7 @@ static int do_pack(int argc, char **argv) {
         if (!unwrapped && fsz >= 4 && fb[0]==0xFF && fb[1]==0xD8 && fb[2]==0xFF) {
             char tmp_prefix[1024];
             snprintf(tmp_prefix, sizeof(tmp_prefix), "%s.%d", out, i);
-            if (pack_jpeg(fb, fsz, files[i], tmp_prefix, &ents[i].brn) == 0) {
+            if (try_brunsli_buf(fb, fsz, tmp_prefix, &ents[i].brn) == 0) {
                 ents[i].kind = KIND_JPEG;
                 unwrapped = 1;
             }
@@ -712,7 +766,7 @@ static int do_unpack(int argc, char **argv) {
         } else if (ents[i].kind == KIND_ZIP) {
             unpack_recipe(ents[i].recipe, ents[i].recipe_len,
                           solid, solid_len, &solid_pos,
-                          of, ents[i].orig_size);
+                          of, ents[i].orig_size, p);
             fclose(of);
         } else if (ents[i].kind == KIND_JPEG) {
             /* Write brn blob to a temp, dbrunsli to the output path. */

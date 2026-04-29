@@ -110,6 +110,7 @@ bench_zip() {
 
 bench_zip "M2 ZIP-unwrap"       tests/corpus/pe-deflate.zip
 bench_zip "M3 preflate (L6 ZIP)" tests/corpus/pe-deflate-l6.zip
+bench_zip "M3b JPEG-in-ZIP"      tests/corpus/zip-with-jpeg.zip
 
 # M3b: JPEG via brunsli. Same shape as bench_zip, but compares brunsli-routed
 # zxle against xz-9e (which hits the already-compressed wall).
