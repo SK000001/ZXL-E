@@ -4,7 +4,7 @@ Recursive format-aware transform pipeline for general-purpose compression.
 
 Goal: be the smallest archive across **every** file type, not just one. Sister project to [ZXL](../Zxl) (which targets PE binaries specifically). ZXL-E uses ZXL as one of its backends when it detects PE streams.
 
-## Status (2026-05-01, M3b shipped + corpus expanded)
+## Status (2026-05-01, M3c-mp3 shipped)
 
 | Stage | Status |
 |---|---|
@@ -13,7 +13,8 @@ Goal: be the smallest archive across **every** file type, not just one. Sister p
 | M2 ZIP-family unwrap (zlib-DEFLATE) | shipped — −15.04% vs xz-9e on pe-deflate.zip; −18.64% on sample.docx |
 | M3a DEFLATE recompressor (preflate) | shipped — −15.39% vs xz-9e on zlib-L6 ZIP fixture |
 | M3b JPEG recompressor (brunsli) | shipped — −27.15% vs xz-9e on synth.jpg; −15.25% on JPEG-in-ZIP fixture |
-| M3c Per-stream recompressors (cjxl PNG, packMP3) | next — MP3 baseline −0.04% confirms need |
+| M3c-mp3 MP3 recompressor (packMP3) | shipped — −13.05% vs xz-9e on synth.mp3 |
+| M3c-png PNG recompressor | pending — needs IDAT-via-preflate (cjxl is not byte-exact on PNG) |
 | M4 Cross-stream content-defined ordering | pending |
 | M5 Neural residual fallback | pending |
 
@@ -33,6 +34,7 @@ Each stage is known in isolation; the integrated product does not exist publicly
 ```
 make preflate-deps   # one-time: clones + patches + builds third_party/preflate
 make brunsli-deps    # one-time: clones + builds third_party/brunsli (cbrunsli/dbrunsli)
+make packmp3-deps    # one-time: clones + builds third_party/packmp3 (packMP3)
 make
 ```
 
