@@ -111,6 +111,30 @@ bench_zip() {
 bench_zip "M2 ZIP-unwrap"       tests/corpus/pe-deflate.zip
 bench_zip "M3 preflate (L6 ZIP)" tests/corpus/pe-deflate-l6.zip
 bench_zip "M3b JPEG-in-ZIP"      tests/corpus/zip-with-jpeg.zip
+bench_zip "DOCX (ZIP/L6 XML)"    tests/corpus/sample.docx
+bench_zip "JAR (ZIP/L6 class)"   tests/corpus/sample.jar
+
+bench_file() {
+    local label="$1" SRC="$2"
+    [ -f "$SRC" ] || return
+    local base; base=$(basename "$SRC")
+    echo
+    echo "$label ($base):"
+    "$BIN" pack "tests/baseline/$base.zxle" "$SRC" >/dev/null 2>&1
+    rm -rf "tests/unpacked/$base.d" && mkdir -p "tests/unpacked/$base.d"
+    "$BIN" unpack "tests/baseline/$base.zxle" "tests/unpacked/$base.d" >/dev/null 2>&1
+    local F_RT=OK
+    cmp -s "$SRC" "tests/unpacked/$base.d/$base" || F_RT=FAIL
+    local F_ORIG F_ZXLE F_XZ F_ZSTD
+    F_ORIG=$(stat -c%s "$SRC")
+    F_ZXLE=$(stat -c%s "tests/baseline/$base.zxle")
+    F_XZ=$(xz -9e -c "$SRC" 2>/dev/null | wc -c)
+    F_ZSTD=$(zstd -19 -q -c "$SRC" 2>/dev/null | wc -c)
+    printf "  orig=%d  zxle=%d  zstd-19=%d  xz-9e=%d  rt=%s\n" "$F_ORIG" "$F_ZXLE" "$F_ZSTD" "$F_XZ" "$F_RT"
+    printf "  zxle vs xz-9e: %s\n" "$(awk -v a="$F_ZXLE" -v b="$F_XZ" 'BEGIN{printf "%.2f%%", (a-b)*100/b}')"
+}
+
+bench_file "MP3 (raw)" tests/corpus/synth.mp3
 
 # M3b: JPEG via brunsli. Same shape as bench_zip, but compares brunsli-routed
 # zxle against xz-9e (which hits the already-compressed wall).
