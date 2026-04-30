@@ -4,13 +4,23 @@ Single source of truth for where ZXL-E is, where it's going, and what not to ret
 
 ---
 
-## Current state (2026-04-30, M3b shipped)
+## Current state (2026-05-01, corpus expanded post-M3b)
 
 M1 + M2 + M3a (preflate) + M3b (brunsli) ship end-to-end. Round-trip OK across the 8-file corpus, both ZIP fixtures, and the JPEG fixture.
 
 **Headline M3b result:** `zxle` is **−27.15% vs xz-9e** on a 162,822 B JPEG (synth.jpg → 117,473 B). Top-level JPEG files are detected by SOI marker, routed through `cbrunsli`, verified by round-trip `dbrunsli` + cmp at pack time, and stored as a brunsli blob in the manifest (bypassing solid mode entirely — JPEGs hit the already-compressed wall under zstd, so no solid benefit is given up).
 
 **M3b-zip:** brunsli routing is also wired into the ZIP unwrap path for STORED JPEG entries. Mixed fixture (1 stored JPEG + 2 deflate-9 DLLs, 1,705,559 B): zxle 1,442,710 → **−15.25% vs xz-9e**.
+
+**Corpus-expansion (2026-05-01):** added `sample.docx`, `sample.jar`, `synth.mp3` via `tests/make_fixtures.sh` to validate M2/M3a/M3b on non-PE ZIP content and to set a pre-M3c-mp3 baseline.
+
+| Fixture | orig | zxle | xz-9e | zxle vs xz-9e |
+|---|---|---|---|---|
+| sample.docx (8000-para WordML, ZIP/L6) | 585,600 | 476,517 | 585,696 | **−18.64%** |
+| sample.jar (30 small classes, ZIP/L6) | 19,717 | 6,540 | 15,392 | **−57.51%** |
+| synth.mp3 (10 s 440 Hz @ 128 k) | 160,958 | 87,429 | 87,464 | −0.04% |
+
+DOCX/JAR results confirm the M2+M3a unwrap path generalizes from PE-DLL ZIPs to real-world XML/class-file ZIPs (DOCX exceeds the PE-DLL win because XML deflates more thoroughly when re-fed to zstd-19 solid). MP3 result is the expected flat — already at entropy under generic codecs; motivates M3c-mp3 (packMP3).
 
 **Headline M3a result:** `zxle` is **−15.39% vs xz-9e** on a zlib-L6 ZIP of 3 PE DLLs (2,276,846 B → 1,924,666 B). All 3 entries miss M2's L9-redeflate fast path, get split via preflate (215 B reconstruction info on the largest stream), and the unpacked bytes flow into the solid zstd-19 stream.
 

@@ -4,16 +4,16 @@ Recursive format-aware transform pipeline for general-purpose compression.
 
 Goal: be the smallest archive across **every** file type, not just one. Sister project to [ZXL](../Zxl) (which targets PE binaries specifically). ZXL-E uses ZXL as one of its backends when it detects PE streams.
 
-## Status (2026-04-30, M3b shipped)
+## Status (2026-05-01, M3b shipped + corpus expanded)
 
 | Stage | Status |
 |---|---|
 | M0 Phase-0 measurement | done — ZIP unwrap saves 20.45% over opaque-xz-9e on a 3-DLL test ZIP |
 | M1 Walking skeleton (manifest + solid zstd-19) | shipped — solid 0.3655 vs xz-9e 0.3524 on 8-file corpus |
-| M2 ZIP-family unwrap (zlib-DEFLATE) | shipped — −15.04% vs xz-9e on pe-deflate.zip |
+| M2 ZIP-family unwrap (zlib-DEFLATE) | shipped — −15.04% vs xz-9e on pe-deflate.zip; −18.64% on sample.docx |
 | M3a DEFLATE recompressor (preflate) | shipped — −15.39% vs xz-9e on zlib-L6 ZIP fixture |
 | M3b JPEG recompressor (brunsli) | shipped — −27.15% vs xz-9e on synth.jpg; −15.25% on JPEG-in-ZIP fixture |
-| M3c Per-stream recompressors (cjxl PNG, packMP3) | next |
+| M3c Per-stream recompressors (cjxl PNG, packMP3) | next — MP3 baseline −0.04% confirms need |
 | M4 Cross-stream content-defined ordering | pending |
 | M5 Neural residual fallback | pending |
 
