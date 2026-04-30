@@ -59,10 +59,13 @@ PY
     rm -rf "$TMP"
 fi
 
-# synth.mp3 — 10s 440Hz tone @ 128k. Motivates M3c packMP3 sub-milestone.
+# synth.mp3 — 30 s stereo synthesised "music" (sine + phaser + chorus) @ 128 kbps.
+# Pure tones compress trivially under xz-9e and don't show packMP3's win, so we
+# use a content-rich signal that produces music-like MP3 frame entropy.
 if want synth.mp3; then
-    ffmpeg -y -loglevel error -f lavfi -i "sine=frequency=440:duration=10" \
-        -b:a 128k synth.mp3
+    ffmpeg -y -loglevel error -f lavfi \
+        -i "sine=f=220:d=30,asplit=2[a][b];[a]aphaser=type=t[c];[b]chorus=0.7:0.9:55:0.4:0.25:2[d];[c][d]amerge" \
+        -ac 2 -b:a 128k synth.mp3
 fi
 
 echo "fixtures in tests/corpus/:"

@@ -9,9 +9,13 @@
  *     u16 path_len, path bytes,
  *     u64 original_size,
  *     u32 mode,
- *     u8  kind                    -- 0=opaque, 1=zip-unwrap, 2=jpeg-brunsli
+ *     u8  kind                    -- 0=opaque, 1=zip-unwrap, 2=jpeg-brunsli,
+ *                                    3=mp3-packmp3
  *     [if kind==1] u32 recipe_len, recipe_bytes
  *     [if kind==2] u32 brn_len,    brn_bytes      -- brunsli blob; entry
+ *                                                    contributes nothing to
+ *                                                    the solid stream
+ *     [if kind==3] u32 pmp_len,    pmp_bytes      -- packmp3 blob; entry
  *                                                    contributes nothing to
  *                                                    the solid stream
  *   zstd-19 payload: solid concatenation of "raw input bytes" (kind=0) or
@@ -59,6 +63,7 @@
 #define KIND_OPAQUE 0
 #define KIND_ZIP    1
 #define KIND_JPEG   2
+#define KIND_MP3    3
 
 #define OP_STRUCT     0x00
 #define OP_REDEFLATE  0x01
@@ -514,6 +519,7 @@ typedef struct {
     uint8_t     kind;
     Buf         recipe;     /* kind=1 only */
     Buf         brn;        /* kind=2 only */
+    Buf         pmp;        /* kind=3 only */
 } PackEntry;
 
 /* Run cbrunsli on a JPEG buffer; verify by dbrunsli + cmp; append the brunsli
@@ -554,6 +560,60 @@ static int try_brunsli_buf(const uint8_t *p, size_t n, const char *tmp_prefix, B
     return 0;
 }
 
+/* MPEG-1 Layer III sync detection. ID3v2 tag (bytes "ID3") or a frame header
+ * (0xFF then top 3 bits set; full sync). Permissive — packMP3 will reject
+ * MPEG-2/2.5 internally and we'll fall back to KIND_OPAQUE. */
+static int looks_like_mp3(const uint8_t *p, size_t n) {
+    if (n < 3) return 0;
+    if (p[0]=='I' && p[1]=='D' && p[2]=='3') return 1;
+    if (p[0]==0xFF && (p[1]&0xE0)==0xE0) return 1;
+    return 0;
+}
+
+/* Run packMP3 on an MP3 buffer; verify by packMP3 (decode side) + cmp; append
+ * the .pmp blob to *out. Returns 0 on success, -1 on detection miss / tooling
+ * failure / round-trip mismatch / blob >= original. */
+static int try_packmp3_buf(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *out) {
+    if (!looks_like_mp3(p, n)) return -1;
+
+    char tmp_in[1024], tmp_pmp[1024], cmd[4096];
+    snprintf(tmp_in,  sizeof(tmp_in),  "%s.in.mp3", tmp_prefix);
+    snprintf(tmp_pmp, sizeof(tmp_pmp), "%s.in.pmp", tmp_prefix);
+
+    FILE *jf = fopen(tmp_in, "wb");
+    if (!jf) return -1;
+    if (n > 0 && fwrite(p, 1, n, jf) != n) { fclose(jf); unlink(tmp_in); return -1; }
+    fclose(jf);
+
+    /* Compress: produces tmp_pmp from tmp_in. */
+    snprintf(cmd, sizeof(cmd), "packMP3 -o -np \"%s\" >%s 2>&1", tmp_in, ZXLE_DEVNULL);
+    if (try_run(cmd) != 0) { unlink(tmp_in); unlink(tmp_pmp); return -1; }
+    unlink(tmp_in);
+
+    /* Decompress for verify. packMP3 of foo.pmp writes foo.mp3 next to it.
+     * Rename the compressed output to a path whose .mp3 sibling is free. */
+    char tmp_rt_pmp[1024], tmp_rt_mp3[1024];
+    snprintf(tmp_rt_pmp, sizeof(tmp_rt_pmp), "%s.rt.pmp", tmp_prefix);
+    snprintf(tmp_rt_mp3, sizeof(tmp_rt_mp3), "%s.rt.mp3", tmp_prefix);
+    if (rename(tmp_pmp, tmp_rt_pmp) != 0) { unlink(tmp_pmp); return -1; }
+    snprintf(cmd, sizeof(cmd), "packMP3 -o -np \"%s\" >%s 2>&1", tmp_rt_pmp, ZXLE_DEVNULL);
+    if (try_run(cmd) != 0) { unlink(tmp_rt_pmp); unlink(tmp_rt_mp3); return -1; }
+    size_t rt_n = 0;
+    uint8_t *rt = read_whole_file(tmp_rt_mp3, &rt_n);
+    int ok = (rt && rt_n == n && memcmp(rt, p, n) == 0);
+    free(rt);
+    unlink(tmp_rt_mp3);
+    if (!ok) { unlink(tmp_rt_pmp); return -1; }
+
+    size_t pmp_n = 0;
+    uint8_t *pmp = read_whole_file(tmp_rt_pmp, &pmp_n);
+    unlink(tmp_rt_pmp);
+    if (!pmp || pmp_n >= n) { free(pmp); return -1; }
+    buf_append(out, pmp, pmp_n);
+    free(pmp);
+    return 0;
+}
+
 static int do_pack(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: zxle pack <out.zxle> <files...>\n"); return 1; }
     const char *out = argv[0];
@@ -576,6 +636,7 @@ static int do_pack(int argc, char **argv) {
         ents[i].mode      = (uint32_t)st.st_mode;
         buf_init(&ents[i].recipe);
         buf_init(&ents[i].brn);
+        buf_init(&ents[i].pmp);
 
         int unwrapped = 0;
         if (fsz >= 22 && fb[0]==0x50 && fb[1]==0x4B) {
@@ -591,6 +652,14 @@ static int do_pack(int argc, char **argv) {
             snprintf(tmp_prefix, sizeof(tmp_prefix), "%s.%d", out, i);
             if (try_brunsli_buf(fb, fsz, tmp_prefix, &ents[i].brn) == 0) {
                 ents[i].kind = KIND_JPEG;
+                unwrapped = 1;
+            }
+        }
+        if (!unwrapped && looks_like_mp3(fb, fsz)) {
+            char tmp_prefix[1024];
+            snprintf(tmp_prefix, sizeof(tmp_prefix), "%s.%d", out, i);
+            if (try_packmp3_buf(fb, fsz, tmp_prefix, &ents[i].pmp) == 0) {
+                ents[i].kind = KIND_MP3;
                 unwrapped = 1;
             }
         }
@@ -622,6 +691,7 @@ static int do_pack(int argc, char **argv) {
         mlen += 2 + strlen(ents[i].name) + 8 + 4 + 1;
         if (ents[i].kind == KIND_ZIP)  mlen += 4 + ents[i].recipe.n;
         if (ents[i].kind == KIND_JPEG) mlen += 4 + ents[i].brn.n;
+        if (ents[i].kind == KIND_MP3)  mlen += 4 + ents[i].pmp.n;
     }
 
     FILE *o = fopen(out, "wb");
@@ -645,6 +715,10 @@ static int do_pack(int argc, char **argv) {
             wu32(o, (uint32_t)ents[i].brn.n);
             if (ents[i].brn.n > 0)
                 fwrite(ents[i].brn.p, 1, ents[i].brn.n, o);
+        } else if (ents[i].kind == KIND_MP3) {
+            wu32(o, (uint32_t)ents[i].pmp.n);
+            if (ents[i].pmp.n > 0)
+                fwrite(ents[i].pmp.p, 1, ents[i].pmp.n, o);
         }
     }
     FILE *zf = fopen(tmp_zst, "rb");
@@ -657,7 +731,7 @@ static int do_pack(int argc, char **argv) {
 
     unlink(tmp_concat);
     unlink(tmp_zst);
-    for (int i = 0; i < n; i++) { buf_free(&ents[i].recipe); buf_free(&ents[i].brn); }
+    for (int i = 0; i < n; i++) { buf_free(&ents[i].recipe); buf_free(&ents[i].brn); buf_free(&ents[i].pmp); }
     buf_free(&solid);
     free(ents);
 
@@ -677,6 +751,8 @@ typedef struct {
     uint32_t recipe_len;
     uint8_t *brn;           /* points into manifest buffer */
     uint32_t brn_len;
+    uint8_t *pmp;           /* points into manifest buffer */
+    uint32_t pmp_len;
 } UnpackEntry;
 
 static int do_unpack(int argc, char **argv) {
@@ -714,6 +790,7 @@ static int do_unpack(int argc, char **argv) {
         ents[count].kind = manifest[mp]; mp += 1;
         ents[count].recipe = NULL; ents[count].recipe_len = 0;
         ents[count].brn    = NULL; ents[count].brn_len    = 0;
+        ents[count].pmp    = NULL; ents[count].pmp_len    = 0;
         if (ents[count].kind == KIND_ZIP) {
             if (mp + 4 > mlen) die("recipe len truncated");
             ents[count].recipe_len = r32(manifest + mp); mp += 4;
@@ -726,6 +803,12 @@ static int do_unpack(int argc, char **argv) {
             if (mp + ents[count].brn_len > mlen) die("brn overflow");
             ents[count].brn = manifest + mp;
             mp += ents[count].brn_len;
+        } else if (ents[count].kind == KIND_MP3) {
+            if (mp + 4 > mlen) die("pmp len truncated");
+            ents[count].pmp_len = r32(manifest + mp); mp += 4;
+            if (mp + ents[count].pmp_len > mlen) die("pmp overflow");
+            ents[count].pmp = manifest + mp;
+            mp += ents[count].pmp_len;
         }
         count++;
     }
@@ -780,6 +863,23 @@ static int do_unpack(int argc, char **argv) {
             snprintf(cmd, sizeof(cmd), "dbrunsli \"%s\" \"%s\" >%s 2>&1", tmp_brn, p, ZXLE_DEVNULL);
             run(cmd);
             unlink(tmp_brn);
+        } else if (ents[i].kind == KIND_MP3) {
+            /* Write pmp blob to a sibling .pmp temp; packMP3 will produce a
+             * sibling .mp3 next to it; then move that to the output path. */
+            fclose(of);
+            char tmp_pmp[2048], tmp_mp3[2048], cmd[4096];
+            snprintf(tmp_pmp, sizeof(tmp_pmp), "%s.pmp.tmp.pmp", p);
+            snprintf(tmp_mp3, sizeof(tmp_mp3), "%s.pmp.tmp.mp3", p);
+            FILE *bf = fopen(tmp_pmp, "wb");
+            if (!bf) die("fopen tmp pmp");
+            if (ents[i].pmp_len > 0 && fwrite(ents[i].pmp, 1, ents[i].pmp_len, bf) != ents[i].pmp_len) die("fwrite tmp pmp");
+            fclose(bf);
+            snprintf(cmd, sizeof(cmd), "packMP3 -o -np \"%s\" >%s 2>&1", tmp_pmp, ZXLE_DEVNULL);
+            run(cmd);
+            unlink(tmp_pmp);
+            /* Move recovered .mp3 to the output path. */
+            unlink(p);
+            if (rename(tmp_mp3, p) != 0) die("rename mp3 out");
         } else {
             die("unknown kind");
         }

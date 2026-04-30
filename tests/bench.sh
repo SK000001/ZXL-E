@@ -27,6 +27,13 @@ if [ -x third_party/brunsli/build/artifacts/cbrunsli.exe ] || \
     export PATH
 fi
 
+# Auto-discover locally-built packMP3 binary so MP3 routing engages.
+if [ -x third_party/packmp3/source/packMP3.exe ] || \
+   [ -x third_party/packmp3/source/packMP3 ]; then
+    PATH="$PWD/third_party/packmp3/source:$PATH"
+    export PATH
+fi
+
 BIN=./zxle
 [ -x ./zxle.exe ] && BIN=./zxle.exe
 
@@ -134,7 +141,7 @@ bench_file() {
     printf "  zxle vs xz-9e: %s\n" "$(awk -v a="$F_ZXLE" -v b="$F_XZ" 'BEGIN{printf "%.2f%%", (a-b)*100/b}')"
 }
 
-bench_file "MP3 (raw)" tests/corpus/synth.mp3
+bench_file "M3c packmp3 (MP3)" tests/corpus/synth.mp3
 
 # M3b: JPEG via brunsli. Same shape as bench_zip, but compares brunsli-routed
 # zxle against xz-9e (which hits the already-compressed wall).

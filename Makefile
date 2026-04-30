@@ -53,7 +53,17 @@ brunsli-deps:
 	@cd $(BRUNSLI_DIR)/build && mingw32-make -j4 cbrunsli dbrunsli
 	@echo "brunsli built. Add $(PWD)/$(BRUNSLI_DIR)/build/artifacts to PATH, or use tests/bench.sh which auto-detects."
 
+PACKMP3_DIR = third_party/packmp3
+
+packmp3-deps:
+	@if [ ! -d $(PACKMP3_DIR) ]; then \
+	  mkdir -p third_party && \
+	  git clone --depth 1 https://github.com/packjpg/packMP3.git $(PACKMP3_DIR); \
+	fi
+	@cd $(PACKMP3_DIR)/source && $(MAKE) RES= || true
+	@echo "packmp3 built. Add $(PWD)/$(PACKMP3_DIR)/source to PATH, or use tests/bench.sh which auto-detects."
+
 clean:
 	rm -f $(BIN) src/*.o tests/*.zxle tests/*.tmp
 
-.PHONY: all clean preflate-deps brunsli-deps
+.PHONY: all clean preflate-deps brunsli-deps packmp3-deps
