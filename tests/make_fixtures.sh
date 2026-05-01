@@ -68,5 +68,23 @@ if want synth.mp3; then
         -ac 2 -b:a 128k synth.mp3
 fi
 
+# zip-with-png.zip — 1 stored PNG + 2 deflate-9 DLLs. Mirrors zip-with-jpeg.zip
+# shape, but exercises OP_PNG_STORE in the ZIP recipe path.
+if want zip-with-png.zip; then
+    CORPUS="${ZXLE_CORPUS:-../../../Zxl/tests}"
+    if [ -f "$CORPUS/test.png" ] && [ -f "$CORPUS/kernel32.dll" ] && [ -f "$CORPUS/user32.dll" ]; then
+        python - "$CORPUS" <<'PY'
+import sys, zipfile
+c = sys.argv[1]
+with zipfile.ZipFile('zip-with-png.zip', 'w') as z:
+    z.write(f'{c}/test.png', 'test.png', compress_type=zipfile.ZIP_STORED)
+    z.write(f'{c}/kernel32.dll', 'kernel32.dll', compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)
+    z.write(f'{c}/user32.dll', 'user32.dll', compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)
+PY
+    else
+        echo "skipping zip-with-png.zip -- corpus files not found in $CORPUS"
+    fi
+fi
+
 echo "fixtures in tests/corpus/:"
 ls -l tests/corpus/ 2>/dev/null || ls -l .

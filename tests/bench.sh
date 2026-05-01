@@ -118,6 +118,7 @@ bench_zip() {
 bench_zip "M2 ZIP-unwrap"       tests/corpus/pe-deflate.zip
 bench_zip "M3 preflate (L6 ZIP)" tests/corpus/pe-deflate-l6.zip
 bench_zip "M3b JPEG-in-ZIP"      tests/corpus/zip-with-jpeg.zip
+bench_zip "M3c PNG-in-ZIP"       tests/corpus/zip-with-png.zip
 bench_zip "DOCX (ZIP/L6 XML)"    tests/corpus/sample.docx
 bench_zip "JAR (ZIP/L6 class)"   tests/corpus/sample.jar
 
