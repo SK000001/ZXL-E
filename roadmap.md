@@ -136,9 +136,7 @@ Route each stream to its strongest recompressor. Tracked as sub-milestones.
 Each recompressor lives behind an availability check; missing recompressors fall through to opaque-zstd.
 
 ### M4 — Cross-stream content-defined ordering
-**Branch:** `feat/m4-content-ordering` · **Expected:** −2 to −10% beyond M3 on multi-file inputs.
-
-After unwrap+recompress, compute MinHash / SimHash on each stream. Cluster, then order so similar streams are adjacent before the solid pass. Solid mode + content ordering captures cross-document boilerplate (e.g., DOCX schema across multiple Office docs).
+**Status:** parked pre-implementation (2026-05-01). See "Tried and reverted" — measurement showed no headroom on sub-window corpora because zstd `--long=27` (128 MiB window) already captures cross-stream matches regardless of order. Revisit when (a) corpora routinely exceed the long-window size, or (b) we ship a non-solid block format where ordering matters per-block.
 
 ### M5 — Neural residual fallback (optional)
 **Branch:** `feat/m5-neural` · **Expected:** −5 to −15% on residuals where zstd is already near optimal.
@@ -148,6 +146,19 @@ Small autoregressive byte predictor (NNCP-class). Default-off due to slowdown; u
 ---
 
 ## Tried and reverted
+
+### M4 cross-stream content-defined ordering (2026-05-01, abandoned pre-implementation)
+
+Plan: after unwrap+recompress, MinHash/SimHash each stream, cluster, reorder so similar streams sit adjacent in the solid input.
+
+**Pre-implementation measurement on the 6 MB sub-corpus (3 PE DLLs + 3 text files):**
+- DLLs grouped (best case):                 2,233,127
+- DLLs interleaved with text (mid case):    2,233,561  (+0.02%)
+- Reversed: text first, DLLs last (worst):  2,236,592  (+0.16%)
+
+**Why it doesn't move:** zstd-19 `--long=27` runs with a 128 MiB match window. The entire corpus fits inside a single window, so cross-stream matches already happen regardless of stream order. Worst-case adversarial reordering costs less than 0.2% — there is no headroom for content-defined ordering to capture.
+
+**Don't retry until:** (a) the practical corpus size exceeds the long-window (>128 MiB on the same `--long=27` setting; or use a smaller window deliberately), or (b) we ship a non-solid / per-block payload format where each block's ordering input matters in isolation. Neither applies in the current architecture.
 
 ### PE-via-ZXL routing as an M3 sub-milestone (2026-04-30, abandoned pre-implementation)
 

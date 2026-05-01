@@ -15,7 +15,7 @@ Goal: be the smallest archive across **every** file type, not just one. Sister p
 | M3b JPEG recompressor (brunsli) | shipped — −27.15% vs xz-9e on synth.jpg; −15.25% on JPEG-in-ZIP fixture |
 | M3c-mp3 MP3 recompressor (packMP3) | shipped — −13.05% vs xz-9e on synth.mp3 |
 | M3c-png PNG IDAT recompressor (zlib-L9 / preflate) | shipped — −22.06% vs xz-9e on test.png |
-| M4 Cross-stream content-defined ordering | pending |
+| M4 Cross-stream content-defined ordering | parked — zstd `--long=27` already spans the corpus (see roadmap "Tried and reverted") |
 | M5 Neural residual fallback | pending |
 
 ## Architecture (target)
