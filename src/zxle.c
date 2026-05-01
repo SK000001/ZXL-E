@@ -10,7 +10,7 @@
  *     u64 original_size,
  *     u32 mode,
  *     u8  kind                    -- 0=opaque, 1=zip-unwrap, 2=jpeg-brunsli,
- *                                    3=mp3-packmp3, 4=png-idat
+ *                                    3=mp3-packmp3, 4=png-idat, 5=gzip
  *     [if kind==1] u32 recipe_len, recipe_bytes
  *     [if kind==2] u32 brn_len,    brn_bytes      -- brunsli blob; entry
  *                                                    contributes nothing to
@@ -20,6 +20,9 @@
  *                                                    the solid stream
  *     [if kind==4] u32 recipe_len, recipe_bytes   -- PNG recipe (see below);
  *                                                    inflated IDAT bytes go to
+ *                                                    the solid stream
+ *     [if kind==5] u32 recipe_len, recipe_bytes   -- gzip recipe (see below);
+ *                                                    inflated body bytes go to
  *                                                    the solid stream
  *   zstd-19 payload: solid concatenation of "raw input bytes" (kind=0) or
  *     "raw entry bytes from re-deflatable / stored ZIP entries" (kind=1),
@@ -72,6 +75,7 @@
 #define KIND_JPEG   2
 #define KIND_MP3    3
 #define KIND_PNG    4
+#define KIND_GZIP   5
 
 /* PNG (kind=4) recipe layout (parsed by pack_png/unpack_png; not by
  * unpack_recipe — KIND_PNG does not use the OP_* tags):
@@ -87,6 +91,19 @@
  *     u8  adler[4]                 -- original zlib adler32 trailer (BE)
  *     u32 diff_len  diff_bytes     -- preflate reconstruction info
  *   u32 post_len  post_bytes       -- chunks after the last IDAT (incl. IEND)
+ */
+
+/* Gzip (kind=5) recipe layout (parsed by pack_gz/unpack_gz):
+ *   u32 hdr_len  hdr_bytes        -- gzip header (10 + optional FEXTRA/FNAME/
+ *                                     FCOMMENT/FHCRC) verbatim
+ *   u8  mode                      -- 0 = raw-deflate L9 redeflate matches,
+ *                                     1 = preflate over the raw deflate body
+ *   u32 raw_len                   -- inflated body size (consumed from solid)
+ *   u32 def_len                   -- length of original raw deflate body
+ *   [if mode==1] u32 diff_len  diff_bytes
+ *   u8  trailer[8]                -- CRC32 LE + ISIZE LE, verbatim
+ *
+ * Single-member only; multi-member gzip falls back to KIND_OPAQUE.
  */
 
 #define OP_STRUCT     0x00
@@ -301,6 +318,10 @@ static int try_brunsli_buf(const uint8_t *p, size_t n, const char *tmp_prefix, B
 static const uint8_t PNG_SIG[8];
 static int  pack_png  (const uint8_t *p, size_t n, Buf *recipe, Buf *solid);
 static void unpack_png(const uint8_t *recipe, size_t rlen,
+                       const uint8_t *solid, size_t solid_len, size_t *solid_pos,
+                       FILE *out, uint64_t expected_size);
+static int  pack_gz   (const uint8_t *p, size_t n, Buf *recipe, Buf *solid);
+static void unpack_gz (const uint8_t *recipe, size_t rlen,
                        const uint8_t *solid, size_t solid_len, size_t *solid_pos,
                        FILE *out, uint64_t expected_size);
 
@@ -826,6 +847,189 @@ static void unpack_png(const uint8_t *recipe, size_t rlen,
     if (written != expected_size) die("png size mismatch");
 }
 
+/* ---------- gzip helpers ---------- */
+
+/* Raw-inflate src into a freshly allocated buffer of unknown size. */
+static uint8_t *raw_inflate_dyn(const uint8_t *src, size_t src_n, size_t *out_n) {
+    z_stream z = {0};
+    if (inflateInit2(&z, -MAX_WBITS) != Z_OK) return NULL;
+    size_t cap = src_n * 4 + 4096;
+    uint8_t *out = malloc(cap);
+    if (!out) { inflateEnd(&z); die("malloc raw_inflate_dyn"); }
+    z.next_in = (Bytef *)src;
+    z.avail_in = (uInt)src_n;
+    z.next_out = out;
+    z.avail_out = (uInt)cap;
+    for (;;) {
+        int rc = inflate(&z, Z_FINISH);
+        if (rc == Z_STREAM_END) break;
+        if (rc == Z_BUF_ERROR || rc == Z_OK) {
+            size_t newcap = cap * 2;
+            uint8_t *no = realloc(out, newcap);
+            if (!no) { inflateEnd(&z); free(out); die("realloc raw_inflate_dyn"); }
+            out = no;
+            z.next_out = out + z.total_out;
+            z.avail_out = (uInt)(newcap - z.total_out);
+            cap = newcap;
+            continue;
+        }
+        inflateEnd(&z); free(out); return NULL;
+    }
+    *out_n = z.total_out;
+    inflateEnd(&z);
+    return out;
+}
+
+/* Pack a top-level single-member gzip. Builds *recipe and appends inflated body
+ * bytes to *solid. Returns 0 on success, -1 to fall back to KIND_OPAQUE. */
+static int pack_gz(const uint8_t *p, size_t n, Buf *recipe, Buf *solid) {
+    if (n < 18) return -1;
+    if (p[0] != 0x1F || p[1] != 0x8B || p[2] != 0x08) return -1;
+    uint8_t flg = p[3];
+    if (flg & 0xE0) return -1; /* reserved bits set */
+    size_t hdr = 10;
+    if (flg & 0x04) {          /* FEXTRA */
+        if (hdr + 2 > n) return -1;
+        uint16_t xlen = (uint16_t)(p[hdr] | (p[hdr+1] << 8));
+        hdr += 2 + xlen;
+        if (hdr > n) return -1;
+    }
+    if (flg & 0x08) {          /* FNAME */
+        while (hdr < n && p[hdr] != 0) hdr++;
+        if (hdr >= n) return -1;
+        hdr++;
+    }
+    if (flg & 0x10) {          /* FCOMMENT */
+        while (hdr < n && p[hdr] != 0) hdr++;
+        if (hdr >= n) return -1;
+        hdr++;
+    }
+    if (flg & 0x02) {          /* FHCRC */
+        if (hdr + 2 > n) return -1;
+        hdr += 2;
+    }
+    if (hdr + 8 > n) return -1;
+    size_t def_n = n - hdr - 8;
+    const uint8_t *def = p + hdr;
+    const uint8_t *trailer = p + n - 8;
+
+    /* Inflate body. */
+    size_t raw_n = 0;
+    uint8_t *raw = raw_inflate_dyn(def, def_n, &raw_n);
+    if (!raw) return -1;
+    if (raw_n > 0xFFFFFFFFu) { free(raw); return -1; }
+
+    /* Verify CRC32 + ISIZE against trailer. */
+    uint32_t want_crc = r32(trailer);
+    uint32_t want_isize = r32(trailer + 4);
+    uLong c = crc32(0L, Z_NULL, 0);
+    if (raw_n > 0) c = crc32(c, raw, (uInt)raw_n);
+    if ((uint32_t)c != want_crc || (uint32_t)(raw_n & 0xFFFFFFFFu) != want_isize) {
+        free(raw); return -1;
+    }
+
+    /* Try mode 0: raw-deflate L9 default-strategy must match. */
+    int mode = -1;
+    Buf preflate_diff; buf_init(&preflate_diff);
+
+    size_t redef_n = 0;
+    uint8_t *redef = raw_deflate_l9(raw, (uint32_t)raw_n, &redef_n);
+    if (redef && redef_n == def_n && memcmp(redef, def, def_n) == 0) {
+        mode = 0;
+    }
+    free(redef);
+
+    /* Mode 1: preflate over the raw deflate body. */
+    if (mode < 0) {
+        uint8_t *unp = NULL, *diff = NULL, *rejoin = NULL;
+        size_t unp_n = 0, diff_n = 0, rejoin_n = 0;
+        if (zxle_preflate_split(def, def_n, &unp, &unp_n, &diff, &diff_n)) {
+            if (unp_n == raw_n && memcmp(unp, raw, raw_n) == 0 &&
+                zxle_preflate_join(unp, unp_n, diff, diff_n, &rejoin, &rejoin_n) &&
+                rejoin_n == def_n &&
+                memcmp(rejoin, def, def_n) == 0) {
+                buf_append(&preflate_diff, diff, diff_n);
+                mode = 1;
+            }
+        }
+        zxle_preflate_free(unp);
+        zxle_preflate_free(diff);
+        zxle_preflate_free(rejoin);
+    }
+
+    if (mode < 0) {
+        free(raw); buf_free(&preflate_diff); return -1;
+    }
+
+    /* Build recipe. */
+    buf_u32(recipe, (uint32_t)hdr);
+    buf_append(recipe, p, hdr);
+    buf_u8(recipe, (uint8_t)mode);
+    buf_u32(recipe, (uint32_t)raw_n);
+    buf_u32(recipe, (uint32_t)def_n);
+    if (mode == 1) {
+        buf_u32(recipe, (uint32_t)preflate_diff.n);
+        buf_append(recipe, preflate_diff.p, preflate_diff.n);
+    }
+    buf_append(recipe, trailer, 8);
+
+    buf_append(solid, raw, raw_n);
+
+    fprintf(stderr, "    gz: hdr=%zu def=%zu raw=%zu mode=%d%s\n",
+            hdr, def_n, raw_n, mode, mode == 1 ? " (preflate)" : " (l9)");
+
+    free(raw);
+    buf_free(&preflate_diff);
+    return 0;
+}
+
+/* Reconstruct a gzip from recipe + solid bytes. */
+static void unpack_gz(const uint8_t *recipe, size_t rlen,
+                      const uint8_t *solid, size_t solid_len, size_t *solid_pos,
+                      FILE *out, uint64_t expected_size) {
+    size_t r = 0;
+    if (r + 4 > rlen) die("gz recipe truncated");
+    uint32_t hdr_len = r32(recipe + r); r += 4;
+    if (r + hdr_len > rlen) die("gz hdr overflow");
+    const uint8_t *hdr = recipe + r; r += hdr_len;
+    if (r + 1 + 4 + 4 > rlen) die("gz header truncated");
+    uint8_t mode = recipe[r]; r += 1;
+    uint32_t raw_len = r32(recipe + r); r += 4;
+    uint32_t def_len = r32(recipe + r); r += 4;
+    const uint8_t *diff = NULL; uint32_t diff_len = 0;
+    if (mode == 1) {
+        if (r + 4 > rlen) die("gz diff len truncated");
+        diff_len = r32(recipe + r); r += 4;
+        if (r + diff_len > rlen) die("gz diff overflow");
+        diff = recipe + r; r += diff_len;
+    }
+    if (r + 8 > rlen) die("gz trailer truncated");
+    const uint8_t *trailer = recipe + r; r += 8;
+    if (r != rlen) die("gz recipe trailing bytes");
+
+    if (*solid_pos + raw_len > solid_len) die("gz solid overflow");
+    const uint8_t *raw = solid + *solid_pos;
+
+    uint8_t *def_buf = NULL; size_t def_n = 0;
+    if (mode == 0) {
+        def_buf = raw_deflate_l9(raw, raw_len, &def_n);
+        if (!def_buf) die("gz raw_deflate_l9");
+    } else {
+        if (!zxle_preflate_join(raw, raw_len, diff, diff_len, &def_buf, &def_n))
+            die("gz preflate_join");
+    }
+    if (def_n != def_len) die("gz def size mismatch");
+
+    if (hdr_len > 0 && fwrite(hdr, 1, hdr_len, out) != hdr_len) die("fwrite gz hdr");
+    if (def_n > 0 && fwrite(def_buf, 1, def_n, out) != def_n) die("fwrite gz body");
+    if (fwrite(trailer, 1, 8, out) != 8) die("fwrite gz trailer");
+
+    if (mode == 0) free(def_buf); else zxle_preflate_free(def_buf);
+    *solid_pos += raw_len;
+    uint64_t written = (uint64_t)hdr_len + def_n + 8;
+    if (written != expected_size) die("gz size mismatch");
+}
+
 /* ---------- pack/unpack drivers ---------- */
 
 typedef struct {
@@ -989,6 +1193,15 @@ static int do_pack(int argc, char **argv) {
                 buf_init(&ents[i].recipe);
             }
         }
+        if (!unwrapped && fsz >= 18 && fb[0]==0x1F && fb[1]==0x8B && fb[2]==0x08) {
+            if (pack_gz(fb, fsz, &ents[i].recipe, &solid) == 0) {
+                ents[i].kind = KIND_GZIP;
+                unwrapped = 1;
+            } else {
+                buf_free(&ents[i].recipe);
+                buf_init(&ents[i].recipe);
+            }
+        }
         if (!unwrapped) {
             ents[i].kind = KIND_OPAQUE;
             buf_append(&solid, fb, fsz);
@@ -1019,6 +1232,7 @@ static int do_pack(int argc, char **argv) {
         if (ents[i].kind == KIND_JPEG) mlen += 4 + ents[i].brn.n;
         if (ents[i].kind == KIND_MP3)  mlen += 4 + ents[i].pmp.n;
         if (ents[i].kind == KIND_PNG)  mlen += 4 + ents[i].recipe.n;
+        if (ents[i].kind == KIND_GZIP) mlen += 4 + ents[i].recipe.n;
     }
 
     FILE *o = fopen(out, "wb");
@@ -1047,6 +1261,10 @@ static int do_pack(int argc, char **argv) {
             if (ents[i].pmp.n > 0)
                 fwrite(ents[i].pmp.p, 1, ents[i].pmp.n, o);
         } else if (ents[i].kind == KIND_PNG) {
+            wu32(o, (uint32_t)ents[i].recipe.n);
+            if (ents[i].recipe.n > 0)
+                fwrite(ents[i].recipe.p, 1, ents[i].recipe.n, o);
+        } else if (ents[i].kind == KIND_GZIP) {
             wu32(o, (uint32_t)ents[i].recipe.n);
             if (ents[i].recipe.n > 0)
                 fwrite(ents[i].recipe.p, 1, ents[i].recipe.n, o);
@@ -1146,6 +1364,12 @@ static int do_unpack(int argc, char **argv) {
             if (mp + ents[count].recipe_len > mlen) die("png recipe overflow");
             ents[count].recipe = manifest + mp;
             mp += ents[count].recipe_len;
+        } else if (ents[count].kind == KIND_GZIP) {
+            if (mp + 4 > mlen) die("gz recipe len truncated");
+            ents[count].recipe_len = r32(manifest + mp); mp += 4;
+            if (mp + ents[count].recipe_len > mlen) die("gz recipe overflow");
+            ents[count].recipe = manifest + mp;
+            mp += ents[count].recipe_len;
         }
         count++;
     }
@@ -1204,6 +1428,11 @@ static int do_unpack(int argc, char **argv) {
             unpack_png(ents[i].recipe, ents[i].recipe_len,
                        solid, solid_len, &solid_pos,
                        of, ents[i].orig_size);
+            fclose(of);
+        } else if (ents[i].kind == KIND_GZIP) {
+            unpack_gz(ents[i].recipe, ents[i].recipe_len,
+                      solid, solid_len, &solid_pos,
+                      of, ents[i].orig_size);
             fclose(of);
         } else if (ents[i].kind == KIND_MP3) {
             /* Write pmp blob to a sibling .pmp temp; packMP3 will produce a
