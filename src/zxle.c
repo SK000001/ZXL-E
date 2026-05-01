@@ -10,7 +10,7 @@
  *     u64 original_size,
  *     u32 mode,
  *     u8  kind                    -- 0=opaque, 1=zip-unwrap, 2=jpeg-brunsli,
- *                                    3=mp3-packmp3, 4=png-idat, 5=gzip
+ *                                    3=mp3-packmp3, 4=png-idat, 5=gzip, 6=tar
  *     [if kind==1] u32 recipe_len, recipe_bytes
  *     [if kind==2] u32 brn_len,    brn_bytes      -- brunsli blob; entry
  *                                                    contributes nothing to
@@ -24,6 +24,12 @@
  *     [if kind==5] u32 recipe_len, recipe_bytes   -- gzip recipe (see below);
  *                                                    inflated body bytes go to
  *                                                    the solid stream
+ *     [if kind==6] u32 recipe_len, recipe_bytes   -- tar recipe; same OP_*
+ *                                                    vocabulary as kind==1.
+ *                                                    Per-entry payloads route
+ *                                                    via OP_STORE / OP_JPEG_STORE
+ *                                                    / OP_PNG_STORE; headers
+ *                                                    and padding go in OP_STRUCT.
  *   zstd-19 payload: solid concatenation of "raw input bytes" (kind=0) or
  *     "raw entry bytes from re-deflatable / stored ZIP entries" (kind=1),
  *     in manifest order.
@@ -76,6 +82,7 @@
 #define KIND_MP3    3
 #define KIND_PNG    4
 #define KIND_GZIP   5
+#define KIND_TAR    6
 
 /* PNG (kind=4) recipe layout (parsed by pack_png/unpack_png; not by
  * unpack_recipe — KIND_PNG does not use the OP_* tags):
@@ -1030,6 +1037,123 @@ static void unpack_gz(const uint8_t *recipe, size_t rlen,
     if (written != expected_size) die("gz size mismatch");
 }
 
+/* ---------- tar (POSIX/ustar) ---------- */
+
+/* Pack a top-level ustar tar. Builds *recipe (using the OP_* vocabulary shared
+ * with KIND_ZIP) and appends raw payload bytes of regular file entries to
+ * *solid. Returns 0 on success, -1 to fall back to KIND_OPAQUE.
+ *
+ * Scope: ustar / GNU "ustar " magic. Regular files (typeflag '0' or '\\0').
+ * Other types (dir/link/longname/etc.) keep their header in OP_STRUCT and
+ * have no payload; if such an entry has a non-zero size, we conservatively
+ * STORE it. GNU base-256 size encoding (high bit of size[0] set) is rejected. */
+static int pack_tar(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *recipe, Buf *solid) {
+    if (n < 1024) return -1;
+    if (n % 512 != 0) return -1;
+    if (memcmp(p + 257, "ustar", 5) != 0) return -1;
+
+    size_t cur = 0;
+    int regulars = 0, jpeg_stored = 0, png_stored = 0, gzip_stored = 0, stored_plain = 0;
+
+    while (cur + 512 <= n) {
+        const uint8_t *hdr = p + cur;
+
+        /* Detect end-of-archive zero block(s). Two consecutive zero blocks
+         * mark the end; emit everything from cur to n verbatim. */
+        int is_zero = 1;
+        for (int i = 0; i < 512; i++) if (hdr[i]) { is_zero = 0; break; }
+        if (is_zero) {
+            buf_u8(recipe, OP_STRUCT);
+            buf_u32(recipe, (uint32_t)(n - cur));
+            buf_append(recipe, p + cur, n - cur);
+            cur = n;
+            break;
+        }
+
+        if (memcmp(hdr + 257, "ustar", 5) != 0) return -1;
+        if (hdr[124] & 0x80) return -1; /* GNU base-256 size */
+
+        uint64_t size = 0;
+        for (int i = 124; i < 124 + 11; i++) {
+            uint8_t c = hdr[i];
+            if (c == 0 || c == ' ') break;
+            if (c < '0' || c > '7') return -1;
+            size = size * 8 + (c - '0');
+        }
+        if (size > 0xFFFFFFFFu) return -1;
+
+        char tflag = (char)hdr[156];
+        uint64_t padded = (size + 511) & ~(uint64_t)511;
+        if (cur + 512 + padded > n) return -1;
+
+        /* Header verbatim. */
+        buf_u8(recipe, OP_STRUCT);
+        buf_u32(recipe, 512);
+        buf_append(recipe, hdr, 512);
+        cur += 512;
+
+        if (size > 0) {
+            int is_regular = (tflag == '0' || tflag == 0);
+            int handled = 0;
+
+            if (is_regular && size >= 8 && memcmp(p + cur, PNG_SIG, 8) == 0) {
+                Buf png_recipe; buf_init(&png_recipe);
+                if (pack_png(p + cur, (size_t)size, &png_recipe, solid) == 0) {
+                    buf_u8(recipe, OP_PNG_STORE);
+                    buf_u32(recipe, (uint32_t)size);
+                    buf_u32(recipe, (uint32_t)png_recipe.n);
+                    buf_append(recipe, png_recipe.p, png_recipe.n);
+                    png_stored++;
+                    handled = 1;
+                }
+                buf_free(&png_recipe);
+            }
+            if (!handled && is_regular && size >= 4 &&
+                p[cur] == 0xFF && p[cur+1] == 0xD8 && p[cur+2] == 0xFF) {
+                char tp[2048];
+                snprintf(tp, sizeof(tp), "%s.tj.%zu", tmp_prefix, cur);
+                Buf brn; buf_init(&brn);
+                if (try_brunsli_buf(p + cur, (size_t)size, tp, &brn) == 0) {
+                    buf_u8(recipe, OP_JPEG_STORE);
+                    buf_u32(recipe, (uint32_t)size);
+                    buf_u32(recipe, (uint32_t)brn.n);
+                    buf_append(recipe, brn.p, brn.n);
+                    jpeg_stored++;
+                    handled = 1;
+                }
+                buf_free(&brn);
+            }
+            if (!handled) {
+                buf_u8(recipe, OP_STORE);
+                buf_u32(recipe, (uint32_t)size);
+                buf_append(solid, p + cur, (size_t)size);
+                stored_plain++;
+            }
+            cur += size;
+            (void)gzip_stored;
+
+            uint64_t pad = padded - size;
+            if (pad > 0) {
+                buf_u8(recipe, OP_STRUCT);
+                buf_u32(recipe, (uint32_t)pad);
+                buf_append(recipe, p + cur, (size_t)pad);
+                cur += pad;
+            }
+            if (is_regular) regulars++;
+        }
+    }
+
+    if (cur < n) {
+        buf_u8(recipe, OP_STRUCT);
+        buf_u32(recipe, (uint32_t)(n - cur));
+        buf_append(recipe, p + cur, n - cur);
+    }
+
+    fprintf(stderr, "    tar: %d regular (%d store, %d jpeg-store, %d png-store)\n",
+            regulars, stored_plain, jpeg_stored, png_stored);
+    return 0;
+}
+
 /* ---------- pack/unpack drivers ---------- */
 
 typedef struct {
@@ -1202,6 +1326,17 @@ static int do_pack(int argc, char **argv) {
                 buf_init(&ents[i].recipe);
             }
         }
+        if (!unwrapped && fsz >= 1024 && memcmp(fb + 257, "ustar", 5) == 0) {
+            char tp[1024];
+            snprintf(tp, sizeof(tp), "%s.%d", out, i);
+            if (pack_tar(fb, fsz, tp, &ents[i].recipe, &solid) == 0) {
+                ents[i].kind = KIND_TAR;
+                unwrapped = 1;
+            } else {
+                buf_free(&ents[i].recipe);
+                buf_init(&ents[i].recipe);
+            }
+        }
         if (!unwrapped) {
             ents[i].kind = KIND_OPAQUE;
             buf_append(&solid, fb, fsz);
@@ -1233,6 +1368,7 @@ static int do_pack(int argc, char **argv) {
         if (ents[i].kind == KIND_MP3)  mlen += 4 + ents[i].pmp.n;
         if (ents[i].kind == KIND_PNG)  mlen += 4 + ents[i].recipe.n;
         if (ents[i].kind == KIND_GZIP) mlen += 4 + ents[i].recipe.n;
+        if (ents[i].kind == KIND_TAR)  mlen += 4 + ents[i].recipe.n;
     }
 
     FILE *o = fopen(out, "wb");
@@ -1265,6 +1401,10 @@ static int do_pack(int argc, char **argv) {
             if (ents[i].recipe.n > 0)
                 fwrite(ents[i].recipe.p, 1, ents[i].recipe.n, o);
         } else if (ents[i].kind == KIND_GZIP) {
+            wu32(o, (uint32_t)ents[i].recipe.n);
+            if (ents[i].recipe.n > 0)
+                fwrite(ents[i].recipe.p, 1, ents[i].recipe.n, o);
+        } else if (ents[i].kind == KIND_TAR) {
             wu32(o, (uint32_t)ents[i].recipe.n);
             if (ents[i].recipe.n > 0)
                 fwrite(ents[i].recipe.p, 1, ents[i].recipe.n, o);
@@ -1370,6 +1510,12 @@ static int do_unpack(int argc, char **argv) {
             if (mp + ents[count].recipe_len > mlen) die("gz recipe overflow");
             ents[count].recipe = manifest + mp;
             mp += ents[count].recipe_len;
+        } else if (ents[count].kind == KIND_TAR) {
+            if (mp + 4 > mlen) die("tar recipe len truncated");
+            ents[count].recipe_len = r32(manifest + mp); mp += 4;
+            if (mp + ents[count].recipe_len > mlen) die("tar recipe overflow");
+            ents[count].recipe = manifest + mp;
+            mp += ents[count].recipe_len;
         }
         count++;
     }
@@ -1433,6 +1579,11 @@ static int do_unpack(int argc, char **argv) {
             unpack_gz(ents[i].recipe, ents[i].recipe_len,
                       solid, solid_len, &solid_pos,
                       of, ents[i].orig_size);
+            fclose(of);
+        } else if (ents[i].kind == KIND_TAR) {
+            unpack_recipe(ents[i].recipe, ents[i].recipe_len,
+                          solid, solid_len, &solid_pos,
+                          of, ents[i].orig_size, p);
             fclose(of);
         } else if (ents[i].kind == KIND_MP3) {
             /* Write pmp blob to a sibling .pmp temp; packMP3 will produce a
