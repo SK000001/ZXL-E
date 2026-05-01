@@ -4,7 +4,7 @@ Recursive format-aware transform pipeline for general-purpose compression.
 
 Goal: be the smallest archive across **every** file type, not just one. Sister project to [ZXL](../Zxl) (which targets PE binaries specifically). ZXL-E uses ZXL as one of its backends when it detects PE streams.
 
-## Status (2026-05-01, M3c-png-zip shipped)
+## Status (2026-05-02, M3d-gzip shipped)
 
 | Stage | Status |
 |---|---|
@@ -15,6 +15,7 @@ Goal: be the smallest archive across **every** file type, not just one. Sister p
 | M3b JPEG recompressor (brunsli) | shipped — −27.15% vs xz-9e on synth.jpg; −15.25% on JPEG-in-ZIP fixture |
 | M3c-mp3 MP3 recompressor (packMP3) | shipped — −13.05% vs xz-9e on synth.mp3 |
 | M3c-png PNG IDAT recompressor (zlib-L9 / preflate) | shipped — −22.06% vs xz-9e on test.png; −15.73% on PNG-in-ZIP fixture |
+| M3d gzip wrapper (zlib-L9 / preflate) | shipped — −11.45% vs xz-9e on ntdll.dll.gz |
 | M4 Cross-stream content-defined ordering | parked — zstd `--long=27` already spans the corpus (see roadmap "Tried and reverted") |
 | M5 Neural residual fallback | pending |
 
