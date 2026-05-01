@@ -86,5 +86,16 @@ PY
     fi
 fi
 
+# ntdll.dll.gz — gzip(L6, default) of a corpus DLL. Tests M3d-gzip preflate path
+# (GNU gzip uses a different lazy-match policy from zlib so mode 0 misses).
+if want ntdll.dll.gz; then
+    CORPUS="${ZXLE_CORPUS:-../../../Zxl/tests}"
+    if [ -f "$CORPUS/ntdll.dll" ]; then
+        gzip -k -c "$CORPUS/ntdll.dll" > ntdll.dll.gz
+    else
+        echo "skipping ntdll.dll.gz -- $CORPUS/ntdll.dll not found"
+    fi
+fi
+
 echo "fixtures in tests/corpus/:"
 ls -l tests/corpus/ 2>/dev/null || ls -l .
