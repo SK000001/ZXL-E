@@ -10,13 +10,16 @@
  *     u64 original_size,
  *     u32 mode,
  *     u8  kind                    -- 0=opaque, 1=zip-unwrap, 2=jpeg-brunsli,
- *                                    3=mp3-packmp3
+ *                                    3=mp3-packmp3, 4=png-idat
  *     [if kind==1] u32 recipe_len, recipe_bytes
  *     [if kind==2] u32 brn_len,    brn_bytes      -- brunsli blob; entry
  *                                                    contributes nothing to
  *                                                    the solid stream
  *     [if kind==3] u32 pmp_len,    pmp_bytes      -- packmp3 blob; entry
  *                                                    contributes nothing to
+ *                                                    the solid stream
+ *     [if kind==4] u32 recipe_len, recipe_bytes   -- PNG recipe (see below);
+ *                                                    inflated IDAT bytes go to
  *                                                    the solid stream
  *   zstd-19 payload: solid concatenation of "raw input bytes" (kind=0) or
  *     "raw entry bytes from re-deflatable / stored ZIP entries" (kind=1),
@@ -64,6 +67,23 @@
 #define KIND_ZIP    1
 #define KIND_JPEG   2
 #define KIND_MP3    3
+#define KIND_PNG    4
+
+/* PNG (kind=4) recipe layout (parsed by pack_png/unpack_png; not by
+ * unpack_recipe — KIND_PNG does not use the OP_* tags):
+ *   u32 pre_len  pre_bytes        -- signature + chunks before the first IDAT
+ *   u32 idat_count
+ *   u32 idat_data_size[idat_count] -- data length of each original IDAT chunk
+ *   u8  zlib_mode                  -- 0 = zlib L9 redeflate matches original,
+ *                                     1 = preflate over the raw deflate body
+ *   u32 raw_len                    -- inflated IDAT size (consumed from solid)
+ *   u32 zlib_total                 -- total length of original zlib stream
+ *   [if zlib_mode==1]
+ *     u8  zhdr[2]                  -- original zlib header
+ *     u8  adler[4]                 -- original zlib adler32 trailer (BE)
+ *     u32 diff_len  diff_bytes     -- preflate reconstruction info
+ *   u32 post_len  post_bytes       -- chunks after the last IDAT (incl. IEND)
+ */
 
 #define OP_STRUCT     0x00
 #define OP_REDEFLATE  0x01
@@ -509,6 +529,273 @@ static void unpack_recipe(const uint8_t *recipe, size_t rlen,
     if (written != expected_size) die("recipe size mismatch");
 }
 
+/* ---------- PNG helpers ---------- */
+
+static const uint8_t PNG_SIG[8] = {0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A};
+
+static uint32_t r32be(const uint8_t *p) {
+    return ((uint32_t)p[0]<<24) | ((uint32_t)p[1]<<16) | ((uint32_t)p[2]<<8) | (uint32_t)p[3];
+}
+static void w32be(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v>>24); p[1] = (uint8_t)(v>>16); p[2] = (uint8_t)(v>>8); p[3] = (uint8_t)v;
+}
+
+/* zlib-wrapped inflate with unknown output size. Returns malloc'd buffer or NULL. */
+static uint8_t *zlib_inflate_dyn(const uint8_t *src, size_t src_n, size_t *out_n) {
+    z_stream z = {0};
+    if (inflateInit(&z) != Z_OK) return NULL;
+    size_t cap = src_n * 4 + 4096;
+    uint8_t *out = malloc(cap);
+    if (!out) { inflateEnd(&z); die("malloc inflate"); }
+    z.next_in = (Bytef *)src;
+    z.avail_in = (uInt)src_n;
+    z.next_out = out;
+    z.avail_out = (uInt)cap;
+    for (;;) {
+        int rc = inflate(&z, Z_FINISH);
+        if (rc == Z_STREAM_END) break;
+        if (rc == Z_BUF_ERROR || rc == Z_OK) {
+            size_t newcap = cap * 2;
+            uint8_t *no = realloc(out, newcap);
+            if (!no) { inflateEnd(&z); free(out); die("realloc inflate"); }
+            out = no;
+            z.next_out = out + z.total_out;
+            z.avail_out = (uInt)(newcap - z.total_out);
+            cap = newcap;
+            continue;
+        }
+        inflateEnd(&z); free(out); return NULL;
+    }
+    *out_n = z.total_out;
+    inflateEnd(&z);
+    return out;
+}
+
+/* zlib-wrapped deflate, level 9, default strategy. */
+static uint8_t *zlib_deflate_l9(const uint8_t *raw, size_t raw_n, size_t *out_n) {
+    z_stream z = {0};
+    if (deflateInit2(&z, 9, Z_DEFLATED, MAX_WBITS, 8, Z_DEFAULT_STRATEGY) != Z_OK) return NULL;
+    size_t bound = deflateBound(&z, (uLong)raw_n);
+    uint8_t *out = malloc(bound ? bound : 1);
+    if (!out) { deflateEnd(&z); die("malloc zlib_deflate"); }
+    z.next_in = (Bytef *)raw;
+    z.avail_in = (uInt)raw_n;
+    z.next_out = out;
+    z.avail_out = (uInt)bound;
+    int rc = deflate(&z, Z_FINISH);
+    if (rc != Z_STREAM_END) { deflateEnd(&z); free(out); return NULL; }
+    *out_n = z.total_out;
+    deflateEnd(&z);
+    return out;
+}
+
+/* Pack a top-level PNG. Builds *recipe and appends inflated IDAT bytes to
+ * *solid. Returns 0 on success, -1 to fall back to KIND_OPAQUE. */
+static int pack_png(const uint8_t *p, size_t n, Buf *recipe, Buf *solid) {
+    if (n < 8 + 12 || memcmp(p, PNG_SIG, 8) != 0) return -1;
+
+    /* Walk chunks. Locate IDAT range and concatenate IDAT data. */
+    size_t pre_end = 0;          /* offset where first IDAT chunk header begins */
+    size_t post_start = 0;       /* offset right after last IDAT's CRC */
+    Buf zlib_concat; buf_init(&zlib_concat);
+    Buf idat_sizes; buf_init(&idat_sizes);  /* u32 LE per IDAT data length */
+    uint32_t idat_count = 0;
+    int seen_idat = 0, seen_post_idat = 0;
+
+    size_t cur = 8;
+    while (cur + 12 <= n) {
+        uint32_t clen = r32be(p + cur);
+        if ((size_t)clen + 12 > n - cur) { buf_free(&zlib_concat); buf_free(&idat_sizes); return -1; }
+        const uint8_t *type = p + cur + 4;
+        const uint8_t *data = p + cur + 8;
+        int is_idat = (type[0]=='I' && type[1]=='D' && type[2]=='A' && type[3]=='T');
+
+        if (is_idat) {
+            if (seen_post_idat) { buf_free(&zlib_concat); buf_free(&idat_sizes); return -1; } /* non-contiguous */
+            if (!seen_idat) { pre_end = cur; seen_idat = 1; }
+            buf_append(&zlib_concat, data, clen);
+            buf_u32(&idat_sizes, clen);
+            idat_count++;
+        } else if (seen_idat) {
+            if (!seen_post_idat) { post_start = cur; seen_post_idat = 1; }
+        }
+
+        cur += 12 + clen;
+        if (type[0]=='I' && type[1]=='E' && type[2]=='N' && type[3]=='D') break;
+    }
+    if (!seen_idat || idat_count == 0) { buf_free(&zlib_concat); buf_free(&idat_sizes); return -1; }
+    if (!seen_post_idat) post_start = cur; /* no chunks after IDAT block */
+
+    /* Inflate concatenated IDAT zlib stream. */
+    size_t raw_n = 0;
+    uint8_t *raw = zlib_inflate_dyn(zlib_concat.p, zlib_concat.n, &raw_n);
+    if (!raw) { buf_free(&zlib_concat); buf_free(&idat_sizes); return -1; }
+    if (raw_n > 0xFFFFFFFFu) { free(raw); buf_free(&zlib_concat); buf_free(&idat_sizes); return -1; }
+
+    /* Try mode 0: zlib L9 default-strategy redeflate must match byte-for-byte. */
+    int mode = -1;
+    Buf preflate_diff; buf_init(&preflate_diff);
+    uint8_t zhdr[2] = {0,0}, adler[4] = {0,0,0,0};
+
+    size_t redef_n = 0;
+    uint8_t *redef = zlib_deflate_l9(raw, raw_n, &redef_n);
+    if (redef && redef_n == zlib_concat.n &&
+        memcmp(redef, zlib_concat.p, zlib_concat.n) == 0) {
+        mode = 0;
+    }
+    free(redef);
+
+    /* Mode 1: preflate over the raw deflate body (zlib stream minus 2-byte
+     * header and 4-byte adler trailer). */
+    if (mode < 0 && zlib_concat.n >= 6) {
+        zhdr[0] = zlib_concat.p[0];
+        zhdr[1] = zlib_concat.p[1];
+        memcpy(adler, zlib_concat.p + zlib_concat.n - 4, 4);
+        const uint8_t *def = zlib_concat.p + 2;
+        size_t def_n = zlib_concat.n - 6;
+        uint8_t *unp = NULL, *diff = NULL, *rejoin = NULL;
+        size_t unp_n = 0, diff_n = 0, rejoin_n = 0;
+        if (zxle_preflate_split(def, def_n, &unp, &unp_n, &diff, &diff_n)) {
+            if (unp_n == raw_n && memcmp(unp, raw, raw_n) == 0 &&
+                zxle_preflate_join(unp, unp_n, diff, diff_n, &rejoin, &rejoin_n) &&
+                rejoin_n == def_n &&
+                memcmp(rejoin, def, def_n) == 0) {
+                buf_append(&preflate_diff, diff, diff_n);
+                mode = 1;
+            }
+        }
+        zxle_preflate_free(unp);
+        zxle_preflate_free(diff);
+        zxle_preflate_free(rejoin);
+    }
+
+    if (mode < 0) {
+        free(raw);
+        buf_free(&zlib_concat);
+        buf_free(&idat_sizes);
+        buf_free(&preflate_diff);
+        return -1;
+    }
+
+    /* Build recipe. */
+    uint32_t pre_len  = (uint32_t)pre_end;
+    uint32_t post_len = (uint32_t)(n - post_start);
+    buf_u32(recipe, pre_len);
+    buf_append(recipe, p, pre_len);
+    buf_u32(recipe, idat_count);
+    buf_append(recipe, idat_sizes.p, idat_sizes.n);
+    buf_u8(recipe, (uint8_t)mode);
+    buf_u32(recipe, (uint32_t)raw_n);
+    buf_u32(recipe, (uint32_t)zlib_concat.n);
+    if (mode == 1) {
+        buf_append(recipe, zhdr, 2);
+        buf_append(recipe, adler, 4);
+        buf_u32(recipe, (uint32_t)preflate_diff.n);
+        buf_append(recipe, preflate_diff.p, preflate_diff.n);
+    }
+    buf_u32(recipe, post_len);
+    buf_append(recipe, p + post_start, post_len);
+
+    /* Inflated IDAT bytes go to the solid stream. */
+    buf_append(solid, raw, raw_n);
+
+    fprintf(stderr, "    png: %u IDAT chunk(s), zlib=%zu raw=%zu mode=%d%s\n",
+            idat_count, zlib_concat.n, raw_n, mode,
+            mode == 1 ? " (preflate)" : " (l9)");
+
+    free(raw);
+    buf_free(&zlib_concat);
+    buf_free(&idat_sizes);
+    buf_free(&preflate_diff);
+    return 0;
+}
+
+/* Reconstruct a PNG from recipe + solid bytes. */
+static void unpack_png(const uint8_t *recipe, size_t rlen,
+                       const uint8_t *solid, size_t solid_len, size_t *solid_pos,
+                       FILE *out, uint64_t expected_size) {
+    size_t r = 0;
+    if (r + 4 > rlen) die("png recipe truncated");
+    uint32_t pre_len = r32(recipe + r); r += 4;
+    if (r + pre_len > rlen) die("png pre overflow");
+    const uint8_t *pre = recipe + r; r += pre_len;
+    if (r + 4 > rlen) die("png idat_count truncated");
+    uint32_t idat_count = r32(recipe + r); r += 4;
+    if (idat_count == 0 || r + (size_t)idat_count * 4 > rlen) die("png idat sizes overflow");
+    const uint8_t *idat_sizes = recipe + r; r += (size_t)idat_count * 4;
+    if (r + 1 + 4 + 4 > rlen) die("png header truncated");
+    uint8_t mode = recipe[r]; r += 1;
+    uint32_t raw_len = r32(recipe + r); r += 4;
+    uint32_t zlib_total = r32(recipe + r); r += 4;
+    uint8_t zhdr[2] = {0,0}, adler[4] = {0,0,0,0};
+    const uint8_t *diff = NULL; uint32_t diff_len = 0;
+    if (mode == 1) {
+        if (r + 2 + 4 + 4 > rlen) die("png mode1 header truncated");
+        memcpy(zhdr, recipe + r, 2); r += 2;
+        memcpy(adler, recipe + r, 4); r += 4;
+        diff_len = r32(recipe + r); r += 4;
+        if (r + diff_len > rlen) die("png diff overflow");
+        diff = recipe + r; r += diff_len;
+    }
+    if (r + 4 > rlen) die("png post_len truncated");
+    uint32_t post_len = r32(recipe + r); r += 4;
+    if (r + post_len > rlen) die("png post overflow");
+    const uint8_t *post = recipe + r; r += post_len;
+    if (r != rlen) die("png recipe trailing bytes");
+
+    if (*solid_pos + raw_len > solid_len) die("png solid overflow");
+    const uint8_t *raw = solid + *solid_pos;
+
+    /* Reconstruct zlib stream. */
+    uint8_t *zlib_buf = NULL;
+    size_t zlib_n = 0;
+    if (mode == 0) {
+        zlib_buf = zlib_deflate_l9(raw, raw_len, &zlib_n);
+        if (!zlib_buf) die("png zlib_deflate_l9");
+    } else {
+        uint8_t *def = NULL; size_t def_n = 0;
+        if (!zxle_preflate_join(raw, raw_len, diff, diff_len, &def, &def_n))
+            die("png preflate_join");
+        zlib_n = 2 + def_n + 4;
+        zlib_buf = malloc(zlib_n);
+        if (!zlib_buf) die("png malloc zlib");
+        memcpy(zlib_buf, zhdr, 2);
+        memcpy(zlib_buf + 2, def, def_n);
+        memcpy(zlib_buf + 2 + def_n, adler, 4);
+        zxle_preflate_free(def);
+    }
+    if (zlib_n != zlib_total) die("png zlib size mismatch");
+
+    /* Verify split sizes sum to zlib_n. */
+    size_t sum = 0;
+    for (uint32_t i = 0; i < idat_count; i++) sum += r32(idat_sizes + i*4);
+    if (sum != zlib_n) die("png idat sizes mismatch");
+
+    /* Emit pre, IDAT chunks, post. */
+    if (pre_len > 0 && fwrite(pre, 1, pre_len, out) != pre_len) die("fwrite png pre");
+    size_t zoff = 0;
+    for (uint32_t i = 0; i < idat_count; i++) {
+        uint32_t clen = r32(idat_sizes + i*4);
+        uint8_t hdr[8];
+        w32be(hdr, clen);
+        hdr[4] = 'I'; hdr[5] = 'D'; hdr[6] = 'A'; hdr[7] = 'T';
+        if (fwrite(hdr, 1, 8, out) != 8) die("fwrite png idat hdr");
+        if (clen > 0 && fwrite(zlib_buf + zoff, 1, clen, out) != clen) die("fwrite png idat data");
+        uLong c = crc32(0L, Z_NULL, 0);
+        c = crc32(c, hdr + 4, 4);
+        if (clen > 0) c = crc32(c, zlib_buf + zoff, clen);
+        uint8_t crcb[4]; w32be(crcb, (uint32_t)c);
+        if (fwrite(crcb, 1, 4, out) != 4) die("fwrite png idat crc");
+        zoff += clen;
+    }
+    if (post_len > 0 && fwrite(post, 1, post_len, out) != post_len) die("fwrite png post");
+
+    free(zlib_buf);
+    *solid_pos += raw_len;
+    uint64_t written = (uint64_t)pre_len + (uint64_t)idat_count * 12 + zlib_n + post_len;
+    if (written != expected_size) die("png size mismatch");
+}
+
 /* ---------- pack/unpack drivers ---------- */
 
 typedef struct {
@@ -663,6 +950,15 @@ static int do_pack(int argc, char **argv) {
                 unwrapped = 1;
             }
         }
+        if (!unwrapped && fsz >= 8 && memcmp(fb, PNG_SIG, 8) == 0) {
+            if (pack_png(fb, fsz, &ents[i].recipe, &solid) == 0) {
+                ents[i].kind = KIND_PNG;
+                unwrapped = 1;
+            } else {
+                buf_free(&ents[i].recipe);
+                buf_init(&ents[i].recipe);
+            }
+        }
         if (!unwrapped) {
             ents[i].kind = KIND_OPAQUE;
             buf_append(&solid, fb, fsz);
@@ -692,6 +988,7 @@ static int do_pack(int argc, char **argv) {
         if (ents[i].kind == KIND_ZIP)  mlen += 4 + ents[i].recipe.n;
         if (ents[i].kind == KIND_JPEG) mlen += 4 + ents[i].brn.n;
         if (ents[i].kind == KIND_MP3)  mlen += 4 + ents[i].pmp.n;
+        if (ents[i].kind == KIND_PNG)  mlen += 4 + ents[i].recipe.n;
     }
 
     FILE *o = fopen(out, "wb");
@@ -719,6 +1016,10 @@ static int do_pack(int argc, char **argv) {
             wu32(o, (uint32_t)ents[i].pmp.n);
             if (ents[i].pmp.n > 0)
                 fwrite(ents[i].pmp.p, 1, ents[i].pmp.n, o);
+        } else if (ents[i].kind == KIND_PNG) {
+            wu32(o, (uint32_t)ents[i].recipe.n);
+            if (ents[i].recipe.n > 0)
+                fwrite(ents[i].recipe.p, 1, ents[i].recipe.n, o);
         }
     }
     FILE *zf = fopen(tmp_zst, "rb");
@@ -809,6 +1110,12 @@ static int do_unpack(int argc, char **argv) {
             if (mp + ents[count].pmp_len > mlen) die("pmp overflow");
             ents[count].pmp = manifest + mp;
             mp += ents[count].pmp_len;
+        } else if (ents[count].kind == KIND_PNG) {
+            if (mp + 4 > mlen) die("png recipe len truncated");
+            ents[count].recipe_len = r32(manifest + mp); mp += 4;
+            if (mp + ents[count].recipe_len > mlen) die("png recipe overflow");
+            ents[count].recipe = manifest + mp;
+            mp += ents[count].recipe_len;
         }
         count++;
     }
@@ -863,6 +1170,11 @@ static int do_unpack(int argc, char **argv) {
             snprintf(cmd, sizeof(cmd), "dbrunsli \"%s\" \"%s\" >%s 2>&1", tmp_brn, p, ZXLE_DEVNULL);
             run(cmd);
             unlink(tmp_brn);
+        } else if (ents[i].kind == KIND_PNG) {
+            unpack_png(ents[i].recipe, ents[i].recipe_len,
+                       solid, solid_len, &solid_pos,
+                       of, ents[i].orig_size);
+            fclose(of);
         } else if (ents[i].kind == KIND_MP3) {
             /* Write pmp blob to a sibling .pmp temp; packMP3 will produce a
              * sibling .mp3 next to it; then move that to the output path. */
