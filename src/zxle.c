@@ -37,6 +37,10 @@
  *   0x04 JPEG_STORE -- (u32 brn_len)(brn_bytes); brunsli-decode brn to `len`
  *                      JPEG bytes, write to output. Solid not consumed. Used
  *                      for STORED ZIP entries whose payload is a JPEG.
+ *   0x05 PNG_STORE  -- (u32 png_recipe_len)(png_recipe_bytes); call unpack_png
+ *                      to reconstruct `len` PNG bytes; consumes inflated IDAT
+ *                      bytes from the solid stream (per the PNG recipe). Used
+ *                      for STORED ZIP entries whose payload is a PNG.
  *
  * ZIP unwrap scope: zlib-DEFLATE / stored entries; ZIP64 / encryption /
  * DEFLATE64 / BZIP2 / LZMA / prefix bytes -> falls back to KIND_OPAQUE.
@@ -90,6 +94,7 @@
 #define OP_STORE      0x02
 #define OP_PREFLATE   0x03
 #define OP_JPEG_STORE 0x04
+#define OP_PNG_STORE  0x05
 
 /* Defined in preflate_shim.cpp; both return 1 on success, 0 on failure.
  * Out buffers are malloc'd; release with zxle_preflate_free. */
@@ -293,6 +298,11 @@ static int zip_parse(const uint8_t *p, size_t n,
 }
 
 static int try_brunsli_buf(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *out);
+static const uint8_t PNG_SIG[8];
+static int  pack_png  (const uint8_t *p, size_t n, Buf *recipe, Buf *solid);
+static void unpack_png(const uint8_t *recipe, size_t rlen,
+                       const uint8_t *solid, size_t solid_len, size_t *solid_pos,
+                       FILE *out, uint64_t expected_size);
 
 /* Raw-inflate `comp_size` bytes at src into a freshly allocated buffer of
  * exactly raw_size bytes. Returns NULL on failure. */
@@ -342,7 +352,7 @@ static int pack_zip(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *rec
     if (zip_parse(p, n, &ents, &count, &cd_off, &cd_len, &eocd_off, &eocd_len) != 0) return -1;
 
     size_t cursor = 0;
-    int redeflated = 0, preflated = 0, store_orig = 0, stored_method = 0, jpeg_stored = 0;
+    int redeflated = 0, preflated = 0, store_orig = 0, stored_method = 0, jpeg_stored = 0, png_stored = 0;
 
     for (uint32_t i = 0; i < count; i++) {
         ZipEntry *e = &ents[i];
@@ -361,7 +371,20 @@ static int pack_zip(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *rec
             /* Stored: raw bytes are the payload bytes. Try brunsli for JPEGs. */
             if (e->raw_size != e->comp_size) { free(ents); return -1; }
             int handled = 0;
-            if (e->raw_size >= 4 &&
+            if (!handled && e->raw_size >= 8 &&
+                memcmp(p + e->payload_off, PNG_SIG, 8) == 0) {
+                Buf png_recipe; buf_init(&png_recipe);
+                if (pack_png(p + e->payload_off, e->raw_size, &png_recipe, solid) == 0) {
+                    buf_u8(recipe, OP_PNG_STORE);
+                    buf_u32(recipe, e->raw_size);
+                    buf_u32(recipe, (uint32_t)png_recipe.n);
+                    buf_append(recipe, png_recipe.p, png_recipe.n);
+                    png_stored++;
+                    handled = 1;
+                }
+                buf_free(&png_recipe);
+            }
+            if (!handled && e->raw_size >= 4 &&
                 p[e->payload_off]   == 0xFF &&
                 p[e->payload_off+1] == 0xD8 &&
                 p[e->payload_off+2] == 0xFF) {
@@ -448,8 +471,8 @@ static int pack_zip(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *rec
         buf_append(recipe, p + cursor, n - cursor);
     }
 
-    fprintf(stderr, "    zip: %u entries (%d redeflate, %d preflate, %d store-orig, %d stored, %d jpeg-store)\n",
-            count, redeflated, preflated, store_orig, stored_method, jpeg_stored);
+    fprintf(stderr, "    zip: %u entries (%d redeflate, %d preflate, %d store-orig, %d stored, %d jpeg-store, %d png-store)\n",
+            count, redeflated, preflated, store_orig, stored_method, jpeg_stored, png_stored);
 
     free(ents);
     return 0;
@@ -507,6 +530,13 @@ static void unpack_recipe(const uint8_t *recipe, size_t rlen,
             if (fwrite(got, 1, got_n, out) != got_n) die("fwrite JPEG_STORE");
             free(got);
             r += brn_len;
+            written += len;
+        } else if (op == OP_PNG_STORE) {
+            if (r + 4 > rlen) die("recipe PNG_STORE recipe_len truncated");
+            uint32_t prl = r32(recipe + r); r += 4;
+            if (r + prl > rlen) die("recipe PNG_STORE recipe overflow");
+            unpack_png(recipe + r, prl, solid, solid_len, solid_pos, out, len);
+            r += prl;
             written += len;
         } else if (op == OP_PREFLATE) {
             if (r + 4 > rlen) die("recipe PREFLATE diff_len truncated");
