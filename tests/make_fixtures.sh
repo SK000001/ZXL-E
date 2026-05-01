@@ -86,6 +86,23 @@ PY
     fi
 fi
 
+# mixed.tar — ustar tar of corpus PNG + JPEG + 2 DLLs. Tests M3e-tar routing
+# (PNG -> pack_png, JPEG -> brunsli, DLLs -> solid STORE).
+if want mixed.tar; then
+    CORPUS="${ZXLE_CORPUS:-../../../Zxl/tests}"
+    if [ -f "$CORPUS/test.png" ] && [ -f "$CORPUS/kernel32.dll" ] && \
+       [ -f "$CORPUS/user32.dll" ] && [ -f "synth.jpg" ]; then
+        TMP=$(mktemp -d)
+        cp "$CORPUS/test.png" "$CORPUS/kernel32.dll" "$CORPUS/user32.dll" \
+           "synth.jpg" "$TMP/"
+        (cd "$TMP" && tar cf mixed.tar test.png synth.jpg kernel32.dll user32.dll)
+        mv "$TMP/mixed.tar" .
+        rm -rf "$TMP"
+    else
+        echo "skipping mixed.tar -- corpus or synth.jpg not found"
+    fi
+fi
+
 # ntdll.dll.gz — gzip(L6, default) of a corpus DLL. Tests M3d-gzip preflate path
 # (GNU gzip uses a different lazy-match policy from zlib so mode 0 misses).
 if want ntdll.dll.gz; then

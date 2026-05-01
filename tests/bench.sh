@@ -144,6 +144,7 @@ bench_file() {
 
 bench_file "M3c packmp3 (MP3)" tests/corpus/synth.mp3
 bench_file "M3d gzip (gz)"     tests/corpus/ntdll.dll.gz
+bench_file "M3e tar (mixed)"   tests/corpus/mixed.tar
 
 # M3b: JPEG via brunsli. Same shape as bench_zip, but compares brunsli-routed
 # zxle against xz-9e (which hits the already-compressed wall).
