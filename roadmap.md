@@ -4,9 +4,13 @@ Single source of truth for where ZXL-E is, where it's going, and what not to ret
 
 ---
 
-## Current state (2026-05-01, M3c-mp3 shipped)
+## Current state (2026-05-01, M3c-png shipped)
 
-M1 + M2 + M3a (preflate) + M3b (brunsli) + M3c-mp3 (packMP3) ship end-to-end. Round-trip OK across the 8-file corpus, both ZIP fixtures, the JPEG fixture, the DOCX/JAR fixtures, and the MP3 fixture.
+M1 + M2 + M3a (preflate) + M3b (brunsli) + M3c-mp3 (packMP3) + M3c-png (zlib-L9 / preflate over IDAT) ship end-to-end. Round-trip OK across the 8-file corpus, both ZIP fixtures, the JPEG fixture, the DOCX/JAR fixtures, the MP3 fixture, and `test.png`.
+
+**Headline M3c-png result:** `zxle` is **−22.06% vs xz-9e** on `test.png` (157,441 B → 119,297 B). The IDAT zlib stream is concatenated and inflated; if zlib-L9 default-strategy redeflate matches, the inflated filtered-pixel bytes go straight to the solid zstd-19 stream (mode 0). Otherwise the deflate body is split via preflate (mode 1, with the original zlib header + adler stored in the recipe). PNG entries do contribute to solid (the win is zstd-19 long-window-27 over filtered-pixel bytes); chunk boundaries are reconstructed from per-IDAT lengths in the recipe and CRCs are recomputed. Failures fall through to KIND_OPAQUE.
+
+Corpus per-file average vs orig: 0.3721 → **0.3673**. Solid: 0.3655 → **0.3608**. All non-PNG fixtures unchanged.
 
 **Headline M3c-mp3 result:** `zxle` is **−13.05% vs xz-9e** on a 481,115 B synthesized music MP3 (zxle 398,756 → savings of 59,840 vs xz-9e). Top-level MP3 files are detected by ID3v2 tag or MPEG-1 Layer III sync word, routed through `packMP3`, verified by round-trip `packMP3` decode + cmp at pack time, and stored as a `.pmp` blob in the manifest (bypassing solid mode — MP3 frames hit the already-compressed wall under zstd, so no solid benefit is given up).
 
@@ -21,6 +25,7 @@ M1 + M2 + M3a (preflate) + M3b (brunsli) + M3c-mp3 (packMP3) ship end-to-end. Ro
 | sample.docx (8000-para WordML, ZIP/L6) | 585,600 | 476,517 | 585,696 | **−18.64%** |
 | sample.jar (30 small classes, ZIP/L6) | 19,717 | 6,540 | 15,392 | **−57.51%** |
 | synth.mp3 (30 s synth music, stereo @ 128 k) | 481,115 | 398,756 | 458,596 | **−13.05%** |
+| test.png (corpus PNG) | 157,441 | 119,297 | 153,064 | **−22.06%** |
 
 DOCX/JAR results confirm the M2+M3a unwrap path generalizes from PE-DLL ZIPs to real-world XML/class-file ZIPs (DOCX exceeds the PE-DLL win because XML deflates more thoroughly when re-fed to zstd-19 solid). MP3 result is M3c-mp3 (packMP3 routing). Note: the original 10 s 440 Hz tone was replaced by a 30 s synthesized stereo signal (sine + phaser + chorus) because pure-tone MP3 frames are dominated by repetition and compress trivially under xz-9e (−45% with no help), masking packMP3's structural win.
 
@@ -113,11 +118,18 @@ Route each stream to its strongest recompressor. Tracked as sub-milestones.
 - Build dep: `make packmp3-deps`. Runtime dep: `packMP3` on PATH (bench.sh auto-prepends the locally-built copy).
 - Limitation: only MPEG-1 Layer III is supported (packMP3 limitation). MPEG-2 / MPEG-2.5 MP3 files fall through to KIND_OPAQUE.
 
+#### M3c-png — PNG IDAT recompressor (shipped 2026-05-01)
+- New container kind `KIND_PNG = 4`. Detection: 8-byte PNG signature.
+- Pack: parse chunks, concatenate the IDAT zlib stream, inflate to filtered-pixel bytes, try zlib-L9 default-strategy redeflate (mode 0 — match original byte-for-byte → just store inflated bytes). On mismatch, strip the 2-byte zlib header + 4-byte adler trailer, run preflate over the deflate body (mode 1), verify by re-join + cmp. Either success path puts inflated bytes into the solid zstd-19 stream and a small recipe in the manifest (pre-IDAT chunks verbatim, per-IDAT chunk lengths, mode flag, [mode=1: zhdr/adler/diff], post-IDAT chunks verbatim).
+- Unpack: rebuild the zlib stream (deflate-L9 in mode 0; preflate-rejoin + zhdr/adler in mode 1), split by stored per-IDAT lengths, recompute CRC32 per chunk, emit byte-identical PNG.
+- Measured: **−22.06% vs xz-9e** on `test.png` (zxle 119,297 vs xz-9e 153,064). Corpus per-file ratio 0.3721 → 0.3673; solid 0.3655 → 0.3608. All other fixtures preserved.
+- Limitations: only top-level PNGs (PNGs inside ZIP entries are still routed through redeflate/preflate of the entry's deflate stream, which often misses since the ZIP-deflated zlib-stream isn't the same as the inner PNG's IDAT zlib-stream). Out of scope for this milestone.
+
 #### M3c — pending sub-milestones
 **Branch:** `feat/m3-*` · **Expected:** large wins per stream.
 
 - ~~MP3 via packMP3~~ — shipped as M3c-mp3 above.
-- PNG byte-exact: requires IDAT-via-preflate (cjxl pixel-lossless rewrites the PNG container, not byte-exact). Larger effort.
+- ~~PNG byte-exact via IDAT-zlib-L9 / preflate~~ — shipped as M3c-png above.
 - ~~PE streams via ZXL~~ — see "Tried and reverted"; revisit once ZXL has a multi-stream/solid mode.
 - ~~JPEGs inside ZIP entries~~ — shipped as M3b-zip above.
 
