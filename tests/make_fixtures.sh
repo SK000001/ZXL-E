@@ -103,6 +103,17 @@ if want mixed.tar; then
     fi
 fi
 
+# mixed.tar.gz — gzip wrap of mixed.tar. Tests M3e-targz: gzip-wrapped tar with
+# per-entry payloads getting format-aware routing (PNG -> pack_png, JPEG ->
+# brunsli, DLLs -> solid STORE) instead of opaque-to-solid.
+if want mixed.tar.gz; then
+    if [ -f mixed.tar ]; then
+        gzip -9 -k -c mixed.tar > mixed.tar.gz
+    else
+        echo "skipping mixed.tar.gz -- mixed.tar not present"
+    fi
+fi
+
 # ntdll.dll.gz — gzip(L6, default) of a corpus DLL. Tests M3d-gzip preflate path
 # (GNU gzip uses a different lazy-match policy from zlib so mode 0 misses).
 if want ntdll.dll.gz; then

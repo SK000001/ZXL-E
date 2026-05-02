@@ -105,10 +105,16 @@
  *                                     FCOMMENT/FHCRC) verbatim
  *   u8  mode                      -- 0 = raw-deflate L9 redeflate matches,
  *                                     1 = preflate over the raw deflate body
- *   u32 raw_len                   -- inflated body size (consumed from solid)
+ *   u32 raw_len                   -- inflated body size
  *   u32 def_len                   -- length of original raw deflate body
  *   [if mode==1] u32 diff_len  diff_bytes
  *   u8  trailer[8]                -- CRC32 LE + ISIZE LE, verbatim
+ *   u8  inner_kind                -- 0 = inflated body bytes consumed from
+ *                                     solid verbatim;
+ *                                   1 = inflated body is a ustar tar; followed
+ *                                     by a nested tar recipe whose ops consume
+ *                                     from solid (M3e-targz).
+ *   [if inner_kind==1] u32 tar_recipe_len  tar_recipe_bytes
  *
  * Single-member only; multi-member gzip falls back to KIND_OPAQUE.
  */
@@ -327,10 +333,15 @@ static int  pack_png  (const uint8_t *p, size_t n, Buf *recipe, Buf *solid);
 static void unpack_png(const uint8_t *recipe, size_t rlen,
                        const uint8_t *solid, size_t solid_len, size_t *solid_pos,
                        FILE *out, uint64_t expected_size);
-static int  pack_gz   (const uint8_t *p, size_t n, Buf *recipe, Buf *solid);
+static int  pack_gz   (const uint8_t *p, size_t n, const char *tmp_prefix, Buf *recipe, Buf *solid);
 static void unpack_gz (const uint8_t *recipe, size_t rlen,
                        const uint8_t *solid, size_t solid_len, size_t *solid_pos,
-                       FILE *out, uint64_t expected_size);
+                       FILE *out, uint64_t expected_size, const char *tmp_prefix);
+static int  pack_tar  (const uint8_t *p, size_t n, const char *tmp_prefix, Buf *recipe, Buf *solid);
+static void unpack_recipe(const uint8_t *recipe, size_t rlen,
+                          const uint8_t *solid, size_t solid_len, size_t *solid_pos,
+                          FILE *out, uint64_t expected_size,
+                          const char *tmp_prefix);
 
 /* Raw-inflate `comp_size` bytes at src into a freshly allocated buffer of
  * exactly raw_size bytes. Returns NULL on failure. */
@@ -889,7 +900,7 @@ static uint8_t *raw_inflate_dyn(const uint8_t *src, size_t src_n, size_t *out_n)
 
 /* Pack a top-level single-member gzip. Builds *recipe and appends inflated body
  * bytes to *solid. Returns 0 on success, -1 to fall back to KIND_OPAQUE. */
-static int pack_gz(const uint8_t *p, size_t n, Buf *recipe, Buf *solid) {
+static int pack_gz(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *recipe, Buf *solid) {
     if (n < 18) return -1;
     if (p[0] != 0x1F || p[1] != 0x8B || p[2] != 0x08) return -1;
     uint8_t flg = p[3];
@@ -968,6 +979,24 @@ static int pack_gz(const uint8_t *p, size_t n, Buf *recipe, Buf *solid) {
         free(raw); buf_free(&preflate_diff); return -1;
     }
 
+    /* M3e-targz: if the inflated body is a ustar tar, route per-entry payloads
+     * through pack_tar instead of dumping the whole thing opaque to solid. Use
+     * scratch buffers so a mid-stream pack_tar failure can't contaminate solid. */
+    int inner_kind = 0;
+    Buf tar_recipe; buf_init(&tar_recipe);
+    Buf tar_solid;  buf_init(&tar_solid);
+    if (raw_n >= 1024 && raw_n % 512 == 0 &&
+        memcmp(raw + 257, "ustar", 5) == 0) {
+        char tp[1024];
+        snprintf(tp, sizeof(tp), "%s.gztar", tmp_prefix);
+        if (pack_tar(raw, raw_n, tp, &tar_recipe, &tar_solid) == 0) {
+            inner_kind = 1;
+        } else {
+            buf_free(&tar_recipe); buf_init(&tar_recipe);
+            buf_free(&tar_solid);  buf_init(&tar_solid);
+        }
+    }
+
     /* Build recipe. */
     buf_u32(recipe, (uint32_t)hdr);
     buf_append(recipe, p, hdr);
@@ -979,21 +1008,31 @@ static int pack_gz(const uint8_t *p, size_t n, Buf *recipe, Buf *solid) {
         buf_append(recipe, preflate_diff.p, preflate_diff.n);
     }
     buf_append(recipe, trailer, 8);
+    buf_u8(recipe, (uint8_t)inner_kind);
+    if (inner_kind == 1) {
+        buf_u32(recipe, (uint32_t)tar_recipe.n);
+        buf_append(recipe, tar_recipe.p, tar_recipe.n);
+        buf_append(solid, tar_solid.p, tar_solid.n);
+    } else {
+        buf_append(solid, raw, raw_n);
+    }
 
-    buf_append(solid, raw, raw_n);
-
-    fprintf(stderr, "    gz: hdr=%zu def=%zu raw=%zu mode=%d%s\n",
-            hdr, def_n, raw_n, mode, mode == 1 ? " (preflate)" : " (l9)");
+    fprintf(stderr, "    gz: hdr=%zu def=%zu raw=%zu mode=%d%s%s\n",
+            hdr, def_n, raw_n, mode,
+            mode == 1 ? " (preflate)" : " (l9)",
+            inner_kind == 1 ? " inner=tar" : "");
 
     free(raw);
     buf_free(&preflate_diff);
+    buf_free(&tar_recipe);
+    buf_free(&tar_solid);
     return 0;
 }
 
 /* Reconstruct a gzip from recipe + solid bytes. */
 static void unpack_gz(const uint8_t *recipe, size_t rlen,
                       const uint8_t *solid, size_t solid_len, size_t *solid_pos,
-                      FILE *out, uint64_t expected_size) {
+                      FILE *out, uint64_t expected_size, const char *tmp_prefix) {
     size_t r = 0;
     if (r + 4 > rlen) die("gz recipe truncated");
     uint32_t hdr_len = r32(recipe + r); r += 4;
@@ -1012,10 +1051,41 @@ static void unpack_gz(const uint8_t *recipe, size_t rlen,
     }
     if (r + 8 > rlen) die("gz trailer truncated");
     const uint8_t *trailer = recipe + r; r += 8;
+    if (r + 1 > rlen) die("gz inner_kind truncated");
+    uint8_t inner_kind = recipe[r]; r += 1;
+    const uint8_t *tar_recipe = NULL; uint32_t tar_recipe_len = 0;
+    if (inner_kind == 1) {
+        if (r + 4 > rlen) die("gz tar recipe len truncated");
+        tar_recipe_len = r32(recipe + r); r += 4;
+        if (r + tar_recipe_len > rlen) die("gz tar recipe overflow");
+        tar_recipe = recipe + r; r += tar_recipe_len;
+    }
     if (r != rlen) die("gz recipe trailing bytes");
 
-    if (*solid_pos + raw_len > solid_len) die("gz solid overflow");
-    const uint8_t *raw = solid + *solid_pos;
+    /* Materialize the inflated body. inner_kind=0: raw bytes are in solid.
+     * inner_kind=1: reconstruct via the nested tar recipe (which itself
+     * consumes from solid). */
+    uint8_t *raw_buf = NULL;
+    const uint8_t *raw = NULL;
+    if (inner_kind == 0) {
+        if (*solid_pos + raw_len > solid_len) die("gz solid overflow");
+        raw = solid + *solid_pos;
+        *solid_pos += raw_len;
+    } else {
+        char tp[2048];
+        snprintf(tp, sizeof(tp), "%s.gztar.tmp", tmp_prefix);
+        FILE *tf = fopen(tp, "wb");
+        if (!tf) die("fopen gz tar tmp");
+        unpack_recipe(tar_recipe, tar_recipe_len,
+                      solid, solid_len, solid_pos,
+                      tf, raw_len, tp);
+        fclose(tf);
+        size_t got_n = 0;
+        raw_buf = read_whole_file(tp, &got_n);
+        unlink(tp);
+        if (got_n != raw_len) die("gz tar size mismatch");
+        raw = raw_buf;
+    }
 
     uint8_t *def_buf = NULL; size_t def_n = 0;
     if (mode == 0) {
@@ -1032,7 +1102,7 @@ static void unpack_gz(const uint8_t *recipe, size_t rlen,
     if (fwrite(trailer, 1, 8, out) != 8) die("fwrite gz trailer");
 
     if (mode == 0) free(def_buf); else zxle_preflate_free(def_buf);
-    *solid_pos += raw_len;
+    free(raw_buf);
     uint64_t written = (uint64_t)hdr_len + def_n + 8;
     if (written != expected_size) die("gz size mismatch");
 }
@@ -1318,7 +1388,9 @@ static int do_pack(int argc, char **argv) {
             }
         }
         if (!unwrapped && fsz >= 18 && fb[0]==0x1F && fb[1]==0x8B && fb[2]==0x08) {
-            if (pack_gz(fb, fsz, &ents[i].recipe, &solid) == 0) {
+            char tp[1024];
+            snprintf(tp, sizeof(tp), "%s.%d", out, i);
+            if (pack_gz(fb, fsz, tp, &ents[i].recipe, &solid) == 0) {
                 ents[i].kind = KIND_GZIP;
                 unwrapped = 1;
             } else {
@@ -1578,7 +1650,7 @@ static int do_unpack(int argc, char **argv) {
         } else if (ents[i].kind == KIND_GZIP) {
             unpack_gz(ents[i].recipe, ents[i].recipe_len,
                       solid, solid_len, &solid_pos,
-                      of, ents[i].orig_size);
+                      of, ents[i].orig_size, p);
             fclose(of);
         } else if (ents[i].kind == KIND_TAR) {
             unpack_recipe(ents[i].recipe, ents[i].recipe_len,
