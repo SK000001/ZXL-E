@@ -146,6 +146,8 @@ bench_file "M3c packmp3 (MP3)" tests/corpus/synth.mp3
 bench_file "M3d gzip (gz)"     tests/corpus/ntdll.dll.gz
 bench_file "M3e tar (mixed)"   tests/corpus/mixed.tar
 bench_file "M3e-targz (gz of mixed.tar)" tests/corpus/mixed.tar.gz
+bench_file "M3e-tar gzip-in-tar"         tests/corpus/gz-in.tar
+bench_file "M3f-ar (.deb shape)"          tests/corpus/mixed.deb
 
 # M3b: JPEG via brunsli. Same shape as bench_zip, but compares brunsli-routed
 # zxle against xz-9e (which hits the already-compressed wall).

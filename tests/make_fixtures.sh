@@ -103,6 +103,40 @@ if want mixed.tar; then
     fi
 fi
 
+# mixed.deb — .deb-shape AR archive: debian-binary + data.tar.gz of two DLLs.
+# Tests M3f-ar recursive unwrap (ar -> gzip -> tar -> DLLs).
+if want mixed.deb; then
+    CORPUS="${ZXLE_CORPUS:-../../../Zxl/tests}"
+    if [ -f "$CORPUS/ntdll.dll" ] && [ -f "$CORPUS/kernel32.dll" ]; then
+        TMP=$(mktemp -d)
+        echo "2.0" > "$TMP/debian-binary"
+        cp "$CORPUS/ntdll.dll" "$CORPUS/kernel32.dll" "$TMP/"
+        (cd "$TMP" && tar cf data.tar ntdll.dll kernel32.dll && \
+            gzip -9 data.tar && \
+            ar rc mixed.deb debian-binary data.tar.gz)
+        mv "$TMP/mixed.deb" .
+        rm -rf "$TMP"
+    else
+        echo "skipping mixed.deb -- corpus DLLs not found"
+    fi
+fi
+
+# gz-in.tar — tar containing a .gz file + a plain DLL. Tests OP_GZIP_STORE
+# routing inside pack_tar.
+if want gz-in.tar; then
+    CORPUS="${ZXLE_CORPUS:-../../../Zxl/tests}"
+    if [ -f "$CORPUS/ntdll.dll" ] && [ -f "$CORPUS/kernel32.dll" ]; then
+        TMP=$(mktemp -d)
+        cp "$CORPUS/ntdll.dll" "$TMP/" && gzip -9 "$TMP/ntdll.dll"
+        cp "$CORPUS/kernel32.dll" "$TMP/"
+        (cd "$TMP" && tar cf gz-in.tar ntdll.dll.gz kernel32.dll)
+        mv "$TMP/gz-in.tar" .
+        rm -rf "$TMP"
+    else
+        echo "skipping gz-in.tar -- corpus DLLs not found"
+    fi
+fi
+
 # mixed.tar.gz — gzip wrap of mixed.tar. Tests M3e-targz: gzip-wrapped tar with
 # per-entry payloads getting format-aware routing (PNG -> pack_png, JPEG ->
 # brunsli, DLLs -> solid STORE) instead of opaque-to-solid.

@@ -28,8 +28,17 @@
  *                                                    vocabulary as kind==1.
  *                                                    Per-entry payloads route
  *                                                    via OP_STORE / OP_JPEG_STORE
- *                                                    / OP_PNG_STORE; headers
- *                                                    and padding go in OP_STRUCT.
+ *                                                    / OP_PNG_STORE / OP_GZIP_STORE;
+ *                                                    headers and padding go in
+ *                                                    OP_STRUCT.
+ *     [if kind==7] u32 recipe_len, recipe_bytes   -- ar recipe (Unix archive,
+ *                                                    .a / .deb). Same OP_*
+ *                                                    vocabulary; per-entry
+ *                                                    payloads route via OP_STORE
+ *                                                    / OP_GZIP_STORE / OP_PNG_STORE
+ *                                                    / OP_JPEG_STORE; headers
+ *                                                    and 2-byte alignment pad
+ *                                                    go in OP_STRUCT.
  *   zstd-19 payload: solid concatenation of "raw input bytes" (kind=0) or
  *     "raw entry bytes from re-deflatable / stored ZIP entries" (kind=1),
  *     in manifest order.
@@ -50,6 +59,10 @@
  *                      to reconstruct `len` PNG bytes; consumes inflated IDAT
  *                      bytes from the solid stream (per the PNG recipe). Used
  *                      for STORED ZIP entries whose payload is a PNG.
+ *   0x06 GZIP_STORE -- (u32 gz_recipe_len)(gz_recipe_bytes); call unpack_gz
+ *                      to reconstruct `len` gzip bytes; consumes inflated body
+ *                      bytes from the solid stream (per the embedded gzip
+ *                      recipe). Used for gzip files inside tar/ar entries.
  *
  * ZIP unwrap scope: zlib-DEFLATE / stored entries; ZIP64 / encryption /
  * DEFLATE64 / BZIP2 / LZMA / prefix bytes -> falls back to KIND_OPAQUE.
@@ -83,6 +96,7 @@
 #define KIND_PNG    4
 #define KIND_GZIP   5
 #define KIND_TAR    6
+#define KIND_AR     7
 
 /* PNG (kind=4) recipe layout (parsed by pack_png/unpack_png; not by
  * unpack_recipe — KIND_PNG does not use the OP_* tags):
@@ -125,6 +139,7 @@
 #define OP_PREFLATE   0x03
 #define OP_JPEG_STORE 0x04
 #define OP_PNG_STORE  0x05
+#define OP_GZIP_STORE 0x06
 
 /* Defined in preflate_shim.cpp; both return 1 on success, 0 on failure.
  * Out buffers are malloc'd; release with zxle_preflate_free. */
@@ -576,6 +591,13 @@ static void unpack_recipe(const uint8_t *recipe, size_t rlen,
             if (r + prl > rlen) die("recipe PNG_STORE recipe overflow");
             unpack_png(recipe + r, prl, solid, solid_len, solid_pos, out, len);
             r += prl;
+            written += len;
+        } else if (op == OP_GZIP_STORE) {
+            if (r + 4 > rlen) die("recipe GZIP_STORE recipe_len truncated");
+            uint32_t grl = r32(recipe + r); r += 4;
+            if (r + grl > rlen) die("recipe GZIP_STORE recipe overflow");
+            unpack_gz(recipe + r, grl, solid, solid_len, solid_pos, out, len, tmp_prefix);
+            r += grl;
             written += len;
         } else if (op == OP_PREFLATE) {
             if (r + 4 > rlen) die("recipe PREFLATE diff_len truncated");
@@ -1193,6 +1215,24 @@ static int pack_tar(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *rec
                 }
                 buf_free(&brn);
             }
+            if (!handled && is_regular && size >= 18 &&
+                p[cur] == 0x1F && p[cur+1] == 0x8B && p[cur+2] == 0x08) {
+                char tp[1024];
+                snprintf(tp, sizeof(tp), "%s.tgz.%zu", tmp_prefix, cur);
+                Buf gz_recipe; buf_init(&gz_recipe);
+                Buf gz_solid;  buf_init(&gz_solid);
+                if (pack_gz(p + cur, (size_t)size, tp, &gz_recipe, &gz_solid) == 0) {
+                    buf_u8(recipe, OP_GZIP_STORE);
+                    buf_u32(recipe, (uint32_t)size);
+                    buf_u32(recipe, (uint32_t)gz_recipe.n);
+                    buf_append(recipe, gz_recipe.p, gz_recipe.n);
+                    buf_append(solid, gz_solid.p, gz_solid.n);
+                    gzip_stored++;
+                    handled = 1;
+                }
+                buf_free(&gz_recipe);
+                buf_free(&gz_solid);
+            }
             if (!handled) {
                 buf_u8(recipe, OP_STORE);
                 buf_u32(recipe, (uint32_t)size);
@@ -1200,7 +1240,6 @@ static int pack_tar(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *rec
                 stored_plain++;
             }
             cur += size;
-            (void)gzip_stored;
 
             uint64_t pad = padded - size;
             if (pad > 0) {
@@ -1219,8 +1258,128 @@ static int pack_tar(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *rec
         buf_append(recipe, p + cur, n - cur);
     }
 
-    fprintf(stderr, "    tar: %d regular (%d store, %d jpeg-store, %d png-store)\n",
-            regulars, stored_plain, jpeg_stored, png_stored);
+    fprintf(stderr, "    tar: %d regular (%d store, %d jpeg-store, %d png-store, %d gzip-store)\n",
+            regulars, stored_plain, jpeg_stored, png_stored, gzip_stored);
+    return 0;
+}
+
+/* ---------- ar (Unix archive: .a, .deb) ---------- */
+
+/* Pack a top-level AR archive. 8-byte magic "!<arch>\n" then per-entry 60-byte
+ * headers (16-byte name + 12-byte mtime + 6-byte uid + 6-byte gid + 8-byte mode
+ * + 10-byte ASCII-decimal size + 2-byte 0x60 0x0A magic). Entries are 2-byte
+ * aligned: a single 0x0A pad byte follows odd-sized payloads.
+ *
+ * Same OP_* vocabulary as KIND_TAR. Per-entry payloads route via OP_GZIP_STORE
+ * (gzip files inside the archive — typical for .deb's data.tar.gz / control.tar.gz),
+ * OP_PNG_STORE, OP_JPEG_STORE, else OP_STORE. Headers and pad bytes go in
+ * OP_STRUCT verbatim.
+ *
+ * BSD vs GNU long-name variants don't need to be interpreted: we treat the
+ * special "//" / "#1/N" entries as opaque payloads (just route them through
+ * the same payload-dispatch chain as anything else; they typically don't
+ * match gzip/png/jpeg magic so they fall through to OP_STORE). */
+static int pack_ar(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *recipe, Buf *solid) {
+    if (n < 8) return -1;
+    if (memcmp(p, "!<arch>\n", 8) != 0) return -1;
+
+    buf_u8(recipe, OP_STRUCT);
+    buf_u32(recipe, 8);
+    buf_append(recipe, p, 8);
+
+    size_t cur = 8;
+    int entries = 0, gzip_stored = 0, png_stored = 0, jpeg_stored = 0, stored_plain = 0;
+
+    while (cur < n) {
+        if (cur + 60 > n) return -1;
+        const uint8_t *hdr = p + cur;
+        if (hdr[58] != 0x60 || hdr[59] != 0x0A) return -1;
+
+        uint64_t size = 0;
+        for (int i = 0; i < 10; i++) {
+            uint8_t c = hdr[48 + i];
+            if (c == ' ' || c == 0) break;
+            if (c < '0' || c > '9') return -1;
+            size = size * 10 + (c - '0');
+        }
+        if (size > 0xFFFFFFFFu) return -1;
+        if (cur + 60 + size > n) return -1;
+
+        buf_u8(recipe, OP_STRUCT);
+        buf_u32(recipe, 60);
+        buf_append(recipe, hdr, 60);
+        cur += 60;
+
+        if (size > 0) {
+            const uint8_t *body = p + cur;
+            int handled = 0;
+
+            if (size >= 18 && body[0] == 0x1F && body[1] == 0x8B && body[2] == 0x08) {
+                char tp[1024];
+                snprintf(tp, sizeof(tp), "%s.argz.%zu", tmp_prefix, cur);
+                Buf gz_recipe; buf_init(&gz_recipe);
+                Buf gz_solid;  buf_init(&gz_solid);
+                if (pack_gz(body, (size_t)size, tp, &gz_recipe, &gz_solid) == 0) {
+                    buf_u8(recipe, OP_GZIP_STORE);
+                    buf_u32(recipe, (uint32_t)size);
+                    buf_u32(recipe, (uint32_t)gz_recipe.n);
+                    buf_append(recipe, gz_recipe.p, gz_recipe.n);
+                    buf_append(solid, gz_solid.p, gz_solid.n);
+                    gzip_stored++;
+                    handled = 1;
+                }
+                buf_free(&gz_recipe);
+                buf_free(&gz_solid);
+            }
+            if (!handled && size >= 8 && memcmp(body, PNG_SIG, 8) == 0) {
+                Buf png_recipe; buf_init(&png_recipe);
+                if (pack_png(body, (size_t)size, &png_recipe, solid) == 0) {
+                    buf_u8(recipe, OP_PNG_STORE);
+                    buf_u32(recipe, (uint32_t)size);
+                    buf_u32(recipe, (uint32_t)png_recipe.n);
+                    buf_append(recipe, png_recipe.p, png_recipe.n);
+                    png_stored++;
+                    handled = 1;
+                }
+                buf_free(&png_recipe);
+            }
+            if (!handled && size >= 4 &&
+                body[0] == 0xFF && body[1] == 0xD8 && body[2] == 0xFF) {
+                char tp[2048];
+                snprintf(tp, sizeof(tp), "%s.arj.%zu", tmp_prefix, cur);
+                Buf brn; buf_init(&brn);
+                if (try_brunsli_buf(body, (size_t)size, tp, &brn) == 0) {
+                    buf_u8(recipe, OP_JPEG_STORE);
+                    buf_u32(recipe, (uint32_t)size);
+                    buf_u32(recipe, (uint32_t)brn.n);
+                    buf_append(recipe, brn.p, brn.n);
+                    jpeg_stored++;
+                    handled = 1;
+                }
+                buf_free(&brn);
+            }
+            if (!handled) {
+                buf_u8(recipe, OP_STORE);
+                buf_u32(recipe, (uint32_t)size);
+                buf_append(solid, body, (size_t)size);
+                stored_plain++;
+            }
+            cur += size;
+        }
+
+        /* 2-byte alignment: a single 0x0A pad byte after an odd-sized entry. */
+        if (cur < n && (cur & 1) == 1) {
+            if (p[cur] != 0x0A) return -1;
+            buf_u8(recipe, OP_STRUCT);
+            buf_u32(recipe, 1);
+            buf_append(recipe, p + cur, 1);
+            cur += 1;
+        }
+        entries++;
+    }
+
+    fprintf(stderr, "    ar: %d entries (%d store, %d gzip-store, %d png-store, %d jpeg-store)\n",
+            entries, stored_plain, gzip_stored, png_stored, jpeg_stored);
     return 0;
 }
 
@@ -1409,6 +1568,17 @@ static int do_pack(int argc, char **argv) {
                 buf_init(&ents[i].recipe);
             }
         }
+        if (!unwrapped && fsz >= 8 && memcmp(fb, "!<arch>\n", 8) == 0) {
+            char tp[1024];
+            snprintf(tp, sizeof(tp), "%s.%d", out, i);
+            if (pack_ar(fb, fsz, tp, &ents[i].recipe, &solid) == 0) {
+                ents[i].kind = KIND_AR;
+                unwrapped = 1;
+            } else {
+                buf_free(&ents[i].recipe);
+                buf_init(&ents[i].recipe);
+            }
+        }
         if (!unwrapped) {
             ents[i].kind = KIND_OPAQUE;
             buf_append(&solid, fb, fsz);
@@ -1441,6 +1611,7 @@ static int do_pack(int argc, char **argv) {
         if (ents[i].kind == KIND_PNG)  mlen += 4 + ents[i].recipe.n;
         if (ents[i].kind == KIND_GZIP) mlen += 4 + ents[i].recipe.n;
         if (ents[i].kind == KIND_TAR)  mlen += 4 + ents[i].recipe.n;
+        if (ents[i].kind == KIND_AR)   mlen += 4 + ents[i].recipe.n;
     }
 
     FILE *o = fopen(out, "wb");
@@ -1477,6 +1648,10 @@ static int do_pack(int argc, char **argv) {
             if (ents[i].recipe.n > 0)
                 fwrite(ents[i].recipe.p, 1, ents[i].recipe.n, o);
         } else if (ents[i].kind == KIND_TAR) {
+            wu32(o, (uint32_t)ents[i].recipe.n);
+            if (ents[i].recipe.n > 0)
+                fwrite(ents[i].recipe.p, 1, ents[i].recipe.n, o);
+        } else if (ents[i].kind == KIND_AR) {
             wu32(o, (uint32_t)ents[i].recipe.n);
             if (ents[i].recipe.n > 0)
                 fwrite(ents[i].recipe.p, 1, ents[i].recipe.n, o);
@@ -1588,6 +1763,12 @@ static int do_unpack(int argc, char **argv) {
             if (mp + ents[count].recipe_len > mlen) die("tar recipe overflow");
             ents[count].recipe = manifest + mp;
             mp += ents[count].recipe_len;
+        } else if (ents[count].kind == KIND_AR) {
+            if (mp + 4 > mlen) die("ar recipe len truncated");
+            ents[count].recipe_len = r32(manifest + mp); mp += 4;
+            if (mp + ents[count].recipe_len > mlen) die("ar recipe overflow");
+            ents[count].recipe = manifest + mp;
+            mp += ents[count].recipe_len;
         }
         count++;
     }
@@ -1653,6 +1834,11 @@ static int do_unpack(int argc, char **argv) {
                       of, ents[i].orig_size, p);
             fclose(of);
         } else if (ents[i].kind == KIND_TAR) {
+            unpack_recipe(ents[i].recipe, ents[i].recipe_len,
+                          solid, solid_len, &solid_pos,
+                          of, ents[i].orig_size, p);
+            fclose(of);
+        } else if (ents[i].kind == KIND_AR) {
             unpack_recipe(ents[i].recipe, ents[i].recipe_len,
                           solid, solid_len, &solid_pos,
                           of, ents[i].orig_size, p);
