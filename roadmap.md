@@ -4,9 +4,13 @@ Single source of truth for where ZXL-E is, where it's going, and what not to ret
 
 ---
 
-## Current state (2026-05-03, M3e-targz shipped)
+## Current state (2026-05-03, M3f-ar shipped)
 
-M1 + M2 + M3a (preflate) + M3b (brunsli) + M3b-zip (JPEG-in-ZIP) + M3c-mp3 (packMP3) + M3c-png (zlib-L9 / preflate over IDAT) + M3c-png-zip (PNG-in-ZIP) + M3d-gzip (single-member gzip wrapper) + M3e-tar (ustar per-entry dispatch) + M3e-targz (gzip-wrapped tar) ship end-to-end. Round-trip OK across the 8-file corpus, all ZIP fixtures, the DOCX/JAR fixtures, the standalone JPEG/MP3/PNG fixtures, the gzip fixture, and the new mixed.tar fixture.
+M1 + M2 + M3a (preflate) + M3b (brunsli) + M3b-zip (JPEG-in-ZIP) + M3c-mp3 (packMP3) + M3c-png (zlib-L9 / preflate over IDAT) + M3c-png-zip (PNG-in-ZIP) + M3d-gzip (single-member gzip wrapper) + M3e-tar (ustar per-entry dispatch) + M3e-targz (gzip-wrapped tar) + M3e-tar-gz-in (gzip files inside tar) + M3f-ar (Unix archive: .a / .deb) ship end-to-end. Round-trip OK across the 8-file corpus, all ZIP fixtures, the DOCX/JAR fixtures, the standalone JPEG/MP3/PNG fixtures, the gzip fixture, and the new mixed.tar fixture.
+
+**Headline M3f-ar result:** on a `.deb`-shape AR archive (8-byte `!<arch>\n` magic + `debian-binary` text entry + `data.tar.gz` of two corpus DLLs, 1,543,622 B) `zxle` is **−13.31% vs xz-9e** (1,336,266 vs 1,541,516). Recursive unwrap chain: `ar → gzip → tar → DLLs`, each layer routed through its own pack handler so the inflated DLL bytes land in the same solid stream as everything else. New container kind `KIND_AR = 7`; new recipe op `OP_GZIP_STORE = 0x06` carries an embedded gzip recipe inside any outer container's recipe (used by both `pack_ar` and the new gzip path inside `pack_tar`). Headers and 2-byte alignment pad bytes go in `OP_STRUCT`. BSD vs GNU long-name variants don't need to be interpreted — special `//` / `#1/N` entries route through the same payload-dispatch chain (typically falls through to OP_STORE).
+
+Bonus headline (same op): on `gz-in.tar` (ustar tar containing one `.gz` file + one stored DLL, 2,007,040 B) `zxle` is **−9.37% vs xz-9e** (1,336,642 vs 1,474,808). The `.gz` entry inside the tar now routes through `pack_gz` instead of opaquing to solid; xz-9e can't crack the gzip-deflated portion so loses despite the stored DLL being trivially redeflatable.
 
 **Headline M3e-targz result:** on `mixed.tar.gz` (gzip -9 wrap of `mixed.tar`, 1,419,435 B) `zxle` is **−16.04% vs xz-9e** (1,191,596 vs 1,419,292) — xz can barely touch a `.gz` file because the deflated body is already opaque to it, while zxle inflates the gzip, recursively routes the inner tar through `pack_tar`, and PNG/JPEG payloads get format-aware treatment. KIND_GZIP recipe gained a trailing `inner_kind` byte (0=plain solid, 1=tar) plus an optional nested tar recipe; mode 0/1 (l9 vs preflate) is unchanged. Single-member gzip only (same M3d limitation).
 
@@ -42,6 +46,8 @@ Corpus per-file average vs orig: 0.3721 → **0.3673**. Solid: 0.3655 → **0.36
 | ntdll.dll.gz (gzip -default of corpus DLL) | 1,163,931 | 1,029,252 | 1,162,316 | **−11.45%** |
 | mixed.tar (PNG + JPEG + 2 DLLs, ustar) | 3,041,280 | 1,188,859 | 1,188,340 | **+0.04%** (ties xz-9e; −5.16% vs zstd-19) |
 | mixed.tar.gz (gzip -9 wrap of mixed.tar) | 1,419,435 | 1,191,596 | 1,419,292 | **−16.04%** |
+| gz-in.tar (.gz file inside ustar tar) | 2,007,040 | 1,336,642 | 1,474,808 | **−9.37%** |
+| mixed.deb (.deb-shape ar -> gzip -> tar -> DLLs) | 1,543,622 | 1,336,266 | 1,541,516 | **−13.31%** |
 
 DOCX/JAR results confirm the M2+M3a unwrap path generalizes from PE-DLL ZIPs to real-world XML/class-file ZIPs (DOCX exceeds the PE-DLL win because XML deflates more thoroughly when re-fed to zstd-19 solid). MP3 result is M3c-mp3 (packMP3 routing). Note: the original 10 s 440 Hz tone was replaced by a 30 s synthesized stereo signal (sine + phaser + chorus) because pure-tone MP3 frames are dominated by repetition and compress trivially under xz-9e (−45% with no help), masking packMP3's structural win.
 
@@ -175,6 +181,8 @@ Route each stream to its strongest recompressor. Tracked as sub-milestones.
 - ~~gzip single-member wrapper~~ — shipped as M3d-gzip above.
 - ~~ustar tar per-entry dispatch~~ — shipped as M3e-tar above.
 - ~~gzip-wrapped tar~~ — shipped as M3e-targz above.
+- ~~gzip files inside tar~~ — shipped (added `OP_GZIP_STORE` to the OP vocabulary, wired into `pack_tar` alongside the new M3f-ar handler).
+- ~~Unix AR archive (.a / .deb)~~ — shipped as M3f-ar above.
 
 Each recompressor lives behind an availability check; missing recompressors fall through to opaque-zstd.
 
