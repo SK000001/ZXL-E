@@ -4,9 +4,11 @@ Single source of truth for where ZXL-E is, where it's going, and what not to ret
 
 ---
 
-## Current state (2026-05-02, M3e-tar shipped)
+## Current state (2026-05-03, M3e-targz shipped)
 
-M1 + M2 + M3a (preflate) + M3b (brunsli) + M3b-zip (JPEG-in-ZIP) + M3c-mp3 (packMP3) + M3c-png (zlib-L9 / preflate over IDAT) + M3c-png-zip (PNG-in-ZIP) + M3d-gzip (single-member gzip wrapper) + M3e-tar (ustar per-entry dispatch) ship end-to-end. Round-trip OK across the 8-file corpus, all ZIP fixtures, the DOCX/JAR fixtures, the standalone JPEG/MP3/PNG fixtures, the gzip fixture, and the new mixed.tar fixture.
+M1 + M2 + M3a (preflate) + M3b (brunsli) + M3b-zip (JPEG-in-ZIP) + M3c-mp3 (packMP3) + M3c-png (zlib-L9 / preflate over IDAT) + M3c-png-zip (PNG-in-ZIP) + M3d-gzip (single-member gzip wrapper) + M3e-tar (ustar per-entry dispatch) + M3e-targz (gzip-wrapped tar) ship end-to-end. Round-trip OK across the 8-file corpus, all ZIP fixtures, the DOCX/JAR fixtures, the standalone JPEG/MP3/PNG fixtures, the gzip fixture, and the new mixed.tar fixture.
+
+**Headline M3e-targz result:** on `mixed.tar.gz` (gzip -9 wrap of `mixed.tar`, 1,419,435 B) `zxle` is **−16.04% vs xz-9e** (1,191,596 vs 1,419,292) — xz can barely touch a `.gz` file because the deflated body is already opaque to it, while zxle inflates the gzip, recursively routes the inner tar through `pack_tar`, and PNG/JPEG payloads get format-aware treatment. KIND_GZIP recipe gained a trailing `inner_kind` byte (0=plain solid, 1=tar) plus an optional nested tar recipe; mode 0/1 (l9 vs preflate) is unchanged. Single-member gzip only (same M3d limitation).
 
 **Headline M3e-tar result:** on `mixed.tar` (3,041,280 B, ustar tar of corpus PNG + JPEG + 2 corpus DLLs) `zxle` ties `xz-9e` to within 0.04% (1,188,859 vs 1,188,340 — a 519-byte noise gap), and beats opaque zstd-19 by 5.16% (1,253,549). Top-level files with `"ustar"` at offset 257 are walked block-by-block; per-entry payloads route through `pack_png` / brunsli / OP_STORE; headers and padding go in OP_STRUCT verbatim. Recipe reuses the OP_* vocabulary from KIND_ZIP, so unpack dispatches the same `unpack_recipe` walker — no separate decoder.
 
@@ -39,6 +41,7 @@ Corpus per-file average vs orig: 0.3721 → **0.3673**. Solid: 0.3655 → **0.36
 | zip-with-png.zip (1 stored PNG + 2 deflate-9 DLLs) | 1,263,952 | 1,060,279 | 1,258,232 | **−15.73%** |
 | ntdll.dll.gz (gzip -default of corpus DLL) | 1,163,931 | 1,029,252 | 1,162,316 | **−11.45%** |
 | mixed.tar (PNG + JPEG + 2 DLLs, ustar) | 3,041,280 | 1,188,859 | 1,188,340 | **+0.04%** (ties xz-9e; −5.16% vs zstd-19) |
+| mixed.tar.gz (gzip -9 wrap of mixed.tar) | 1,419,435 | 1,191,596 | 1,419,292 | **−16.04%** |
 
 DOCX/JAR results confirm the M2+M3a unwrap path generalizes from PE-DLL ZIPs to real-world XML/class-file ZIPs (DOCX exceeds the PE-DLL win because XML deflates more thoroughly when re-fed to zstd-19 solid). MP3 result is M3c-mp3 (packMP3 routing). Note: the original 10 s 440 Hz tone was replaced by a 30 s synthesized stereo signal (sine + phaser + chorus) because pure-tone MP3 frames are dominated by repetition and compress trivially under xz-9e (−45% with no help), masking packMP3's structural win.
 
@@ -157,10 +160,10 @@ Route each stream to its strongest recompressor. Tracked as sub-milestones.
 - Size parsed as octal; GNU base-256 size encoding rejected (high bit on size[0] → fall through to KIND_OPAQUE). Non-regular typeflags (dirs/links/longname) keep their header in OP_STRUCT and have no payload to route; a non-regular entry with non-zero size is conservatively STORE'd.
 - Measured on `mixed.tar` (PNG + JPEG + 2 DLLs, 3,041,280 B): zxle 1,188,859 vs xz-9e 1,188,340 → **+0.04%** (519-byte noise tie); vs opaque zstd-19 1,253,549 → −5.16%. Media-only tar (PNG + JPEG): zxle 244,180 vs xz-9e 313,780 → **−22.18%**.
 
-#### M3e-targz — gzip-wrapped tar (pending)
-**Branch:** `feat/m3e-targz` · **Expected:** combines M3d-gzip + M3e-tar; should match M3e-tar headline on the inflated tar.
-
-When `pack_gz` succeeds and the inflated body looks like a tar, route it through `pack_tar` instead of dumping inflated bytes to solid. Recipe nests the tar recipe inside the gzip recipe.
+#### M3e-targz — gzip-wrapped tar (shipped 2026-05-03)
+- KIND_GZIP recipe extended with a trailing `u8 inner_kind` (0 = inflated body bytes consumed from solid verbatim — old M3d behavior; 1 = inflated body is a ustar tar) plus, when `inner_kind==1`, a `(u32 tar_recipe_len, tar_recipe_bytes)` nested tar recipe. The nested tar recipe consumes from the same solid stream via `unpack_recipe`. Pack: after `pack_gz` inflates and CRC-verifies the body and picks mode 0/1, if the body sniffs as ustar (size ≥ 1024, multiple of 512, "ustar" at offset 257), `pack_tar` is run on the inflated bytes into scratch buffers; on success, those scratch buffers are committed instead of dumping `raw` to solid. Unpack: when `inner_kind==1`, `unpack_gz` materializes the tar bytes via `unpack_recipe` to a temp file, reads them back, then deflates as before.
+- Measured on `mixed.tar.gz` (gzip -9 wrap of `mixed.tar`, 1,419,435 B): zxle 1,191,596 vs xz-9e 1,419,292 → **−16.04%**. Inner tar shows `4 regular (2 store, 1 jpeg-store, 1 png-store)`. RT OK. All other fixtures preserved within ±1 B (KIND_GZIP entries gained 1 byte for the new `inner_kind` flag).
+- Limitation inherits M3d's single-member-gzip-only constraint and M3e-tar's ustar-only constraint. Multi-member `.gz` or non-ustar tar inside a `.gz` falls through to the existing M3d plain-solid path.
 
 #### M3c / M3d / M3e — pending sub-milestones
 **Branch:** `feat/m3-*` · **Expected:** large wins per stream.
@@ -171,6 +174,7 @@ When `pack_gz` succeeds and the inflated body looks like a tar, route it through
 - ~~JPEGs inside ZIP entries~~ — shipped as M3b-zip above.
 - ~~gzip single-member wrapper~~ — shipped as M3d-gzip above.
 - ~~ustar tar per-entry dispatch~~ — shipped as M3e-tar above.
+- ~~gzip-wrapped tar~~ — shipped as M3e-targz above.
 
 Each recompressor lives behind an availability check; missing recompressors fall through to opaque-zstd.
 
