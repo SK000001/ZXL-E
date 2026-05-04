@@ -4,9 +4,11 @@ Single source of truth for where ZXL-E is, where it's going, and what not to ret
 
 ---
 
-## Current state (2026-05-04, M3h-zsttar shipped)
+## Current state (2026-05-05, min-pack fallthrough shipped)
 
-M1 + M2 + M3a (preflate) + M3b (brunsli) + M3b-zip (JPEG-in-ZIP) + M3c-mp3 (packMP3) + M3c-png (zlib-L9 / preflate over IDAT) + M3c-png-zip (PNG-in-ZIP) + M3d-gzip (single-member gzip wrapper) + M3e-tar (ustar per-entry dispatch) + M3e-targz (gzip-wrapped tar) + M3e-tar-gz-in (gzip files inside tar) + M3f-ar (Unix archive: .a / .deb) + M3g-bz2tar (bzip2-wrapped tar) + M3h-zsttar (zstd-wrapped tar) ship end-to-end. Round-trip OK across the 8-file corpus, all ZIP fixtures, the DOCX/JAR fixtures, the standalone JPEG/MP3/PNG fixtures, the gzip fixture, the mixed.tar/tar.gz/tar.bz2/.deb fixtures.
+M1 + M2 + M3a (preflate) + M3b (brunsli) + M3b-zip (JPEG-in-ZIP) + M3c-mp3 (packMP3) + M3c-png (zlib-L9 / preflate over IDAT) + M3c-png-zip (PNG-in-ZIP) + M3d-gzip (single-member gzip wrapper) + M3e-tar (ustar per-entry dispatch) + M3e-targz (gzip-wrapped tar) + M3e-tar-gz-in (gzip files inside tar) + M3f-ar (Unix archive: .a / .deb) + M3g-bz2tar (bzip2-wrapped tar) + M3h-zsttar (zstd-wrapped tar) + min-pack fallthrough ship end-to-end.
+
+**Headline min-pack result (2026-05-05):** the real-world bench (see `tests/real_world.md`) surfaced a catastrophic regression on small tightly-deflated tarballs: `leftpad.tgz` (1,679 B) packed to 6,067 B (+247.08% vs xz-9e), `is-odd.tgz` (2,774 B) to 6,952 B (+144.44%). The mechanism is structural — unwrapping a near-optimal gzip stream into 7 KB of inflated text and feeding it to solid zstd-19 cannot beat the original gzip output, but pays preflate reconstruction + recipe + solid framing overhead on top. Fix: `do_pack` now runs the existing pack twice when at least one entry is unwrapped — once with container routing engaged (status quo) and once with `force_opaque=1` (every input goes to KIND_OPAQUE) — and keeps the smaller result. After the fix: `leftpad.tgz` → 1,729 B (**−1.09%** vs xz-9e); `is-odd.tgz` → 2,823 B (**−0.74%**). `hello.deb` similarly tightened from +0.04% to −0.04%. All M1–M3h synthetic headlines preserved byte-exactly (the unwrap path wins on every fixture, so the opaque fallback is computed and discarded). All RT OK. 2× pack time on container-shaped inputs is the cost. Round-trip OK across the 8-file corpus, all ZIP fixtures, the DOCX/JAR fixtures, the standalone JPEG/MP3/PNG fixtures, the gzip fixture, the mixed.tar/tar.gz/tar.bz2/.deb fixtures.
 
 **Headline M3h-zsttar result:** on `mixed.tar.zst3` (default zstd -3 wrap of `mixed.tar`, 1,419,046 B) `zxle` is **−15.79% vs xz-9e** (1,188,879 vs 1,411,820). Default-level `.tar.zst` is the typical real-world shape (most CLI / distro tooling uses level 3, not max), and zstd -3 leaves much more headroom than xz-9e can recover from the outside. On the high-effort variant `mixed.tar.zst` (zstd -19 --long=27, 1,253,451 B) the win is **−5.16% vs xz-9e** (1,188,878 vs 1,253,580). New container kind `KIND_ZSTD = 9`. Recipe stores `(level, long_window, raw_len, orig_len, inner_kind, [tar_recipe])`. Reproducibility verified at pack time by probing a 7-entry `(level, --long)` ladder (covering our internal `-19 --long=27` first, then default `-3`, plus -22/-19/-22/-1 variants); first cmp match wins, otherwise KIND_OPAQUE.
 
@@ -89,34 +91,15 @@ The 8-file corpus contains no containers, so M2 doesn't change these numbers vs 
 
 ---
 
-## Next session — close the real-world validation gap (2026-05-04)
+## Next session — after min-pack (2026-05-05)
 
-The recent ladder of milestones (M3e through M3h) has been *coverage-completeness on synthetic fixtures*. Headlines vs xz-9e are real and reproducible (RT OK every commit), but **no real-world artifact has ever touched this codebase**. Every fixture is constructed by `tests/make_fixtures.sh` from sister-project DLLs + a `tar`/`gzip`/`bzip2`/`zstd` invocation. We do not know how zxle behaves on a real `.deb` from Debian, a real source tarball from kernel.org, an actual `.pkg.tar.zst` from Arch, an Android APK, or an npm tarball. Each new synthetic milestone is shrinking diminishing returns; the bigger questions are unanswered.
+The real-world bench (`tests/real_world.md`, run 2026-05-05) and the min-pack fix that followed cured the worst regression (npm tarballs +247% → −1%) and turned the marginal `.deb` / `.pkg.tar.zst` losses into wash-or-better. Two concrete misses are still on the board, in priority order:
 
-Two concrete moves, in this order:
+### 1. zstd ladder cannot reproduce real `.pkg.tar.zst`
 
-### 1. Real-world artifact bench (no code changes)
+Manual probing of `(level, --long, --ultra)` combinations including `-22 --ultra --long=27`, `-19 --ultra --long=27`, `-20 --long=27`, `--auto-threads`, etc., does **not** reproduce makepkg's output byte-exact for `which.pkg.tar.zst` (closest probe is 208 B off). The 7-entry ladder in `pack_zst` therefore fires KIND_OPAQUE on every real Arch package. The right fix is **frame-header-driven probing**: parse the input's zstd frame header (window descriptor, content-size flag, dictionary ID, content-checksum) and only try `(level, --long)` combos that match the observed parameters. This narrows the probe space and dramatically increases the hit rate on third-party zstd output. Until this lands KIND_ZSTD is a synthetic-fixture-only feature.
 
-Pull 5–10 real artifacts and run `zxle pack`/`unpack` on them with the current binary. Measure size vs xz-9e and zstd-19, verify byte-exact RT, log which KIND_* the top-level routes through and how many entries fall through to opaque inside containers. Candidates (small, public, easy):
-
-- A small Linux source tarball (`.tar.xz` from kernel.org or GNU — e.g., `make-4.4.1.tar.gz`, `bash-5.2.tar.gz`, a single sub-directory tarball).
-- A real `.deb` (e.g., a small Debian package — `coreutils`, `bash`, etc.).
-- A real `.pkg.tar.zst` (an Arch package — small one).
-- An Android APK (any open-source app's debug build).
-- An npm tarball (`.tgz` of a tiny package).
-- A real `.zip` with mixed content (e.g., a Github release artifact).
-- An `.epub` or `.docx` not generated by us.
-
-Output: a `tests/real_world.md` table — file, source URL, size, zxle, xz-9e, zstd-19, RT, top-level kind, % of payload bytes routed through KIND_OPAQUE inside the container. **This data tells us which gap to fund next, not vibes.**
-
-Likely findings (predict before measuring, then compare):
-- Many `.tar.xz` source tarballs → zxle currently falls through to KIND_OPAQUE entirely (no xz handler yet) → ties or slight regression vs xz-9e.
-- Modern `.deb` (data.tar.xz) → same: outer ar parses, inner xz opaque, headline likely flat or worse.
-- `.pkg.tar.zst` → ladder probably catches it (Arch uses level 19); should get inner-tar dispatch and a real win.
-- Android APK → ZIP unwrap engages, mixed STORE/DEFLATE entries; expect M2/M3a-style win plus brunsli on any embedded JPEG icons.
-- npm `.tgz` → gzip + tar; should engage M3e-targz cleanly and hit the inner-tar floor.
-
-### 2. KIND_XZ (after the bench tells us the size of the miss)
+### 2. KIND_XZ (still worthwhile, but narrower than originally framed)
 
 `.tar.xz` is structurally the largest current real-world miss (Linux source tarballs, modern .deb data layers, kernel patches, GNU releases). Same pack pattern as KIND_BZIP2 / KIND_ZSTD: shell out to `xz -d` to inflate, re-encode with `xz -9e` (verified deterministic for a given xz version) + cmp, ladder of `(level, --extreme on/off, --lzma2 preset)` if needed. Inner-kind dispatch routes ustar tar through `pack_tar`. Recipe stores `(level, extreme_flag, raw_len, orig_len, inner_kind, [tar_recipe])`.
 
@@ -277,6 +260,16 @@ Route each stream to its strongest recompressor. Tracked as sub-milestones.
 - Measured on `mixed.tar.zst` (zstd -19 --long=27 wrap of `mixed.tar`, 1,253,451 B): zxle 1,188,876 vs xz-9e 1,253,580 → **−5.16%**. RT OK. All other fixtures preserved.
 - Reproducibility: pack-time probes a 7-entry ladder of `(level, --long_window)` combos and stores the matching pair in the recipe (u8 level, u8 long_window). Order: `-19 --long=27` (matches our internal solid output), `-3` (zstd CLI default — most common in the wild), `-3 --long=27`, `-22 --long=27`, `-19`, `-22`, `-1`. First cmp match wins; if none match, KIND_OPAQUE.
 - Two fixture data points: `mixed.tar.zst` (level 19, 1,253,451 B → −5.16%); `mixed.tar.zst3` (level 3, 1,419,046 B → **−15.79%**). The default-level fixture is the more representative real-world shape and gives the bigger headline because xz-9e on a `-3` zstd stream still can't crack its body.
+
+#### min-pack fallthrough (shipped 2026-05-05)
+- New `pack_run(out, n, files, force_opaque, ...)` helper: lifted from `do_pack`'s body. When `force_opaque=1` every input is stored as KIND_OPAQUE (all magic-detection branches gated on `!force_opaque`); otherwise the unwrap chain runs as before. Returns the count of unwrapped entries plus the produced file size.
+- New `do_pack` driver: pack with unwrap engaged → if any entry was unwrapped, also pack as all-opaque to a sibling `.opq.tmp` → keep the smaller; emit `min-pack: opaque <a> < unwrap <b> -> using opaque` to stderr on the rare opaque-wins path. Cost: 2× pack time on container-shaped inputs (single-pass on plain inputs, since nothing was unwrapped to begin with).
+- Motivation: real-world bench (`tests/real_world.md`) revealed unwrapping a tightly-deflated 1.7 KB gzip into 7 KB of inflated text and feeding that to solid loses to the original gzip — solid zstd-19 cannot beat a near-optimal gzip encoding of the same bytes, and we pay preflate reconstruction + recipe + solid framing on top. Fix is correctness-safe (we only swap if smaller) and asymmetric in cost (the wins are large, the cost is just doubled pack time).
+- Measured (real-world bench, before → after):
+  - `leftpad.tgz` (npm, 1,679 B): +247.08% → **−1.09%** vs xz-9e
+  - `is-odd.tgz` (npm, 2,774 B):  +144.44% → **−0.74%** vs xz-9e
+  - `hello.deb` (Debian hello_2.10-3, 53,080 B): +0.04% → −0.04% vs xz-9e
+- Synthetic fixtures: every M1 / M2 / M3a–h headline is byte-exact unchanged because the unwrap path wins on each, so the opaque candidate is computed and discarded. RT OK across the full corpus + real-world bench.
 
 #### M3c / M3d / M3e — pending sub-milestones
 **Branch:** `feat/m3-*` · **Expected:** large wins per stream.
