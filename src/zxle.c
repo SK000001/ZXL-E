@@ -161,6 +161,8 @@
  */
 
 /* Zstd (kind=9) recipe layout (parsed by pack_zst/unpack_zst):
+ *   u8  level                     -- zstd compression level (1..22)
+ *   u8  long_window               -- 0 = no --long; else window log (e.g. 27)
  *   u32 raw_len                   -- decompressed payload size
  *   u32 orig_len                  -- original .zst file size (sanity)
  *   u8  inner_kind                -- 0 = inflated bytes consumed from solid
@@ -168,11 +170,9 @@
  *                                     tar (nested tar recipe consumes solid).
  *   [if inner_kind==1] u32 tar_recipe_len  tar_recipe_bytes
  *
- * Reproducibility: pack-time tries `zstd -19 --long=27` on the inflated bytes
- * and cmp's against the original. Any mismatch falls through to KIND_OPAQUE.
- * That matches what we use internally for the solid stream; .zst files in the
- * wild produced with other levels (default -3, -22, etc.) currently fall
- * through. Future work: probe a small ladder of levels.
+ * Reproducibility: pack-time probes a small ladder of (level, long_window)
+ * combos and cmp's the re-encode against the original. First match wins;
+ * fall through to KIND_OPAQUE if none match.
  */
 
 #define OP_STRUCT     0x00
@@ -1366,17 +1366,42 @@ static int pack_zst(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *rec
         free(raw); unlink(in_zst); unlink(raw_path); return -1;
     }
 
-    snprintf(cmd, sizeof(cmd), "zstd -19 --long=27 -q -f -o \"%s\" \"%s\" >%s 2>&1",
-             rt_zst, raw_path, ZXLE_DEVNULL);
-    if (try_run(cmd) != 0) {
-        free(raw); unlink(in_zst); unlink(raw_path); unlink(rt_zst); return -1;
+    /* Ladder of (level, long_window) combos to try at re-encode. First entry
+     * matches our internal solid setting (most common via this project's own
+     * outputs); -3 default catches typical CLI usage; -22/-19 with and without
+     * --long cover common high-effort and "fast" alternatives. */
+    static const struct { uint8_t level; uint8_t window; } ladder[] = {
+        {19, 27},
+        { 3,  0},
+        { 3, 27},
+        {22, 27},
+        {19,  0},
+        {22,  0},
+        { 1,  0},
+    };
+    int matched = -1;
+    for (size_t i = 0; i < sizeof(ladder)/sizeof(ladder[0]); i++) {
+        if (ladder[i].window > 0) {
+            snprintf(cmd, sizeof(cmd),
+                     "zstd -%u --long=%u -q -f -o \"%s\" \"%s\" >%s 2>&1",
+                     ladder[i].level, ladder[i].window,
+                     rt_zst, raw_path, ZXLE_DEVNULL);
+        } else {
+            snprintf(cmd, sizeof(cmd), "zstd -%u -q -f -o \"%s\" \"%s\" >%s 2>&1",
+                     ladder[i].level, rt_zst, raw_path, ZXLE_DEVNULL);
+        }
+        if (try_run(cmd) != 0) { unlink(rt_zst); continue; }
+        size_t rt_n = 0;
+        uint8_t *rt = read_whole_file(rt_zst, &rt_n);
+        int ok = (rt && rt_n == n && memcmp(rt, p, n) == 0);
+        free(rt);
+        unlink(rt_zst);
+        if (ok) { matched = (int)i; break; }
     }
-    size_t rt_n = 0;
-    uint8_t *rt = read_whole_file(rt_zst, &rt_n);
-    int ok = (rt && rt_n == n && memcmp(rt, p, n) == 0);
-    free(rt);
-    unlink(in_zst); unlink(rt_zst);
-    if (!ok) { free(raw); unlink(raw_path); return -1; }
+    unlink(in_zst);
+    if (matched < 0) { free(raw); unlink(raw_path); return -1; }
+    uint8_t level  = ladder[matched].level;
+    uint8_t window = ladder[matched].window;
 
     int inner_kind = 0;
     Buf tar_recipe; buf_init(&tar_recipe);
@@ -1393,6 +1418,8 @@ static int pack_zst(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *rec
         }
     }
 
+    buf_u8(recipe, level);
+    buf_u8(recipe, window);
     buf_u32(recipe, (uint32_t)raw_n);
     buf_u32(recipe, (uint32_t)n);
     buf_u8(recipe, (uint8_t)inner_kind);
@@ -1404,8 +1431,9 @@ static int pack_zst(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *rec
         buf_append(solid, raw, raw_n);
     }
 
-    fprintf(stderr, "    zst: orig=%zu raw=%zu%s\n",
-            n, raw_n, inner_kind == 1 ? " inner=tar" : "");
+    fprintf(stderr, "    zst: orig=%zu raw=%zu level=%u window=%u%s\n",
+            n, raw_n, level, window,
+            inner_kind == 1 ? " inner=tar" : "");
 
     free(raw);
     unlink(raw_path);
@@ -1418,10 +1446,13 @@ static void unpack_zst(const uint8_t *recipe, size_t rlen,
                        const uint8_t *solid, size_t solid_len, size_t *solid_pos,
                        FILE *out, uint64_t expected_size, const char *tmp_prefix) {
     size_t r = 0;
-    if (r + 4 + 4 + 1 > rlen) die("zst recipe truncated");
+    if (r + 1 + 1 + 4 + 4 + 1 > rlen) die("zst recipe truncated");
+    uint8_t level      = recipe[r]; r += 1;
+    uint8_t window     = recipe[r]; r += 1;
     uint32_t raw_len   = r32(recipe + r); r += 4;
     uint32_t orig_len  = r32(recipe + r); r += 4;
     uint8_t inner_kind = recipe[r]; r += 1;
+    if (level < 1 || level > 22) die("zst level out of range");
     const uint8_t *tar_recipe = NULL; uint32_t tar_recipe_len = 0;
     if (inner_kind == 1) {
         if (r + 4 > rlen) die("zst tar recipe len truncated");
@@ -1450,8 +1481,14 @@ static void unpack_zst(const uint8_t *recipe, size_t rlen,
         fclose(rf);
     }
 
-    snprintf(cmd, sizeof(cmd), "zstd -19 --long=27 -q -f -o \"%s\" \"%s\" >%s 2>&1",
-             rt_zst, raw_path, ZXLE_DEVNULL);
+    if (window > 0) {
+        snprintf(cmd, sizeof(cmd),
+                 "zstd -%u --long=%u -q -f -o \"%s\" \"%s\" >%s 2>&1",
+                 level, window, rt_zst, raw_path, ZXLE_DEVNULL);
+    } else {
+        snprintf(cmd, sizeof(cmd), "zstd -%u -q -f -o \"%s\" \"%s\" >%s 2>&1",
+                 level, rt_zst, raw_path, ZXLE_DEVNULL);
+    }
     run(cmd);
     unlink(raw_path);
 

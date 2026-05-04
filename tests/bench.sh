@@ -151,6 +151,7 @@ bench_file "M3f-ar (.deb shape)"          tests/corpus/mixed.deb
 bench_file "M3g-bz2tar (bz2 of mixed.tar)" tests/corpus/mixed.tar.bz2
 bench_file "M3g bz2-in-tar"                tests/corpus/bz2-in.tar
 bench_file "M3h-zsttar (zst of mixed.tar)" tests/corpus/mixed.tar.zst
+bench_file "M3h-zsttar level-3 ladder"     tests/corpus/mixed.tar.zst3
 
 # M3b: JPEG via brunsli. Same shape as bench_zip, but compares brunsli-routed
 # zxle against xz-9e (which hits the already-compressed wall).

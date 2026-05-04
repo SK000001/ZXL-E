@@ -176,6 +176,17 @@ if want mixed.tar.zst; then
     fi
 fi
 
+# mixed.tar.zst3 — default-level (zstd -3) wrap of mixed.tar. Tests M3h
+# ladder coverage: distros / general CLI use commonly produces default-level
+# .zst, not -19. Without the ladder, this would fall through to KIND_OPAQUE.
+if want mixed.tar.zst3; then
+    if [ -f mixed.tar ]; then
+        zstd -3 -q -f -o mixed.tar.zst3 mixed.tar
+    else
+        echo "skipping mixed.tar.zst3 -- mixed.tar not present"
+    fi
+fi
+
 # mixed.tar.bz2 — bzip2 -9 wrap of mixed.tar. Tests M3g-bz2tar: bz2-wrapped tar
 # routed through pack_tar so per-entry payloads get format-aware treatment.
 if want mixed.tar.bz2; then
