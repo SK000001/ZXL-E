@@ -164,6 +164,18 @@ if want bz2-in.tar; then
     fi
 fi
 
+# mixed.tar.zst — zstd -19 --long=27 wrap of mixed.tar. Tests M3h-zsttar:
+# zstd-wrapped tar routed through pack_tar so per-entry payloads get
+# format-aware treatment. zstd is weaker than xz, so xz-9e on a .zst is also
+# stuck at ~1.25 MB while inner-pack_tar gets to ~1.19 MB — real headline win.
+if want mixed.tar.zst; then
+    if [ -f mixed.tar ]; then
+        zstd -19 --long=27 -q -f -o mixed.tar.zst mixed.tar
+    else
+        echo "skipping mixed.tar.zst -- mixed.tar not present"
+    fi
+fi
+
 # mixed.tar.bz2 — bzip2 -9 wrap of mixed.tar. Tests M3g-bz2tar: bz2-wrapped tar
 # routed through pack_tar so per-entry payloads get format-aware treatment.
 if want mixed.tar.bz2; then
