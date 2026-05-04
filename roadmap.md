@@ -10,6 +10,8 @@ M1 + M2 + M3a (preflate) + M3b (brunsli) + M3b-zip (JPEG-in-ZIP) + M3c-mp3 (pack
 
 **Headline M3g-bz2tar result:** on `mixed.tar.bz2` (bzip2 -9 wrap of `mixed.tar`, 1,395,196 B) `zxle` is **−14.80% vs xz-9e** (1,188,877 vs 1,395,332). xz-9e cannot crack the bzip2 body so loses across the board on `.tar.bz2`; zxle inflates via system `bzip2 -dc`, recursively routes the inner tar through `pack_tar`, and PNG/JPEG payloads get format-aware treatment. New container kind `KIND_BZIP2 = 8`. Recipe stores `(block_size, raw_len, orig_len, inner_kind, [tar_recipe])`. Reproducibility verified at pack time by `bzip2 -<n>` re-encode + cmp; any mismatch falls through to KIND_OPAQUE. No preflate-equivalent for bzip2 — single mode, no fallback within the kind.
 
+Bonus headline (same milestone): on `bz2-in.tar` (ustar tar containing one bzip2 -9 DLL + one stored DLL, 1,935,360 B) `zxle` is **−6.03% vs xz-9e** (1,327,842 vs 1,413,036). The `.bz2` entry inside the tar routes through `pack_bz2` via the new recipe op `OP_BZ2_STORE = 0x07` (mirrors OP_GZIP_STORE inside pack_tar/pack_ar). Smaller win than gz-in-tar (−9.37%) because xz-9e compresses a bz2 stream more tightly than it compresses a gz stream — but still cleanly positive.
+
 **Headline M3f-ar result:** on a `.deb`-shape AR archive (8-byte `!<arch>\n` magic + `debian-binary` text entry + `data.tar.gz` of two corpus DLLs, 1,543,622 B) `zxle` is **−13.31% vs xz-9e** (1,336,266 vs 1,541,516). Recursive unwrap chain: `ar → gzip → tar → DLLs`, each layer routed through its own pack handler so the inflated DLL bytes land in the same solid stream as everything else. New container kind `KIND_AR = 7`; new recipe op `OP_GZIP_STORE = 0x06` carries an embedded gzip recipe inside any outer container's recipe (used by both `pack_ar` and the new gzip path inside `pack_tar`). Headers and 2-byte alignment pad bytes go in `OP_STRUCT`. BSD vs GNU long-name variants don't need to be interpreted — special `//` / `#1/N` entries route through the same payload-dispatch chain (typically falls through to OP_STORE).
 
 Bonus headline (same op): on `gz-in.tar` (ustar tar containing one `.gz` file + one stored DLL, 2,007,040 B) `zxle` is **−9.37% vs xz-9e** (1,336,642 vs 1,474,808). The `.gz` entry inside the tar now routes through `pack_gz` instead of opaquing to solid; xz-9e can't crack the gzip-deflated portion so loses despite the stored DLL being trivially redeflatable.
@@ -51,6 +53,7 @@ Corpus per-file average vs orig: 0.3721 → **0.3673**. Solid: 0.3655 → **0.36
 | gz-in.tar (.gz file inside ustar tar) | 2,007,040 | 1,336,642 | 1,474,808 | **−9.37%** |
 | mixed.deb (.deb-shape ar -> gzip -> tar -> DLLs) | 1,543,622 | 1,336,266 | 1,541,516 | **−13.31%** |
 | mixed.tar.bz2 (bzip2 -9 wrap of mixed.tar) | 1,395,196 | 1,188,877 | 1,395,332 | **−14.80%** |
+| bz2-in.tar (.bz2 file inside ustar tar) | 1,935,360 | 1,327,842 | 1,413,036 | **−6.03%** |
 
 DOCX/JAR results confirm the M2+M3a unwrap path generalizes from PE-DLL ZIPs to real-world XML/class-file ZIPs (DOCX exceeds the PE-DLL win because XML deflates more thoroughly when re-fed to zstd-19 solid). MP3 result is M3c-mp3 (packMP3 routing). Note: the original 10 s 440 Hz tone was replaced by a 30 s synthesized stereo signal (sine + phaser + chorus) because pure-tone MP3 frames are dominated by repetition and compress trivially under xz-9e (−45% with no help), masking packMP3's structural win.
 
@@ -179,6 +182,7 @@ Route each stream to its strongest recompressor. Tracked as sub-milestones.
 - Inner-kind dispatch mirrors M3e-targz: when the inflated body is a ustar tar (size ≥ 1024, multiple of 512, "ustar" at offset 257), it routes through `pack_tar` so per-entry payloads (PNG via `pack_png`, JPEG via brunsli, DLLs to solid STORE) each get format-aware treatment instead of dumping opaque to solid.
 - Measured on `mixed.tar.bz2` (bzip2 -9 wrap of `mixed.tar`, 1,395,196 B): zxle 1,188,877 vs xz-9e 1,395,332 → **−14.80%**. RT OK. All other fixtures preserved.
 - Limitation: reproducibility relies on the system `bzip2` binary being deterministic for the chosen block size; verified per-pack by the cmp step. No preflate-equivalent for bzip2 — there's no fallback path within the kind, just KIND_OPAQUE on miss. Multi-stream concatenated `.bz2` files would need a multi-member extension (not done; concatenated bzip2 is rare in practice).
+- Companion: new recipe op `OP_BZ2_STORE = 0x07` (same shape as OP_GZIP_STORE) routes `.bz2` files inside tar / ar entries through `pack_bz2`. Wired into `pack_tar` and `pack_ar` payload-dispatch chains. Measured on `bz2-in.tar` (ustar tar of one bzip2 -9 DLL + one stored DLL, 1,935,360 B): zxle 1,327,842 vs xz-9e 1,413,036 → **−6.03%**.
 
 #### M3c / M3d / M3e — pending sub-milestones
 **Branch:** `feat/m3-*` · **Expected:** large wins per stream.
@@ -193,6 +197,7 @@ Route each stream to its strongest recompressor. Tracked as sub-milestones.
 - ~~gzip files inside tar~~ — shipped (added `OP_GZIP_STORE` to the OP vocabulary, wired into `pack_tar` alongside the new M3f-ar handler).
 - ~~Unix AR archive (.a / .deb)~~ — shipped as M3f-ar above.
 - ~~bzip2-wrapped tar~~ — shipped as M3g-bz2tar above.
+- ~~bzip2 files inside tar/ar~~ — shipped (added `OP_BZ2_STORE` to the OP vocabulary, wired into `pack_tar` and `pack_ar` alongside `OP_GZIP_STORE`).
 
 Each recompressor lives behind an availability check; missing recompressors fall through to opaque-zstd.
 
