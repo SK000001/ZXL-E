@@ -4,7 +4,7 @@ Recursive format-aware transform pipeline for general-purpose compression.
 
 Goal: be the smallest archive across **every** file type, not just one. Sister project to [ZXL](../Zxl) (which targets PE binaries specifically). ZXL-E uses ZXL as one of its backends when it detects PE streams.
 
-## Status (2026-05-02, M3e-tar shipped)
+## Status (2026-05-04, M3g-bz2tar shipped)
 
 | Stage | Status |
 |---|---|
@@ -17,6 +17,10 @@ Goal: be the smallest archive across **every** file type, not just one. Sister p
 | M3c-png PNG IDAT recompressor (zlib-L9 / preflate) | shipped — −22.06% vs xz-9e on test.png; −15.73% on PNG-in-ZIP fixture |
 | M3d gzip wrapper (zlib-L9 / preflate) | shipped — −11.45% vs xz-9e on ntdll.dll.gz |
 | M3e ustar tar (per-entry format dispatch) | shipped — ties xz-9e (+0.04%) on mixed.tar; closes the 5%+ gap to xz-9e that opaque tar would leave |
+| M3e-targz gzip-wrapped tar | shipped — −16.04% vs xz-9e on mixed.tar.gz |
+| M3e-tar gzip-in-tar (OP_GZIP_STORE) | shipped — −9.37% vs xz-9e on gz-in.tar |
+| M3f-ar Unix archive (.a / .deb) | shipped — −13.31% vs xz-9e on .deb-shape archive |
+| M3g-bz2tar bzip2-wrapped tar | shipped — −14.80% vs xz-9e on mixed.tar.bz2 |
 | M4 Cross-stream content-defined ordering | parked — zstd `--long=27` already spans the corpus (see roadmap "Tried and reverted") |
 | M5 Neural residual fallback | pending |
 
