@@ -22,7 +22,7 @@ Goal: be the smallest archive across **every** file type, not just one. Sister p
 | M3f-ar Unix archive (.a / .deb) | shipped — −13.31% vs xz-9e on .deb-shape archive |
 | M3g-bz2tar bzip2-wrapped tar | shipped — −14.80% vs xz-9e on mixed.tar.bz2 |
 | M3g bz2-in-tar (OP_BZ2_STORE) | shipped — −6.03% vs xz-9e on bz2-in.tar |
-| M3h-zsttar zstd-wrapped tar | shipped — −5.16% vs xz-9e on mixed.tar.zst |
+| M3h-zsttar zstd-wrapped tar (level/window ladder) | shipped — −15.79% vs xz-9e on default-level mixed.tar.zst3; −5.16% on level-19 mixed.tar.zst |
 | M4 Cross-stream content-defined ordering | parked — zstd `--long=27` already spans the corpus (see roadmap "Tried and reverted") |
 | M5 Neural residual fallback | pending |
 
