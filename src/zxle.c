@@ -1898,17 +1898,19 @@ static int try_packmp3_buf(const uint8_t *p, size_t n, const char *tmp_prefix, B
     return 0;
 }
 
-static int do_pack(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "usage: zxle pack <out.zxle> <files...>\n"); return 1; }
-    const char *out = argv[0];
-    int n = argc - 1;
-    char **files = argv + 1;
-
+/* pack_run — main pack body. force_opaque=1 skips all container-unwrap routing
+ * and stores every input as KIND_OPAQUE. Used by do_pack() to compute a
+ * fall-through baseline; see "min-pack" comment in do_pack. Returns the number
+ * of files unwrapped (i.e. anything other than KIND_OPAQUE) on success, or -1
+ * on failure. *out_size receives the produced file size. */
+static int pack_run(const char *out, int n, char **files, int force_opaque,
+                    long long *out_size, uint64_t *out_total) {
     PackEntry *ents = calloc((size_t)n, sizeof(PackEntry));
     if (!ents) die("calloc ents");
     Buf solid; buf_init(&solid);
 
     uint64_t total = 0;
+    int unwrapped_count = 0;
     for (int i = 0; i < n; i++) {
         struct stat st;
         if (stat(files[i], &st) != 0) { fprintf(stderr, "stat %s\n", files[i]); die("stat input"); }
@@ -1923,7 +1925,7 @@ static int do_pack(int argc, char **argv) {
         buf_init(&ents[i].pmp);
 
         int unwrapped = 0;
-        if (fsz >= 22 && fb[0]==0x50 && fb[1]==0x4B) {
+        if (!force_opaque && fsz >= 22 && fb[0]==0x50 && fb[1]==0x4B) {
             char tp[1024];
             snprintf(tp, sizeof(tp), "%s.%d", out, i);
             if (pack_zip(fb, fsz, tp, &ents[i].recipe, &solid) == 0) {
@@ -1931,7 +1933,7 @@ static int do_pack(int argc, char **argv) {
                 unwrapped = 1;
             }
         }
-        if (!unwrapped && fsz >= 4 && fb[0]==0xFF && fb[1]==0xD8 && fb[2]==0xFF) {
+        if (!force_opaque && !unwrapped && fsz >= 4 && fb[0]==0xFF && fb[1]==0xD8 && fb[2]==0xFF) {
             char tmp_prefix[1024];
             snprintf(tmp_prefix, sizeof(tmp_prefix), "%s.%d", out, i);
             if (try_brunsli_buf(fb, fsz, tmp_prefix, &ents[i].brn) == 0) {
@@ -1939,7 +1941,7 @@ static int do_pack(int argc, char **argv) {
                 unwrapped = 1;
             }
         }
-        if (!unwrapped && looks_like_mp3(fb, fsz)) {
+        if (!force_opaque && !unwrapped && looks_like_mp3(fb, fsz)) {
             char tmp_prefix[1024];
             snprintf(tmp_prefix, sizeof(tmp_prefix), "%s.%d", out, i);
             if (try_packmp3_buf(fb, fsz, tmp_prefix, &ents[i].pmp) == 0) {
@@ -1947,7 +1949,7 @@ static int do_pack(int argc, char **argv) {
                 unwrapped = 1;
             }
         }
-        if (!unwrapped && fsz >= 8 && memcmp(fb, PNG_SIG, 8) == 0) {
+        if (!force_opaque && !unwrapped && fsz >= 8 && memcmp(fb, PNG_SIG, 8) == 0) {
             if (pack_png(fb, fsz, &ents[i].recipe, &solid) == 0) {
                 ents[i].kind = KIND_PNG;
                 unwrapped = 1;
@@ -1956,7 +1958,7 @@ static int do_pack(int argc, char **argv) {
                 buf_init(&ents[i].recipe);
             }
         }
-        if (!unwrapped && fsz >= 18 && fb[0]==0x1F && fb[1]==0x8B && fb[2]==0x08) {
+        if (!force_opaque && !unwrapped && fsz >= 18 && fb[0]==0x1F && fb[1]==0x8B && fb[2]==0x08) {
             char tp[1024];
             snprintf(tp, sizeof(tp), "%s.%d", out, i);
             if (pack_gz(fb, fsz, tp, &ents[i].recipe, &solid) == 0) {
@@ -1967,7 +1969,7 @@ static int do_pack(int argc, char **argv) {
                 buf_init(&ents[i].recipe);
             }
         }
-        if (!unwrapped && fsz >= 8 && fb[0]==0x28 && fb[1]==0xB5 && fb[2]==0x2F && fb[3]==0xFD) {
+        if (!force_opaque && !unwrapped && fsz >= 8 && fb[0]==0x28 && fb[1]==0xB5 && fb[2]==0x2F && fb[3]==0xFD) {
             char tp[1024];
             snprintf(tp, sizeof(tp), "%s.%d", out, i);
             if (pack_zst(fb, fsz, tp, &ents[i].recipe, &solid) == 0) {
@@ -1978,7 +1980,7 @@ static int do_pack(int argc, char **argv) {
                 buf_init(&ents[i].recipe);
             }
         }
-        if (!unwrapped && fsz >= 14 && fb[0]=='B' && fb[1]=='Z' && fb[2]=='h' &&
+        if (!force_opaque && !unwrapped && fsz >= 14 && fb[0]=='B' && fb[1]=='Z' && fb[2]=='h' &&
             fb[3] >= '1' && fb[3] <= '9') {
             char tp[1024];
             snprintf(tp, sizeof(tp), "%s.%d", out, i);
@@ -1990,7 +1992,7 @@ static int do_pack(int argc, char **argv) {
                 buf_init(&ents[i].recipe);
             }
         }
-        if (!unwrapped && fsz >= 1024 && memcmp(fb + 257, "ustar", 5) == 0) {
+        if (!force_opaque && !unwrapped && fsz >= 1024 && memcmp(fb + 257, "ustar", 5) == 0) {
             char tp[1024];
             snprintf(tp, sizeof(tp), "%s.%d", out, i);
             if (pack_tar(fb, fsz, tp, &ents[i].recipe, &solid) == 0) {
@@ -2001,7 +2003,7 @@ static int do_pack(int argc, char **argv) {
                 buf_init(&ents[i].recipe);
             }
         }
-        if (!unwrapped && fsz >= 8 && memcmp(fb, "!<arch>\n", 8) == 0) {
+        if (!force_opaque && !unwrapped && fsz >= 8 && memcmp(fb, "!<arch>\n", 8) == 0) {
             char tp[1024];
             snprintf(tp, sizeof(tp), "%s.%d", out, i);
             if (pack_ar(fb, fsz, tp, &ents[i].recipe, &solid) == 0) {
@@ -2015,6 +2017,8 @@ static int do_pack(int argc, char **argv) {
         if (!unwrapped) {
             ents[i].kind = KIND_OPAQUE;
             buf_append(&solid, fb, fsz);
+        } else {
+            unwrapped_count++;
         }
         total += fsz;
         free(fb);
@@ -2115,6 +2119,40 @@ static int do_pack(int argc, char **argv) {
     free(ents);
 
     long long osz = fsize(out);
+    if (out_size)  *out_size  = osz;
+    if (out_total) *out_total = total;
+    return unwrapped_count;
+}
+
+static int do_pack(int argc, char **argv) {
+    if (argc < 2) { fprintf(stderr, "usage: zxle pack <out.zxle> <files...>\n"); return 1; }
+    const char *out = argv[0];
+    int n = argc - 1;
+    char **files = argv + 1;
+
+    /* min-pack: pack with container unwrap engaged, then if any entry was
+     * unwrapped, also pack as all-opaque and keep the smaller. Cures the
+     * "small tightly-deflated input inflates to bigger solid" regression
+     * (see tests/real_world.md, npm tarballs +144%/+247% before this fix). */
+    long long osz = -1; uint64_t total = 0;
+    int unwrapped = pack_run(out, n, files, 0, &osz, &total);
+
+    if (unwrapped > 0) {
+        char opq[1024];
+        snprintf(opq, sizeof(opq), "%s.opq.tmp", out);
+        long long opq_osz = -1; uint64_t opq_total = 0;
+        pack_run(opq, n, files, 1, &opq_osz, &opq_total);
+        if (opq_osz > 0 && opq_osz < osz) {
+            fprintf(stderr, "min-pack: opaque %lld < unwrap %lld -> using opaque\n",
+                    opq_osz, osz);
+            unlink(out);
+            if (rename(opq, out) != 0) die("rename opq->out");
+            osz = opq_osz;
+        } else {
+            unlink(opq);
+        }
+    }
+
     fprintf(stderr, "packed %d file(s), orig=%llu zxle=%lld ratio=%.4f\n",
             n, (unsigned long long)total, osz,
             total ? (double)osz / (double)total : 0.0);
