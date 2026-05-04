@@ -148,6 +148,22 @@ if want mixed.tar.gz; then
     fi
 fi
 
+# bz2-in.tar — tar containing a .bz2 file + a plain DLL. Tests OP_BZ2_STORE
+# routing inside pack_tar (mirrors gz-in.tar / OP_GZIP_STORE).
+if want bz2-in.tar; then
+    CORPUS="${ZXLE_CORPUS:-../../../Zxl/tests}"
+    if [ -f "$CORPUS/ntdll.dll" ] && [ -f "$CORPUS/kernel32.dll" ]; then
+        TMP=$(mktemp -d)
+        cp "$CORPUS/ntdll.dll" "$TMP/" && bzip2 -9 "$TMP/ntdll.dll"
+        cp "$CORPUS/kernel32.dll" "$TMP/"
+        (cd "$TMP" && tar cf bz2-in.tar ntdll.dll.bz2 kernel32.dll)
+        mv "$TMP/bz2-in.tar" .
+        rm -rf "$TMP"
+    else
+        echo "skipping bz2-in.tar -- corpus DLLs not found"
+    fi
+fi
+
 # mixed.tar.bz2 — bzip2 -9 wrap of mixed.tar. Tests M3g-bz2tar: bz2-wrapped tar
 # routed through pack_tar so per-entry payloads get format-aware treatment.
 if want mixed.tar.bz2; then

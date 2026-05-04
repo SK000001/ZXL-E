@@ -66,6 +66,10 @@
  *                      to reconstruct `len` gzip bytes; consumes inflated body
  *                      bytes from the solid stream (per the embedded gzip
  *                      recipe). Used for gzip files inside tar/ar entries.
+ *   0x07 BZ2_STORE  -- (u32 bz2_recipe_len)(bz2_recipe_bytes); call unpack_bz2
+ *                      to reconstruct `len` bzip2 bytes; consumes inflated body
+ *                      bytes from the solid stream (per the embedded bzip2
+ *                      recipe). Used for bzip2 files inside tar/ar entries.
  *
  * ZIP unwrap scope: zlib-DEFLATE / stored entries; ZIP64 / encryption /
  * DEFLATE64 / BZIP2 / LZMA / prefix bytes -> falls back to KIND_OPAQUE.
@@ -159,6 +163,7 @@
 #define OP_JPEG_STORE 0x04
 #define OP_PNG_STORE  0x05
 #define OP_GZIP_STORE 0x06
+#define OP_BZ2_STORE  0x07
 
 /* Defined in preflate_shim.cpp; both return 1 on success, 0 on failure.
  * Out buffers are malloc'd; release with zxle_preflate_free. */
@@ -621,6 +626,13 @@ static void unpack_recipe(const uint8_t *recipe, size_t rlen,
             if (r + grl > rlen) die("recipe GZIP_STORE recipe overflow");
             unpack_gz(recipe + r, grl, solid, solid_len, solid_pos, out, len, tmp_prefix);
             r += grl;
+            written += len;
+        } else if (op == OP_BZ2_STORE) {
+            if (r + 4 > rlen) die("recipe BZ2_STORE recipe_len truncated");
+            uint32_t brl = r32(recipe + r); r += 4;
+            if (r + brl > rlen) die("recipe BZ2_STORE recipe overflow");
+            unpack_bz2(recipe + r, brl, solid, solid_len, solid_pos, out, len, tmp_prefix);
+            r += brl;
             written += len;
         } else if (op == OP_PREFLATE) {
             if (r + 4 > rlen) die("recipe PREFLATE diff_len truncated");
@@ -1312,7 +1324,7 @@ static int pack_tar(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *rec
     if (memcmp(p + 257, "ustar", 5) != 0) return -1;
 
     size_t cur = 0;
-    int regulars = 0, jpeg_stored = 0, png_stored = 0, gzip_stored = 0, stored_plain = 0;
+    int regulars = 0, jpeg_stored = 0, png_stored = 0, gzip_stored = 0, bz2_stored = 0, stored_plain = 0;
 
     while (cur + 512 <= n) {
         const uint8_t *hdr = p + cur;
@@ -1400,6 +1412,25 @@ static int pack_tar(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *rec
                 buf_free(&gz_recipe);
                 buf_free(&gz_solid);
             }
+            if (!handled && is_regular && size >= 14 &&
+                p[cur] == 'B' && p[cur+1] == 'Z' && p[cur+2] == 'h' &&
+                p[cur+3] >= '1' && p[cur+3] <= '9') {
+                char tp[1024];
+                snprintf(tp, sizeof(tp), "%s.tbz.%zu", tmp_prefix, cur);
+                Buf bz_recipe; buf_init(&bz_recipe);
+                Buf bz_solid;  buf_init(&bz_solid);
+                if (pack_bz2(p + cur, (size_t)size, tp, &bz_recipe, &bz_solid) == 0) {
+                    buf_u8(recipe, OP_BZ2_STORE);
+                    buf_u32(recipe, (uint32_t)size);
+                    buf_u32(recipe, (uint32_t)bz_recipe.n);
+                    buf_append(recipe, bz_recipe.p, bz_recipe.n);
+                    buf_append(solid, bz_solid.p, bz_solid.n);
+                    bz2_stored++;
+                    handled = 1;
+                }
+                buf_free(&bz_recipe);
+                buf_free(&bz_solid);
+            }
             if (!handled) {
                 buf_u8(recipe, OP_STORE);
                 buf_u32(recipe, (uint32_t)size);
@@ -1425,8 +1456,8 @@ static int pack_tar(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *rec
         buf_append(recipe, p + cur, n - cur);
     }
 
-    fprintf(stderr, "    tar: %d regular (%d store, %d jpeg-store, %d png-store, %d gzip-store)\n",
-            regulars, stored_plain, jpeg_stored, png_stored, gzip_stored);
+    fprintf(stderr, "    tar: %d regular (%d store, %d jpeg-store, %d png-store, %d gzip-store, %d bz2-store)\n",
+            regulars, stored_plain, jpeg_stored, png_stored, gzip_stored, bz2_stored);
     return 0;
 }
 
@@ -1455,7 +1486,7 @@ static int pack_ar(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *reci
     buf_append(recipe, p, 8);
 
     size_t cur = 8;
-    int entries = 0, gzip_stored = 0, png_stored = 0, jpeg_stored = 0, stored_plain = 0;
+    int entries = 0, gzip_stored = 0, bz2_stored = 0, png_stored = 0, jpeg_stored = 0, stored_plain = 0;
 
     while (cur < n) {
         if (cur + 60 > n) return -1;
@@ -1525,6 +1556,25 @@ static int pack_ar(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *reci
                 }
                 buf_free(&brn);
             }
+            if (!handled && size >= 14 &&
+                body[0] == 'B' && body[1] == 'Z' && body[2] == 'h' &&
+                body[3] >= '1' && body[3] <= '9') {
+                char tp[1024];
+                snprintf(tp, sizeof(tp), "%s.arbz.%zu", tmp_prefix, cur);
+                Buf bz_recipe; buf_init(&bz_recipe);
+                Buf bz_solid;  buf_init(&bz_solid);
+                if (pack_bz2(body, (size_t)size, tp, &bz_recipe, &bz_solid) == 0) {
+                    buf_u8(recipe, OP_BZ2_STORE);
+                    buf_u32(recipe, (uint32_t)size);
+                    buf_u32(recipe, (uint32_t)bz_recipe.n);
+                    buf_append(recipe, bz_recipe.p, bz_recipe.n);
+                    buf_append(solid, bz_solid.p, bz_solid.n);
+                    bz2_stored++;
+                    handled = 1;
+                }
+                buf_free(&bz_recipe);
+                buf_free(&bz_solid);
+            }
             if (!handled) {
                 buf_u8(recipe, OP_STORE);
                 buf_u32(recipe, (uint32_t)size);
@@ -1545,8 +1595,8 @@ static int pack_ar(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *reci
         entries++;
     }
 
-    fprintf(stderr, "    ar: %d entries (%d store, %d gzip-store, %d png-store, %d jpeg-store)\n",
-            entries, stored_plain, gzip_stored, png_stored, jpeg_stored);
+    fprintf(stderr, "    ar: %d entries (%d store, %d gzip-store, %d bz2-store, %d png-store, %d jpeg-store)\n",
+            entries, stored_plain, gzip_stored, bz2_stored, png_stored, jpeg_stored);
     return 0;
 }
 
