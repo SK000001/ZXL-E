@@ -4,9 +4,11 @@ Single source of truth for where ZXL-E is, where it's going, and what not to ret
 
 ---
 
-## Current state (2026-05-04, M3g-bz2tar shipped)
+## Current state (2026-05-04, M3h-zsttar shipped)
 
-M1 + M2 + M3a (preflate) + M3b (brunsli) + M3b-zip (JPEG-in-ZIP) + M3c-mp3 (packMP3) + M3c-png (zlib-L9 / preflate over IDAT) + M3c-png-zip (PNG-in-ZIP) + M3d-gzip (single-member gzip wrapper) + M3e-tar (ustar per-entry dispatch) + M3e-targz (gzip-wrapped tar) + M3e-tar-gz-in (gzip files inside tar) + M3f-ar (Unix archive: .a / .deb) + M3g-bz2tar (bzip2-wrapped tar) ship end-to-end. Round-trip OK across the 8-file corpus, all ZIP fixtures, the DOCX/JAR fixtures, the standalone JPEG/MP3/PNG fixtures, the gzip fixture, the mixed.tar/tar.gz/tar.bz2/.deb fixtures.
+M1 + M2 + M3a (preflate) + M3b (brunsli) + M3b-zip (JPEG-in-ZIP) + M3c-mp3 (packMP3) + M3c-png (zlib-L9 / preflate over IDAT) + M3c-png-zip (PNG-in-ZIP) + M3d-gzip (single-member gzip wrapper) + M3e-tar (ustar per-entry dispatch) + M3e-targz (gzip-wrapped tar) + M3e-tar-gz-in (gzip files inside tar) + M3f-ar (Unix archive: .a / .deb) + M3g-bz2tar (bzip2-wrapped tar) + M3h-zsttar (zstd-wrapped tar) ship end-to-end. Round-trip OK across the 8-file corpus, all ZIP fixtures, the DOCX/JAR fixtures, the standalone JPEG/MP3/PNG fixtures, the gzip fixture, the mixed.tar/tar.gz/tar.bz2/.deb fixtures.
+
+**Headline M3h-zsttar result:** on `mixed.tar.zst` (zstd -19 --long=27 wrap of `mixed.tar`, 1,253,451 B) `zxle` is **−5.16% vs xz-9e** (1,188,876 vs 1,253,580). zstd is weaker than xz, so xz-9e on a `.zst` is also stuck at ~1.25 MB while our inner-`pack_tar` routing reaches the ~1.19 MB floor that the bare tar shows under our format-aware media handlers. New container kind `KIND_ZSTD = 9`. Recipe stores `(raw_len, orig_len, inner_kind, [tar_recipe])`. Reproducibility verified at pack time by `zstd -19 --long=27` re-encode + cmp; only that level/window is supported, so .zst files with other settings fall through to KIND_OPAQUE.
 
 **Headline M3g-bz2tar result:** on `mixed.tar.bz2` (bzip2 -9 wrap of `mixed.tar`, 1,395,196 B) `zxle` is **−14.80% vs xz-9e** (1,188,877 vs 1,395,332). xz-9e cannot crack the bzip2 body so loses across the board on `.tar.bz2`; zxle inflates via system `bzip2 -dc`, recursively routes the inner tar through `pack_tar`, and PNG/JPEG payloads get format-aware treatment. New container kind `KIND_BZIP2 = 8`. Recipe stores `(block_size, raw_len, orig_len, inner_kind, [tar_recipe])`. Reproducibility verified at pack time by `bzip2 -<n>` re-encode + cmp; any mismatch falls through to KIND_OPAQUE. No preflate-equivalent for bzip2 — single mode, no fallback within the kind.
 
@@ -54,6 +56,7 @@ Corpus per-file average vs orig: 0.3721 → **0.3673**. Solid: 0.3655 → **0.36
 | mixed.deb (.deb-shape ar -> gzip -> tar -> DLLs) | 1,543,622 | 1,336,266 | 1,541,516 | **−13.31%** |
 | mixed.tar.bz2 (bzip2 -9 wrap of mixed.tar) | 1,395,196 | 1,188,877 | 1,395,332 | **−14.80%** |
 | bz2-in.tar (.bz2 file inside ustar tar) | 1,935,360 | 1,327,842 | 1,413,036 | **−6.03%** |
+| mixed.tar.zst (zstd -19 --long=27 wrap of mixed.tar) | 1,253,451 | 1,188,876 | 1,253,580 | **−5.16%** |
 
 DOCX/JAR results confirm the M2+M3a unwrap path generalizes from PE-DLL ZIPs to real-world XML/class-file ZIPs (DOCX exceeds the PE-DLL win because XML deflates more thoroughly when re-fed to zstd-19 solid). MP3 result is M3c-mp3 (packMP3 routing). Note: the original 10 s 440 Hz tone was replaced by a 30 s synthesized stereo signal (sine + phaser + chorus) because pure-tone MP3 frames are dominated by repetition and compress trivially under xz-9e (−45% with no help), masking packMP3's structural win.
 
@@ -184,6 +187,12 @@ Route each stream to its strongest recompressor. Tracked as sub-milestones.
 - Limitation: reproducibility relies on the system `bzip2` binary being deterministic for the chosen block size; verified per-pack by the cmp step. No preflate-equivalent for bzip2 — there's no fallback path within the kind, just KIND_OPAQUE on miss. Multi-stream concatenated `.bz2` files would need a multi-member extension (not done; concatenated bzip2 is rare in practice).
 - Companion: new recipe op `OP_BZ2_STORE = 0x07` (same shape as OP_GZIP_STORE) routes `.bz2` files inside tar / ar entries through `pack_bz2`. Wired into `pack_tar` and `pack_ar` payload-dispatch chains. Measured on `bz2-in.tar` (ustar tar of one bzip2 -9 DLL + one stored DLL, 1,935,360 B): zxle 1,327,842 vs xz-9e 1,413,036 → **−6.03%**.
 
+#### M3h-zsttar — zstd-wrapped tar (shipped 2026-05-04)
+- New container kind `KIND_ZSTD = 9`. Detection at top level: zstd magic `28 B5 2F FD` at offset 0. Pack shells out to `zstd -d` to inflate, then re-runs `zstd -19 --long=27` and `cmp`s byte-for-byte against the original. On match, raw bytes flow into the solid zstd-19 stream and the recipe stores `(u32 raw_len, u32 orig_len, u8 inner_kind[, u32 tar_recipe_len, tar_recipe_bytes])`. On mismatch, falls through to KIND_OPAQUE.
+- Inner-kind dispatch mirrors M3g-bz2tar / M3e-targz: ustar tar payloads go through `pack_tar` so per-entry payloads (PNG via `pack_png`, JPEG via brunsli, DLLs to solid STORE) each get format-aware treatment.
+- Measured on `mixed.tar.zst` (zstd -19 --long=27 wrap of `mixed.tar`, 1,253,451 B): zxle 1,188,876 vs xz-9e 1,253,580 → **−5.16%**. RT OK. All other fixtures preserved.
+- Limitation: only `zstd -19 --long=27` is reproduced. Real-world `.zst` files produced with other levels (default -3 in many distros, -22 max, etc.) currently fall through to KIND_OPAQUE. Future work: probe a small ladder of common levels at pack time.
+
 #### M3c / M3d / M3e — pending sub-milestones
 **Branch:** `feat/m3-*` · **Expected:** large wins per stream.
 
@@ -198,6 +207,7 @@ Route each stream to its strongest recompressor. Tracked as sub-milestones.
 - ~~Unix AR archive (.a / .deb)~~ — shipped as M3f-ar above.
 - ~~bzip2-wrapped tar~~ — shipped as M3g-bz2tar above.
 - ~~bzip2 files inside tar/ar~~ — shipped (added `OP_BZ2_STORE` to the OP vocabulary, wired into `pack_tar` and `pack_ar` alongside `OP_GZIP_STORE`).
+- ~~zstd-wrapped tar~~ — shipped as M3h-zsttar above.
 
 Each recompressor lives behind an availability check; missing recompressors fall through to opaque-zstd.
 

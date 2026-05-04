@@ -4,7 +4,7 @@ Recursive format-aware transform pipeline for general-purpose compression.
 
 Goal: be the smallest archive across **every** file type, not just one. Sister project to [ZXL](../Zxl) (which targets PE binaries specifically). ZXL-E uses ZXL as one of its backends when it detects PE streams.
 
-## Status (2026-05-04, M3g-bz2tar shipped)
+## Status (2026-05-04, M3h-zsttar shipped)
 
 | Stage | Status |
 |---|---|
@@ -22,6 +22,7 @@ Goal: be the smallest archive across **every** file type, not just one. Sister p
 | M3f-ar Unix archive (.a / .deb) | shipped — −13.31% vs xz-9e on .deb-shape archive |
 | M3g-bz2tar bzip2-wrapped tar | shipped — −14.80% vs xz-9e on mixed.tar.bz2 |
 | M3g bz2-in-tar (OP_BZ2_STORE) | shipped — −6.03% vs xz-9e on bz2-in.tar |
+| M3h-zsttar zstd-wrapped tar | shipped — −5.16% vs xz-9e on mixed.tar.zst |
 | M4 Cross-stream content-defined ordering | parked — zstd `--long=27` already spans the corpus (see roadmap "Tried and reverted") |
 | M5 Neural residual fallback | pending |
 
