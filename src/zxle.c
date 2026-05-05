@@ -109,6 +109,7 @@
 #define KIND_AR     7
 #define KIND_BZIP2  8
 #define KIND_ZSTD   9
+#define KIND_XZ     10
 
 /* PNG (kind=4) recipe layout (parsed by pack_png/unpack_png; not by
  * unpack_recipe — KIND_PNG does not use the OP_* tags):
@@ -173,6 +174,24 @@
  * Reproducibility: pack-time probes a small ladder of (level, long_window)
  * combos and cmp's the re-encode against the original. First match wins;
  * fall through to KIND_OPAQUE if none match.
+ */
+
+/* Xz (kind=10) recipe layout (parsed by pack_xz/unpack_xz):
+ *   u8  level                     -- xz compression level 0..9
+ *   u8  flags                     -- 0x01 = --extreme (i.e. xz -<level>e)
+ *   u32 raw_len                   -- decompressed payload size
+ *   u32 orig_len                  -- original .xz file size (sanity)
+ *   u8  inner_kind                -- 0 = inflated bytes consumed from solid
+ *                                     verbatim; 1 = inflated body is a ustar
+ *                                     tar (nested tar recipe consumes solid).
+ *   [if inner_kind==1] u32 tar_recipe_len  tar_recipe_bytes
+ *
+ * Reproducibility: pack-time tries `xz -<level>[e] -c --threads=1` on the
+ * inflated bytes and cmps against the original. xz-utils single-threaded
+ * encode is deterministic for a given liblzma version; multi-threaded output
+ * is not reproducible across worker assignments, so we always pin --threads=1.
+ * If no probe matches (e.g. exotic filter chain, multi-threaded source stream
+ * that crossed block boundaries differently), fall through to KIND_OPAQUE.
  */
 
 #define OP_STRUCT     0x00
@@ -397,6 +416,10 @@ static void unpack_gz (const uint8_t *recipe, size_t rlen,
                        FILE *out, uint64_t expected_size, const char *tmp_prefix);
 static int  pack_bz2  (const uint8_t *p, size_t n, const char *tmp_prefix, Buf *recipe, Buf *solid);
 static void unpack_bz2(const uint8_t *recipe, size_t rlen,
+                       const uint8_t *solid, size_t solid_len, size_t *solid_pos,
+                       FILE *out, uint64_t expected_size, const char *tmp_prefix);
+static int  pack_xz   (const uint8_t *p, size_t n, const char *tmp_prefix, Buf *recipe, Buf *solid);
+static void unpack_xz (const uint8_t *recipe, size_t rlen,
                        const uint8_t *solid, size_t solid_len, size_t *solid_pos,
                        FILE *out, uint64_t expected_size, const char *tmp_prefix);
 static int  pack_zst  (const uint8_t *p, size_t n, const char *tmp_prefix, Buf *recipe, Buf *solid);
@@ -1551,6 +1574,170 @@ static void unpack_zst(const uint8_t *recipe, size_t rlen,
     free(got);
 }
 
+/* ---------- xz (kind=10) ----------
+ *
+ * Detection: 6-byte xz magic FD 37 7A 58 5A 00 at offset 0. Pack: shell out to
+ * `xz -dc` to inflate, then probe a small `(level, --extreme)` ladder; first
+ * `xz -<level>[e] --threads=1` re-encode that byte-matches the input wins.
+ * Inner-kind dispatch routes ustar tar payloads through pack_tar so per-entry
+ * payloads (PNG / JPEG / gzip / bzip2 inside) get format-aware treatment.
+ *
+ * Reproducibility caveats: xz multi-threaded encode is non-deterministic per
+ * worker assignment; we always pin --threads=1 at re-encode time. Inputs that
+ * were originally produced multi-threaded won't match any single-threaded
+ * probe and fall through to KIND_OPAQUE. Cross-version drift across
+ * xz-utils releases is also possible; pack-time cmp is the gate.
+ */
+static int pack_xz(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *recipe, Buf *solid) {
+    static const uint8_t XZ_MAGIC[6] = { 0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00 };
+    if (n < 12) return -1;
+    if (memcmp(p, XZ_MAGIC, 6) != 0) return -1;
+    if (n > 0xFFFFFFFFu) return -1;
+
+    char in_xz[1024], raw_path[1024], rt_xz[1024], cmd[4096];
+    snprintf(in_xz,    sizeof(in_xz),    "%s.in.xz",   tmp_prefix);
+    snprintf(raw_path, sizeof(raw_path), "%s.raw.bin", tmp_prefix);
+    snprintf(rt_xz,    sizeof(rt_xz),    "%s.rt.xz",   tmp_prefix);
+
+    FILE *xf = fopen(in_xz, "wb");
+    if (!xf) return -1;
+    if (n > 0 && fwrite(p, 1, n, xf) != n) { fclose(xf); unlink(in_xz); return -1; }
+    fclose(xf);
+
+    snprintf(cmd, sizeof(cmd), "xz -dc \"%s\" > \"%s\" 2>%s",
+             in_xz, raw_path, ZXLE_DEVNULL);
+    if (try_run(cmd) != 0) { unlink(in_xz); unlink(raw_path); return -1; }
+
+    size_t raw_n = 0;
+    uint8_t *raw = read_whole_file(raw_path, &raw_n);
+    if (!raw || raw_n > 0xFFFFFFFFu) {
+        free(raw); unlink(in_xz); unlink(raw_path); return -1;
+    }
+
+    /* Ladder: -9e first (xz's most common archive setting; mirrors `xz -9e`),
+     * then descending. -6 is xz CLI default (no extreme). */
+    static const struct { uint8_t level; uint8_t extreme; } ladder[] = {
+        {9, 1}, {9, 0},
+        {6, 1}, {6, 0},
+        {3, 1}, {3, 0},
+        {1, 0}, {0, 0},
+    };
+    int matched = -1;
+    for (size_t i = 0; i < sizeof(ladder)/sizeof(ladder[0]); i++) {
+        snprintf(cmd, sizeof(cmd),
+                 "xz -%u%s -c --threads=1 \"%s\" > \"%s\" 2>%s",
+                 (unsigned)ladder[i].level,
+                 ladder[i].extreme ? "e" : "",
+                 raw_path, rt_xz, ZXLE_DEVNULL);
+        if (try_run(cmd) != 0) { unlink(rt_xz); continue; }
+        size_t rt_n = 0;
+        uint8_t *rt = read_whole_file(rt_xz, &rt_n);
+        int ok = (rt && rt_n == n && memcmp(rt, p, n) == 0);
+        free(rt);
+        unlink(rt_xz);
+        if (ok) { matched = (int)i; break; }
+    }
+    unlink(in_xz);
+    if (matched < 0) { free(raw); unlink(raw_path); return -1; }
+    uint8_t level   = ladder[matched].level;
+    uint8_t flags   = ladder[matched].extreme ? 0x01 : 0x00;
+
+    /* Inner-kind dispatch: ustar tar -> pack_tar; otherwise dump raw to solid. */
+    int inner_kind = 0;
+    Buf tar_recipe; buf_init(&tar_recipe);
+    Buf tar_solid;  buf_init(&tar_solid);
+    if (raw_n >= 1024 && raw_n % 512 == 0 &&
+        memcmp(raw + 257, "ustar", 5) == 0) {
+        char tp[1024];
+        snprintf(tp, sizeof(tp), "%s.xztar", tmp_prefix);
+        if (pack_tar(raw, raw_n, tp, &tar_recipe, &tar_solid) == 0) {
+            inner_kind = 1;
+        } else {
+            buf_free(&tar_recipe); buf_init(&tar_recipe);
+            buf_free(&tar_solid);  buf_init(&tar_solid);
+        }
+    }
+
+    buf_u8(recipe, level);
+    buf_u8(recipe, flags);
+    buf_u32(recipe, (uint32_t)raw_n);
+    buf_u32(recipe, (uint32_t)n);
+    buf_u8(recipe, (uint8_t)inner_kind);
+    if (inner_kind == 1) {
+        buf_u32(recipe, (uint32_t)tar_recipe.n);
+        buf_append(recipe, tar_recipe.p, tar_recipe.n);
+        buf_append(solid, tar_solid.p, tar_solid.n);
+    } else {
+        buf_append(solid, raw, raw_n);
+    }
+
+    fprintf(stderr, "    xz: orig=%zu raw=%zu level=%u%s%s\n",
+            n, raw_n, level,
+            (flags & 0x01) ? "e" : "",
+            inner_kind == 1 ? " inner=tar" : "");
+
+    free(raw);
+    unlink(raw_path);
+    buf_free(&tar_recipe);
+    buf_free(&tar_solid);
+    return 0;
+}
+
+static void unpack_xz(const uint8_t *recipe, size_t rlen,
+                      const uint8_t *solid, size_t solid_len, size_t *solid_pos,
+                      FILE *out, uint64_t expected_size, const char *tmp_prefix) {
+    size_t r = 0;
+    if (r + 1 + 1 + 4 + 4 + 1 > rlen) die("xz recipe truncated");
+    uint8_t level      = recipe[r]; r += 1;
+    uint8_t flags      = recipe[r]; r += 1;
+    uint32_t raw_len   = r32(recipe + r); r += 4;
+    uint32_t orig_len  = r32(recipe + r); r += 4;
+    uint8_t inner_kind = recipe[r]; r += 1;
+    const uint8_t *tar_recipe = NULL; uint32_t tar_recipe_len = 0;
+    if (inner_kind == 1) {
+        if (r + 4 > rlen) die("xz tar recipe len truncated");
+        tar_recipe_len = r32(recipe + r); r += 4;
+        if (r + tar_recipe_len > rlen) die("xz tar recipe overflow");
+        tar_recipe = recipe + r; r += tar_recipe_len;
+    }
+    if (r != rlen) die("xz recipe trailing bytes");
+    if (level > 9) die("xz level out of range");
+
+    char raw_path[2048], rt_xz[2048], cmd[4096];
+    snprintf(raw_path, sizeof(raw_path), "%s.xz.raw.tmp", tmp_prefix);
+    snprintf(rt_xz,    sizeof(rt_xz),    "%s.xz.rt.tmp",  tmp_prefix);
+
+    FILE *rf = fopen(raw_path, "wb");
+    if (!rf) die("fopen xz raw tmp");
+    if (inner_kind == 0) {
+        if (*solid_pos + raw_len > solid_len) die("xz solid overflow");
+        if (raw_len > 0 && fwrite(solid + *solid_pos, 1, raw_len, rf) != raw_len)
+            die("fwrite xz raw");
+        *solid_pos += raw_len;
+        fclose(rf);
+    } else {
+        unpack_recipe(tar_recipe, tar_recipe_len,
+                      solid, solid_len, solid_pos,
+                      rf, raw_len, raw_path);
+        fclose(rf);
+    }
+
+    snprintf(cmd, sizeof(cmd),
+             "xz -%u%s -c --threads=1 \"%s\" > \"%s\" 2>%s",
+             (unsigned)level, (flags & 0x01) ? "e" : "",
+             raw_path, rt_xz, ZXLE_DEVNULL);
+    run(cmd);
+    unlink(raw_path);
+
+    size_t got_n = 0;
+    uint8_t *got = read_whole_file(rt_xz, &got_n);
+    unlink(rt_xz);
+    if (!got || got_n != orig_len) die("xz size mismatch");
+    if (got_n != expected_size) die("xz expected size mismatch");
+    if (got_n > 0 && fwrite(got, 1, got_n, out) != got_n) die("fwrite xz out");
+    free(got);
+}
+
 /* ---------- tar (POSIX/ustar) ---------- */
 
 /* Pack a top-level ustar tar. Builds *recipe (using the OP_* vocabulary shared
@@ -2030,6 +2217,18 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
                 buf_init(&ents[i].recipe);
             }
         }
+        if (!force_opaque && !unwrapped && fsz >= 12 &&
+            fb[0]==0xFD && fb[1]==0x37 && fb[2]==0x7A && fb[3]==0x58 && fb[4]==0x5A && fb[5]==0x00) {
+            char tp[1024];
+            snprintf(tp, sizeof(tp), "%s.%d", out, i);
+            if (pack_xz(fb, fsz, tp, &ents[i].recipe, &solid) == 0) {
+                ents[i].kind = KIND_XZ;
+                unwrapped = 1;
+            } else {
+                buf_free(&ents[i].recipe);
+                buf_init(&ents[i].recipe);
+            }
+        }
         if (!force_opaque && !unwrapped && fsz >= 14 && fb[0]=='B' && fb[1]=='Z' && fb[2]=='h' &&
             fb[3] >= '1' && fb[3] <= '9') {
             char tp[1024];
@@ -2101,6 +2300,7 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
         if (ents[i].kind == KIND_AR)   mlen += 4 + ents[i].recipe.n;
         if (ents[i].kind == KIND_BZIP2) mlen += 4 + ents[i].recipe.n;
         if (ents[i].kind == KIND_ZSTD)  mlen += 4 + ents[i].recipe.n;
+        if (ents[i].kind == KIND_XZ)    mlen += 4 + ents[i].recipe.n;
     }
 
     FILE *o = fopen(out, "wb");
@@ -2149,6 +2349,10 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
             if (ents[i].recipe.n > 0)
                 fwrite(ents[i].recipe.p, 1, ents[i].recipe.n, o);
         } else if (ents[i].kind == KIND_ZSTD) {
+            wu32(o, (uint32_t)ents[i].recipe.n);
+            if (ents[i].recipe.n > 0)
+                fwrite(ents[i].recipe.p, 1, ents[i].recipe.n, o);
+        } else if (ents[i].kind == KIND_XZ) {
             wu32(o, (uint32_t)ents[i].recipe.n);
             if (ents[i].recipe.n > 0)
                 fwrite(ents[i].recipe.p, 1, ents[i].recipe.n, o);
@@ -2312,6 +2516,12 @@ static int do_unpack(int argc, char **argv) {
             if (mp + ents[count].recipe_len > mlen) die("zst recipe overflow");
             ents[count].recipe = manifest + mp;
             mp += ents[count].recipe_len;
+        } else if (ents[count].kind == KIND_XZ) {
+            if (mp + 4 > mlen) die("xz recipe len truncated");
+            ents[count].recipe_len = r32(manifest + mp); mp += 4;
+            if (mp + ents[count].recipe_len > mlen) die("xz recipe overflow");
+            ents[count].recipe = manifest + mp;
+            mp += ents[count].recipe_len;
         }
         count++;
     }
@@ -2395,6 +2605,11 @@ static int do_unpack(int argc, char **argv) {
             unpack_zst(ents[i].recipe, ents[i].recipe_len,
                        solid, solid_len, &solid_pos,
                        of, ents[i].orig_size, p);
+            fclose(of);
+        } else if (ents[i].kind == KIND_XZ) {
+            unpack_xz(ents[i].recipe, ents[i].recipe_len,
+                      solid, solid_len, &solid_pos,
+                      of, ents[i].orig_size, p);
             fclose(of);
         } else if (ents[i].kind == KIND_MP3) {
             /* Write pmp blob to a sibling .pmp temp; packMP3 will produce a

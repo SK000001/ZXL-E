@@ -197,6 +197,19 @@ if want mixed.tar.bz2; then
     fi
 fi
 
+# mixed.tar.xz — xz -9e wrap of mixed.tar. Tests M3i-xztar: xz-wrapped tar
+# routed through pack_tar so per-entry payloads get format-aware treatment.
+# xz on a mixed-content tar is already strong, so the headline is closer to
+# tie than the bz2/zst variants — the value is correctness coverage of the
+# most common Linux source / kernel / .deb-data format.
+if want mixed.tar.xz; then
+    if [ -f mixed.tar ]; then
+        xz -9e -k -c --threads=1 mixed.tar > mixed.tar.xz
+    else
+        echo "skipping mixed.tar.xz -- mixed.tar not present"
+    fi
+fi
+
 # ntdll.dll.gz — gzip(L6, default) of a corpus DLL. Tests M3d-gzip preflate path
 # (GNU gzip uses a different lazy-match policy from zlib so mode 0 misses).
 if want ntdll.dll.gz; then
