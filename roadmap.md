@@ -4,9 +4,11 @@ Single source of truth for where ZXL-E is, where it's going, and what not to ret
 
 ---
 
-## Current state (2026-05-05, min-pack fallthrough shipped)
+## Current state (2026-05-05, zstd frame-header probing shipped)
 
-M1 + M2 + M3a (preflate) + M3b (brunsli) + M3b-zip (JPEG-in-ZIP) + M3c-mp3 (packMP3) + M3c-png (zlib-L9 / preflate over IDAT) + M3c-png-zip (PNG-in-ZIP) + M3d-gzip (single-member gzip wrapper) + M3e-tar (ustar per-entry dispatch) + M3e-targz (gzip-wrapped tar) + M3e-tar-gz-in (gzip files inside tar) + M3f-ar (Unix archive: .a / .deb) + M3g-bz2tar (bzip2-wrapped tar) + M3h-zsttar (zstd-wrapped tar) + min-pack fallthrough ship end-to-end.
+M1 + M2 + M3a (preflate) + M3b (brunsli) + M3b-zip (JPEG-in-ZIP) + M3c-mp3 (packMP3) + M3c-png (zlib-L9 / preflate over IDAT) + M3c-png-zip (PNG-in-ZIP) + M3d-gzip (single-member gzip wrapper) + M3e-tar (ustar per-entry dispatch) + M3e-targz (gzip-wrapped tar) + M3e-tar-gz-in (gzip files inside tar) + M3f-ar (Unix archive: .a / .deb) + M3g-bz2tar (bzip2-wrapped tar) + M3h-zsttar (zstd-wrapped tar) + min-pack fallthrough + zstd frame-header probing ship end-to-end.
+
+**Headline zstd-probing result (2026-05-05):** `pack_zst` now parses the input's zstd frame header (RFC 8478 §3.1.1.1) to derive the io mode (file vs stdin, from FCS_flag), checksum policy (from Content_Checksum_flag), and a candidate `--long=N` value (from Window_Descriptor). The probe ladder iterates `level ∈ {19,22,20,21,18,17,9,6,3,1} × long ∈ {27, observed_window_log, none}` and pins io/check from the header rather than guessing. `which.pkg.tar.zst` (Arch makepkg, 16,366 B) now engages KIND_ZSTD — matched at `level=19 long=25 io=stdin check=on`, inner tar dispatched (3 gzip-store + 3 store entries) — instead of falling through to KIND_OPAQUE. Headline unchanged (−0.09% vs xz-9e — small file, min-pack picks opaque), but the synthetic-fixture-only constraint is gone. All synthetic and real-world fixtures preserved (mixed.tar.zst gained 1 byte for the new `flags` recipe byte). Recipe layout bumped: `(u8 level, u8 window, u8 flags, u32 raw_len, u32 orig_len, u8 inner_kind, [...])` where `flags` bits are `0x01 = use_stdin (FCS suppressed)` and `0x02 = no_check`. Single_Segment frames are handled (window_log=0 in recipe → no `--long` arg); dictionary frames still bail to KIND_OPAQUE.
 
 **Headline min-pack result (2026-05-05):** the real-world bench (see `tests/real_world.md`) surfaced a catastrophic regression on small tightly-deflated tarballs: `leftpad.tgz` (1,679 B) packed to 6,067 B (+247.08% vs xz-9e), `is-odd.tgz` (2,774 B) to 6,952 B (+144.44%). The mechanism is structural — unwrapping a near-optimal gzip stream into 7 KB of inflated text and feeding it to solid zstd-19 cannot beat the original gzip output, but pays preflate reconstruction + recipe + solid framing overhead on top. Fix: `do_pack` now runs the existing pack twice when at least one entry is unwrapped — once with container routing engaged (status quo) and once with `force_opaque=1` (every input goes to KIND_OPAQUE) — and keeps the smaller result. After the fix: `leftpad.tgz` → 1,729 B (**−1.09%** vs xz-9e); `is-odd.tgz` → 2,823 B (**−0.74%**). `hello.deb` similarly tightened from +0.04% to −0.04%. All M1–M3h synthetic headlines preserved byte-exactly (the unwrap path wins on every fixture, so the opaque fallback is computed and discarded). All RT OK. 2× pack time on container-shaped inputs is the cost. Round-trip OK across the 8-file corpus, all ZIP fixtures, the DOCX/JAR fixtures, the standalone JPEG/MP3/PNG fixtures, the gzip fixture, the mixed.tar/tar.gz/tar.bz2/.deb fixtures.
 
@@ -91,11 +93,15 @@ The 8-file corpus contains no containers, so M2 doesn't change these numbers vs 
 
 ---
 
-## Next session — after min-pack (2026-05-05)
+## Next session — after zstd frame-header probing (2026-05-05)
 
-The real-world bench (`tests/real_world.md`, run 2026-05-05) and the min-pack fix that followed cured the worst regression (npm tarballs +247% → −1%) and turned the marginal `.deb` / `.pkg.tar.zst` losses into wash-or-better. Two concrete misses are still on the board, in priority order:
+Min-pack fallthrough cured the small-tarball regression; zstd frame-header probing closed the `.pkg.tar.zst` reproducibility gap (engages on `which.pkg.tar.zst`, RT OK). One concrete miss still on the board:
 
-### 1. zstd ladder cannot reproduce real `.pkg.tar.zst`
+### KIND_XZ — `.tar.xz` (Linux source / kernel / modern .deb data layer)
+
+See "2." below — same content, promoted to "next" since the zstd item is shipped.
+
+### Done (kept for context): zstd ladder cannot reproduce real `.pkg.tar.zst`
 
 The 7-entry `(level, --long)` ladder in `pack_zst` fires KIND_OPAQUE on every real Arch package because none of its probes are byte-exact. The right fix is **frame-header-driven probing**: parse the input's zstd frame header, extract observable parameters, and use them to pin the encoder command precisely.
 
@@ -133,7 +139,7 @@ for each level:
 
 **Risk**: makepkg uses multi-threaded zstd (`-T0` / `--auto-threads`) on larger packages. Multi-threaded output is non-deterministic per worker assignment and won't reproduce single-threaded. For small packages like `which` (one frame, single-threaded effectively), this isn't a problem. For larger Arch packages it may be — pull a 5–10 MB package into the bench corpus to measure. If multi-threaded output breaks reproducibility, document and accept fall-through-to-OPAQUE for that subclass.
 
-### 2. KIND_XZ (still worthwhile, but narrower than originally framed)
+### KIND_XZ (still worthwhile, but narrower than originally framed)
 
 `.tar.xz` is structurally the largest current real-world miss (Linux source tarballs, modern .deb data layers, kernel patches, GNU releases). Same pack pattern as KIND_BZIP2 / KIND_ZSTD: shell out to `xz -d` to inflate, re-encode with `xz -9e` (verified deterministic for a given xz version) + cmp, ladder of `(level, --extreme on/off, --lzma2 preset)` if needed. Inner-kind dispatch routes ustar tar through `pack_tar`. Recipe stores `(level, extreme_flag, raw_len, orig_len, inner_kind, [tar_recipe])`.
 
@@ -294,6 +300,13 @@ Route each stream to its strongest recompressor. Tracked as sub-milestones.
 - Measured on `mixed.tar.zst` (zstd -19 --long=27 wrap of `mixed.tar`, 1,253,451 B): zxle 1,188,876 vs xz-9e 1,253,580 → **−5.16%**. RT OK. All other fixtures preserved.
 - Reproducibility: pack-time probes a 7-entry ladder of `(level, --long_window)` combos and stores the matching pair in the recipe (u8 level, u8 long_window). Order: `-19 --long=27` (matches our internal solid output), `-3` (zstd CLI default — most common in the wild), `-3 --long=27`, `-22 --long=27`, `-19`, `-22`, `-1`. First cmp match wins; if none match, KIND_OPAQUE.
 - Two fixture data points: `mixed.tar.zst` (level 19, 1,253,451 B → −5.16%); `mixed.tar.zst3` (level 3, 1,419,046 B → **−15.79%**). The default-level fixture is the more representative real-world shape and gives the bigger headline because xz-9e on a `-3` zstd stream still can't crack its body.
+
+#### M3h-zsttar frame-header probing (shipped 2026-05-05)
+- `pack_zst` parses the zstd frame header (RFC 8478 §3.1.1.1) instead of guessing. From byte 4 (Frame_Header_Descriptor): FCS_flag → io mode (file if FCS present, stdin if absent), Content_Checksum_flag → `--check`/`--no-check`, Dictionary_ID_flag (non-zero → bail to OPAQUE), Single_Segment flag → window descriptor present or not. From byte 5 (Window_Descriptor, when present): `window_log = 10 + exponent`.
+- Probe ladder: `level ∈ {19, 22, 20, 21, 18, 17, 9, 6, 3, 1} × long ∈ {27, observed_window_log, none}` (dedup'd), io mode and check flag pinned from header. `--long=N` is *not* idempotent across N — verified empirically against makepkg output — so the observed value is one of the probes (along with our internal 27 to keep the synthetic fixture path).
+- Recipe layout bumped to `(u8 level, u8 window, u8 flags, u32 raw_len, u32 orig_len, u8 inner_kind, [...])`. `flags` bits: `0x01 = use_stdin (FCS suppressed)`, `0x02 = no_check`. `window=0` in the recipe means "no `--long` arg used" (so the value 0 is a sentinel, not a real window).
+- Measured on `which.pkg.tar.zst` (Arch makepkg `core/which-2.23-1`, 16,366 B): kind=tar (zst engaged → inner ustar dispatched, 3 gzip-store + 3 store entries), matched at `level=19 long=25 io=stdin check=on`, RT OK. Headline unchanged at −0.09% vs xz-9e because the file is small enough that min-pack picks the opaque candidate, but the structural fixture-only constraint is gone. All synthetic and real-world fixtures preserved (mixed.tar.zst gained 1 byte for the new `flags` recipe byte).
+- Limitations: dictionary frames bail to KIND_OPAQUE. Multi-threaded zstd (`-T0`) output is non-deterministic per worker assignment; not addressed here, will fall through to KIND_OPAQUE on larger packages.
 
 #### min-pack fallthrough (shipped 2026-05-05)
 - New `pack_run(out, n, files, force_opaque, ...)` helper: lifted from `do_pack`'s body. When `force_opaque=1` every input is stored as KIND_OPAQUE (all magic-detection branches gated on `!force_opaque`); otherwise the unwrap chain runs as before. Returns the count of unwrapped entries plus the produced file size.
