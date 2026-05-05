@@ -407,6 +407,7 @@ Plan: detect PE streams (top-level files and ZIP entries after unwrap) and route
 ## Quick-reference: project specifics
 
 - **Language:** C, gcc -O3.
+- **Source layout:** modular under `src/`. Driver `src/zxle.c` (main / do_pack / do_unpack / pack_run / manifest IO); shared infra `src/{util,kinds,deflate,recipe,preflate_shim}.{h,c}`; one module per top-level KIND (`src/{zip,png,gz,bz2,zst,xz,tar,ar,jpeg,mp3}.{h,c}`). The local-only `graph.md` (gitignored) is the navigation index — read that instead of grepping zxle.c.
 - **Backend deps (M1):** system `zstd`. M2+ adds `python` for ZIP, then format-specific tools.
 - **File extension:** `.zxle`.
 - **Magic bytes:** `Z X L E` (4 bytes), version byte, flags byte.
