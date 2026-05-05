@@ -164,6 +164,40 @@ if want bz2-in.tar; then
     fi
 fi
 
+# xz-in.tar — tar containing a .xz file + a plain DLL. Tests OP_XZ_STORE
+# routing inside pack_tar.
+if want xz-in.tar; then
+    CORPUS="${ZXLE_CORPUS:-../../../Zxl/tests}"
+    if [ -f "$CORPUS/ntdll.dll" ] && [ -f "$CORPUS/kernel32.dll" ]; then
+        TMP=$(mktemp -d)
+        cp "$CORPUS/ntdll.dll" "$TMP/" && xz -9e --threads=1 "$TMP/ntdll.dll"
+        cp "$CORPUS/kernel32.dll" "$TMP/"
+        (cd "$TMP" && tar cf xz-in.tar ntdll.dll.xz kernel32.dll)
+        mv "$TMP/xz-in.tar" .
+        rm -rf "$TMP"
+    else
+        echo "skipping xz-in.tar -- corpus DLLs not found"
+    fi
+fi
+
+# zst-in.tar — tar containing a .zst file + a plain DLL. Tests OP_ZSTD_STORE
+# routing inside pack_tar.
+if want zst-in.tar; then
+    CORPUS="${ZXLE_CORPUS:-../../../Zxl/tests}"
+    if [ -f "$CORPUS/ntdll.dll" ] && [ -f "$CORPUS/kernel32.dll" ]; then
+        TMP=$(mktemp -d)
+        cp "$CORPUS/ntdll.dll" "$TMP/"
+        zstd -19 --long=27 -q -f -o "$TMP/ntdll.dll.zst" "$TMP/ntdll.dll"
+        rm "$TMP/ntdll.dll"
+        cp "$CORPUS/kernel32.dll" "$TMP/"
+        (cd "$TMP" && tar cf zst-in.tar ntdll.dll.zst kernel32.dll)
+        mv "$TMP/zst-in.tar" .
+        rm -rf "$TMP"
+    else
+        echo "skipping zst-in.tar -- corpus DLLs not found"
+    fi
+fi
+
 # mixed.tar.zst — zstd -19 --long=27 wrap of mixed.tar. Tests M3h-zsttar:
 # zstd-wrapped tar routed through pack_tar so per-entry payloads get
 # format-aware treatment. zstd is weaker than xz, so xz-9e on a .zst is also

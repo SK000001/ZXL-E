@@ -73,6 +73,14 @@
  *                      to reconstruct `len` bzip2 bytes; consumes inflated body
  *                      bytes from the solid stream (per the embedded bzip2
  *                      recipe). Used for bzip2 files inside tar/ar entries.
+ *   0x08 XZ_STORE   -- (u32 xz_recipe_len)(xz_recipe_bytes); call unpack_xz to
+ *                      reconstruct `len` xz bytes; consumes inflated body
+ *                      bytes from the solid stream (per the embedded xz
+ *                      recipe). Used for xz files inside tar/ar entries.
+ *   0x09 ZSTD_STORE -- (u32 zst_recipe_len)(zst_recipe_bytes); call unpack_zst
+ *                      to reconstruct `len` zstd bytes; consumes inflated body
+ *                      bytes from the solid stream (per the embedded zstd
+ *                      recipe). Used for zstd files inside tar/ar entries.
  *
  * ZIP unwrap scope: zlib-DEFLATE / stored entries; ZIP64 / encryption /
  * DEFLATE64 / BZIP2 / LZMA / prefix bytes -> falls back to KIND_OPAQUE.
@@ -202,6 +210,8 @@
 #define OP_PNG_STORE  0x05
 #define OP_GZIP_STORE 0x06
 #define OP_BZ2_STORE  0x07
+#define OP_XZ_STORE   0x08
+#define OP_ZSTD_STORE 0x09
 
 /* Defined in preflate_shim.cpp; both return 1 on success, 0 on failure.
  * Out buffers are malloc'd; release with zxle_preflate_free. */
@@ -679,6 +689,20 @@ static void unpack_recipe(const uint8_t *recipe, size_t rlen,
             if (r + brl > rlen) die("recipe BZ2_STORE recipe overflow");
             unpack_bz2(recipe + r, brl, solid, solid_len, solid_pos, out, len, tmp_prefix);
             r += brl;
+            written += len;
+        } else if (op == OP_XZ_STORE) {
+            if (r + 4 > rlen) die("recipe XZ_STORE recipe_len truncated");
+            uint32_t xrl = r32(recipe + r); r += 4;
+            if (r + xrl > rlen) die("recipe XZ_STORE recipe overflow");
+            unpack_xz(recipe + r, xrl, solid, solid_len, solid_pos, out, len, tmp_prefix);
+            r += xrl;
+            written += len;
+        } else if (op == OP_ZSTD_STORE) {
+            if (r + 4 > rlen) die("recipe ZSTD_STORE recipe_len truncated");
+            uint32_t zrl = r32(recipe + r); r += 4;
+            if (r + zrl > rlen) die("recipe ZSTD_STORE recipe overflow");
+            unpack_zst(recipe + r, zrl, solid, solid_len, solid_pos, out, len, tmp_prefix);
+            r += zrl;
             written += len;
         } else if (op == OP_PREFLATE) {
             if (r + 4 > rlen) die("recipe PREFLATE diff_len truncated");
@@ -1754,7 +1778,7 @@ static int pack_tar(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *rec
     if (memcmp(p + 257, "ustar", 5) != 0) return -1;
 
     size_t cur = 0;
-    int regulars = 0, jpeg_stored = 0, png_stored = 0, gzip_stored = 0, bz2_stored = 0, stored_plain = 0;
+    int regulars = 0, jpeg_stored = 0, png_stored = 0, gzip_stored = 0, bz2_stored = 0, xz_stored = 0, zstd_stored = 0, stored_plain = 0;
 
     while (cur + 512 <= n) {
         const uint8_t *hdr = p + cur;
@@ -1861,6 +1885,44 @@ static int pack_tar(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *rec
                 buf_free(&bz_recipe);
                 buf_free(&bz_solid);
             }
+            if (!handled && is_regular && size >= 12 &&
+                p[cur] == 0xFD && p[cur+1] == 0x37 && p[cur+2] == 0x7A &&
+                p[cur+3] == 0x58 && p[cur+4] == 0x5A && p[cur+5] == 0x00) {
+                char tp[1024];
+                snprintf(tp, sizeof(tp), "%s.txz.%zu", tmp_prefix, cur);
+                Buf xz_recipe; buf_init(&xz_recipe);
+                Buf xz_solid;  buf_init(&xz_solid);
+                if (pack_xz(p + cur, (size_t)size, tp, &xz_recipe, &xz_solid) == 0) {
+                    buf_u8(recipe, OP_XZ_STORE);
+                    buf_u32(recipe, (uint32_t)size);
+                    buf_u32(recipe, (uint32_t)xz_recipe.n);
+                    buf_append(recipe, xz_recipe.p, xz_recipe.n);
+                    buf_append(solid, xz_solid.p, xz_solid.n);
+                    xz_stored++;
+                    handled = 1;
+                }
+                buf_free(&xz_recipe);
+                buf_free(&xz_solid);
+            }
+            if (!handled && is_regular && size >= 8 &&
+                p[cur] == 0x28 && p[cur+1] == 0xB5 &&
+                p[cur+2] == 0x2F && p[cur+3] == 0xFD) {
+                char tp[1024];
+                snprintf(tp, sizeof(tp), "%s.tzs.%zu", tmp_prefix, cur);
+                Buf zs_recipe; buf_init(&zs_recipe);
+                Buf zs_solid;  buf_init(&zs_solid);
+                if (pack_zst(p + cur, (size_t)size, tp, &zs_recipe, &zs_solid) == 0) {
+                    buf_u8(recipe, OP_ZSTD_STORE);
+                    buf_u32(recipe, (uint32_t)size);
+                    buf_u32(recipe, (uint32_t)zs_recipe.n);
+                    buf_append(recipe, zs_recipe.p, zs_recipe.n);
+                    buf_append(solid, zs_solid.p, zs_solid.n);
+                    zstd_stored++;
+                    handled = 1;
+                }
+                buf_free(&zs_recipe);
+                buf_free(&zs_solid);
+            }
             if (!handled) {
                 buf_u8(recipe, OP_STORE);
                 buf_u32(recipe, (uint32_t)size);
@@ -1886,8 +1948,8 @@ static int pack_tar(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *rec
         buf_append(recipe, p + cur, n - cur);
     }
 
-    fprintf(stderr, "    tar: %d regular (%d store, %d jpeg-store, %d png-store, %d gzip-store, %d bz2-store)\n",
-            regulars, stored_plain, jpeg_stored, png_stored, gzip_stored, bz2_stored);
+    fprintf(stderr, "    tar: %d regular (%d store, %d jpeg-store, %d png-store, %d gzip-store, %d bz2-store, %d xz-store, %d zstd-store)\n",
+            regulars, stored_plain, jpeg_stored, png_stored, gzip_stored, bz2_stored, xz_stored, zstd_stored);
     return 0;
 }
 
@@ -1916,7 +1978,7 @@ static int pack_ar(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *reci
     buf_append(recipe, p, 8);
 
     size_t cur = 8;
-    int entries = 0, gzip_stored = 0, bz2_stored = 0, png_stored = 0, jpeg_stored = 0, stored_plain = 0;
+    int entries = 0, gzip_stored = 0, bz2_stored = 0, xz_stored = 0, zstd_stored = 0, png_stored = 0, jpeg_stored = 0, stored_plain = 0;
 
     while (cur < n) {
         if (cur + 60 > n) return -1;
@@ -2005,6 +2067,44 @@ static int pack_ar(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *reci
                 buf_free(&bz_recipe);
                 buf_free(&bz_solid);
             }
+            if (!handled && size >= 12 &&
+                body[0] == 0xFD && body[1] == 0x37 && body[2] == 0x7A &&
+                body[3] == 0x58 && body[4] == 0x5A && body[5] == 0x00) {
+                char tp[1024];
+                snprintf(tp, sizeof(tp), "%s.arxz.%zu", tmp_prefix, cur);
+                Buf xz_recipe; buf_init(&xz_recipe);
+                Buf xz_solid;  buf_init(&xz_solid);
+                if (pack_xz(body, (size_t)size, tp, &xz_recipe, &xz_solid) == 0) {
+                    buf_u8(recipe, OP_XZ_STORE);
+                    buf_u32(recipe, (uint32_t)size);
+                    buf_u32(recipe, (uint32_t)xz_recipe.n);
+                    buf_append(recipe, xz_recipe.p, xz_recipe.n);
+                    buf_append(solid, xz_solid.p, xz_solid.n);
+                    xz_stored++;
+                    handled = 1;
+                }
+                buf_free(&xz_recipe);
+                buf_free(&xz_solid);
+            }
+            if (!handled && size >= 8 &&
+                body[0] == 0x28 && body[1] == 0xB5 &&
+                body[2] == 0x2F && body[3] == 0xFD) {
+                char tp[1024];
+                snprintf(tp, sizeof(tp), "%s.arzs.%zu", tmp_prefix, cur);
+                Buf zs_recipe; buf_init(&zs_recipe);
+                Buf zs_solid;  buf_init(&zs_solid);
+                if (pack_zst(body, (size_t)size, tp, &zs_recipe, &zs_solid) == 0) {
+                    buf_u8(recipe, OP_ZSTD_STORE);
+                    buf_u32(recipe, (uint32_t)size);
+                    buf_u32(recipe, (uint32_t)zs_recipe.n);
+                    buf_append(recipe, zs_recipe.p, zs_recipe.n);
+                    buf_append(solid, zs_solid.p, zs_solid.n);
+                    zstd_stored++;
+                    handled = 1;
+                }
+                buf_free(&zs_recipe);
+                buf_free(&zs_solid);
+            }
             if (!handled) {
                 buf_u8(recipe, OP_STORE);
                 buf_u32(recipe, (uint32_t)size);
@@ -2025,8 +2125,8 @@ static int pack_ar(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *reci
         entries++;
     }
 
-    fprintf(stderr, "    ar: %d entries (%d store, %d gzip-store, %d bz2-store, %d png-store, %d jpeg-store)\n",
-            entries, stored_plain, gzip_stored, bz2_stored, png_stored, jpeg_stored);
+    fprintf(stderr, "    ar: %d entries (%d store, %d gzip-store, %d bz2-store, %d xz-store, %d zstd-store, %d png-store, %d jpeg-store)\n",
+            entries, stored_plain, gzip_stored, bz2_stored, xz_stored, zstd_stored, png_stored, jpeg_stored);
     return 0;
 }
 
