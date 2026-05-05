@@ -1333,18 +1333,44 @@ static void unpack_bz2(const uint8_t *recipe, size_t rlen,
 
 /* ---------- zstd (kind=9) ----------
  *
- * Same shape as KIND_BZIP2 / KIND_GZIP. Pack: shell out to `zstd -d` to inflate,
- * verify round-trip by `zstd -19 --long=27` re-encode + cmp. Inner-kind dispatch
- * routes ustar tar payloads through pack_tar so per-entry payloads get
- * format-aware treatment.
+ * Pack: shell out to `zstd -d` to inflate, then probe a `(level, --long, io)`
+ * ladder to find a re-encode that byte-matches the input. The probe ladder is
+ * driven by the input's frame header (RFC 8478 §3.1.1.1):
+ *   - byte 4 = Frame_Header_Descriptor:
+ *       FCS_flag (bits 6-7), Single_Segment (bit 5),
+ *       Content_Checksum_flag (bit 2), Dictionary_ID_flag (bits 0-1).
+ *   - byte 5 (when !Single_Segment) = Window_Descriptor: window_log = 10 + exp.
  *
- * Only the level/window we use internally for the solid stream is supported;
- * .zst files produced with other settings fall through to KIND_OPAQUE.
+ * Observed FCS presence pins io mode: file-mode writes FCS, stdin-mode does
+ * not. Observed checksum bit pins --check / --no-check. Dictionary frames are
+ * not supported (return -1 → KIND_OPAQUE).
+ *
+ * For each level in the ladder we try --long values in this order: 27 (matches
+ * our internal output), the observed window_log (from the header), then no
+ * --long. --long=N is *not* idempotent across N even when the encoded window
+ * matches (verified empirically against makepkg output), so the observed value
+ * has to be one of the probes.
  */
 static int pack_zst(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *recipe, Buf *solid) {
     if (n < 8) return -1;
     if (p[0] != 0x28 || p[1] != 0xB5 || p[2] != 0x2F || p[3] != 0xFD) return -1;
     if (n > 0xFFFFFFFFu) return -1;
+
+    /* Parse Frame_Header_Descriptor + Window_Descriptor. */
+    uint8_t fhd            = p[4];
+    int fcs_flag           = (fhd >> 6) & 0x3;
+    int single_segment     = (fhd >> 5) & 0x1;
+    int has_checksum       = (fhd >> 2) & 0x1;
+    int dict_id_flag       = fhd & 0x3;
+    if (dict_id_flag != 0) return -1;        /* dictionary frames unsupported */
+    int window_log = 0;                       /* 0 means "no window descriptor present" */
+    if (!single_segment) {
+        if (n < 6) return -1;
+        window_log = 10 + ((p[5] >> 3) & 0x1F);
+        if (window_log < 10 || window_log > 31) return -1;
+    }
+    /* Single_Segment frames always carry FCS (1 byte minimum). */
+    int has_fcs = (fcs_flag != 0) || single_segment;
 
     char in_zst[1024], raw_path[1024], rt_zst[1024], cmd[4096];
     snprintf(in_zst,   sizeof(in_zst),   "%s.in.zst",  tmp_prefix);
@@ -1366,42 +1392,57 @@ static int pack_zst(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *rec
         free(raw); unlink(in_zst); unlink(raw_path); return -1;
     }
 
-    /* Ladder of (level, long_window) combos to try at re-encode. First entry
-     * matches our internal solid setting (most common via this project's own
-     * outputs); -3 default catches typical CLI usage; -22/-19 with and without
-     * --long cover common high-effort and "fast" alternatives. */
-    static const struct { uint8_t level; uint8_t window; } ladder[] = {
-        {19, 27},
-        { 3,  0},
-        { 3, 27},
-        {22, 27},
-        {19,  0},
-        {22,  0},
-        { 1,  0},
-    };
-    int matched = -1;
-    for (size_t i = 0; i < sizeof(ladder)/sizeof(ladder[0]); i++) {
-        if (ladder[i].window > 0) {
-            snprintf(cmd, sizeof(cmd),
-                     "zstd -%u --long=%u -q -f -o \"%s\" \"%s\" >%s 2>&1",
-                     ladder[i].level, ladder[i].window,
-                     rt_zst, raw_path, ZXLE_DEVNULL);
-        } else {
-            snprintf(cmd, sizeof(cmd), "zstd -%u -q -f -o \"%s\" \"%s\" >%s 2>&1",
-                     ladder[i].level, rt_zst, raw_path, ZXLE_DEVNULL);
+    /* Levels ordered: 19 (our internal), then 22/20/21 (common high-effort /
+     * Arch makepkg), then descending to 1. */
+    static const uint8_t levels[] = {19, 22, 20, 21, 18, 17, 9, 6, 3, 1};
+    /* For each level, try long args in order: 27 (internal), observed
+     * window_log, none. Skip duplicates. */
+    uint8_t long_tries[3];
+    int n_long = 0;
+    long_tries[n_long++] = 27;
+    if (window_log != 0 && window_log != 27) long_tries[n_long++] = (uint8_t)window_log;
+    long_tries[n_long++] = 0;  /* sentinel: no --long */
+
+    const char *check_arg = has_checksum ? "--check" : "--no-check";
+
+    int matched_level = -1;
+    uint8_t matched_long = 0;
+    for (size_t li = 0; li < sizeof(levels); li++) {
+        uint8_t level = levels[li];
+        for (int lj = 0; lj < n_long; lj++) {
+            uint8_t lw = long_tries[lj];
+            char long_part[32];
+            if (lw == 0) long_part[0] = 0;
+            else snprintf(long_part, sizeof(long_part), " --long=%u", lw);
+
+            if (has_fcs) {
+                snprintf(cmd, sizeof(cmd),
+                         "zstd -%u%s %s -q -f -o \"%s\" \"%s\" >%s 2>&1",
+                         level, long_part, check_arg, rt_zst, raw_path,
+                         ZXLE_DEVNULL);
+            } else {
+                snprintf(cmd, sizeof(cmd),
+                         "zstd -%u%s %s -q < \"%s\" > \"%s\" 2>%s",
+                         level, long_part, check_arg, raw_path, rt_zst,
+                         ZXLE_DEVNULL);
+            }
+            if (try_run(cmd) != 0) { unlink(rt_zst); continue; }
+            size_t rt_n = 0;
+            uint8_t *rt = read_whole_file(rt_zst, &rt_n);
+            int ok = (rt && rt_n == n && memcmp(rt, p, n) == 0);
+            free(rt);
+            unlink(rt_zst);
+            if (ok) { matched_level = level; matched_long = lw; break; }
         }
-        if (try_run(cmd) != 0) { unlink(rt_zst); continue; }
-        size_t rt_n = 0;
-        uint8_t *rt = read_whole_file(rt_zst, &rt_n);
-        int ok = (rt && rt_n == n && memcmp(rt, p, n) == 0);
-        free(rt);
-        unlink(rt_zst);
-        if (ok) { matched = (int)i; break; }
+        if (matched_level >= 0) break;
     }
     unlink(in_zst);
-    if (matched < 0) { free(raw); unlink(raw_path); return -1; }
-    uint8_t level  = ladder[matched].level;
-    uint8_t window = ladder[matched].window;
+    if (matched_level < 0) { free(raw); unlink(raw_path); return -1; }
+    uint8_t level  = (uint8_t)matched_level;
+    uint8_t window = matched_long;  /* 0 means "no --long"; else value used */
+    uint8_t flags  = 0;
+    if (!has_fcs)      flags |= 0x01;  /* use stdin (suppress FCS) */
+    if (!has_checksum) flags |= 0x02;  /* --no-check */
 
     int inner_kind = 0;
     Buf tar_recipe; buf_init(&tar_recipe);
@@ -1420,6 +1461,7 @@ static int pack_zst(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *rec
 
     buf_u8(recipe, level);
     buf_u8(recipe, window);
+    buf_u8(recipe, flags);
     buf_u32(recipe, (uint32_t)raw_n);
     buf_u32(recipe, (uint32_t)n);
     buf_u8(recipe, (uint8_t)inner_kind);
@@ -1431,8 +1473,10 @@ static int pack_zst(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *rec
         buf_append(solid, raw, raw_n);
     }
 
-    fprintf(stderr, "    zst: orig=%zu raw=%zu level=%u window=%u%s\n",
+    fprintf(stderr, "    zst: orig=%zu raw=%zu level=%u long=%u io=%s check=%s%s\n",
             n, raw_n, level, window,
+            (flags & 0x01) ? "stdin" : "file",
+            (flags & 0x02) ? "off" : "on",
             inner_kind == 1 ? " inner=tar" : "");
 
     free(raw);
@@ -1446,9 +1490,10 @@ static void unpack_zst(const uint8_t *recipe, size_t rlen,
                        const uint8_t *solid, size_t solid_len, size_t *solid_pos,
                        FILE *out, uint64_t expected_size, const char *tmp_prefix) {
     size_t r = 0;
-    if (r + 1 + 1 + 4 + 4 + 1 > rlen) die("zst recipe truncated");
+    if (r + 1 + 1 + 1 + 4 + 4 + 1 > rlen) die("zst recipe truncated");
     uint8_t level      = recipe[r]; r += 1;
     uint8_t window     = recipe[r]; r += 1;
+    uint8_t flags      = recipe[r]; r += 1;
     uint32_t raw_len   = r32(recipe + r); r += 4;
     uint32_t orig_len  = r32(recipe + r); r += 4;
     uint8_t inner_kind = recipe[r]; r += 1;
@@ -1481,13 +1526,18 @@ static void unpack_zst(const uint8_t *recipe, size_t rlen,
         fclose(rf);
     }
 
-    if (window > 0) {
+    char long_part[32];
+    if (window == 0) long_part[0] = 0;
+    else snprintf(long_part, sizeof(long_part), " --long=%u", window);
+    const char *check_arg = (flags & 0x02) ? "--no-check" : "--check";
+    if (flags & 0x01) {
         snprintf(cmd, sizeof(cmd),
-                 "zstd -%u --long=%u -q -f -o \"%s\" \"%s\" >%s 2>&1",
-                 level, window, rt_zst, raw_path, ZXLE_DEVNULL);
+                 "zstd -%u%s %s -q < \"%s\" > \"%s\" 2>%s",
+                 level, long_part, check_arg, raw_path, rt_zst, ZXLE_DEVNULL);
     } else {
-        snprintf(cmd, sizeof(cmd), "zstd -%u -q -f -o \"%s\" \"%s\" >%s 2>&1",
-                 level, rt_zst, raw_path, ZXLE_DEVNULL);
+        snprintf(cmd, sizeof(cmd),
+                 "zstd -%u%s %s -q -f -o \"%s\" \"%s\" >%s 2>&1",
+                 level, long_part, check_arg, rt_zst, raw_path, ZXLE_DEVNULL);
     }
     run(cmd);
     unlink(raw_path);
