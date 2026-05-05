@@ -4,9 +4,11 @@ Single source of truth for where ZXL-E is, where it's going, and what not to ret
 
 ---
 
-## Current state (2026-05-05, zstd frame-header probing shipped)
+## Current state (2026-05-05, M3i-xztar shipped)
 
-M1 + M2 + M3a (preflate) + M3b (brunsli) + M3b-zip (JPEG-in-ZIP) + M3c-mp3 (packMP3) + M3c-png (zlib-L9 / preflate over IDAT) + M3c-png-zip (PNG-in-ZIP) + M3d-gzip (single-member gzip wrapper) + M3e-tar (ustar per-entry dispatch) + M3e-targz (gzip-wrapped tar) + M3e-tar-gz-in (gzip files inside tar) + M3f-ar (Unix archive: .a / .deb) + M3g-bz2tar (bzip2-wrapped tar) + M3h-zsttar (zstd-wrapped tar) + min-pack fallthrough + zstd frame-header probing ship end-to-end.
+M1 + M2 + M3a (preflate) + M3b (brunsli) + M3b-zip (JPEG-in-ZIP) + M3c-mp3 (packMP3) + M3c-png (zlib-L9 / preflate over IDAT) + M3c-png-zip (PNG-in-ZIP) + M3d-gzip (single-member gzip wrapper) + M3e-tar (ustar per-entry dispatch) + M3e-targz (gzip-wrapped tar) + M3e-tar-gz-in (gzip files inside tar) + M3f-ar (Unix archive: .a / .deb) + M3g-bz2tar (bzip2-wrapped tar) + M3h-zsttar (zstd-wrapped tar) + min-pack fallthrough + zstd frame-header probing + M3i-xztar (xz-wrapped tar) ship end-to-end.
+
+**Headline M3i-xztar result (2026-05-05):** new `KIND_XZ = 10`. Detection is the 6-byte xz magic `FD 37 7A 58 5A 00`. Pack shells out to `xz -dc` to inflate, then probes a small `(level, --extreme)` ladder — `{9e, 9, 6e, 6, 3e, 3, 1, 0}` — pinning `--threads=1` for determinism. First match wins; mismatches fall through to KIND_OPAQUE. Inner-kind dispatch routes ustar tar payloads through `pack_tar` exactly like KIND_BZIP2/KIND_ZSTD. Recipe: `(u8 level, u8 flags, u32 raw_len, u32 orig_len, u8 inner_kind, [tar_recipe])` where flags bit 0x01 = `--extreme`. On `mixed.tar.xz` (xz -9e wrap of `mixed.tar`, 1,188,332 B): zxle 1,188,412 vs xz-9e 1,188,460 → **tie (−0.00%)**, as predicted — xz-9e already crushes mixed.tar to its theoretical floor, and min-pack picks the opaque candidate (1,188,412) over the inner-tar-routed candidate (1,232,231) which loses the recipe-overhead vs solid-zstd-19 trade. On a media-only variant (PNG + JPEG ustar in xz -9e, 313,780 B) the unwrap path wins **−8.59%** (zxle 286,833) via inner-tar + PNG IDAT recompression. Single-threaded encode is deterministic across `xz-utils 5.6.x`; `-T0` multi-threaded inputs are non-deterministic and fall through. All synthetic fixtures preserved byte-exactly.
 
 **Headline zstd-probing result (2026-05-05):** `pack_zst` now parses the input's zstd frame header (RFC 8478 §3.1.1.1) to derive the io mode (file vs stdin, from FCS_flag), checksum policy (from Content_Checksum_flag), and a candidate `--long=N` value (from Window_Descriptor). The probe ladder iterates `level ∈ {19,22,20,21,18,17,9,6,3,1} × long ∈ {27, observed_window_log, none}` and pins io/check from the header rather than guessing. `which.pkg.tar.zst` (Arch makepkg, 16,366 B) now engages KIND_ZSTD — matched at `level=19 long=25 io=stdin check=on`, inner tar dispatched (3 gzip-store + 3 store entries) — instead of falling through to KIND_OPAQUE. Headline unchanged (−0.09% vs xz-9e — small file, min-pack picks opaque), but the synthetic-fixture-only constraint is gone. All synthetic and real-world fixtures preserved (mixed.tar.zst gained 1 byte for the new `flags` recipe byte). Recipe layout bumped: `(u8 level, u8 window, u8 flags, u32 raw_len, u32 orig_len, u8 inner_kind, [...])` where `flags` bits are `0x01 = use_stdin (FCS suppressed)` and `0x02 = no_check`. Single_Segment frames are handled (window_log=0 in recipe → no `--long` arg); dictionary frames still bail to KIND_OPAQUE.
 
@@ -62,6 +64,7 @@ Corpus per-file average vs orig: 0.3721 → **0.3673**. Solid: 0.3655 → **0.36
 | bz2-in.tar (.bz2 file inside ustar tar) | 1,935,360 | 1,327,842 | 1,413,036 | **−6.03%** |
 | mixed.tar.zst (zstd -19 --long=27 wrap of mixed.tar) | 1,253,451 | 1,188,878 | 1,253,580 | **−5.16%** |
 | mixed.tar.zst3 (zstd -3 default wrap of mixed.tar) | 1,419,046 | 1,188,879 | 1,411,820 | **−15.79%** |
+| mixed.tar.xz (xz -9e wrap of mixed.tar) | 1,188,332 | 1,188,412 | 1,188,460 | **−0.00%** (tie; xz already at floor) |
 
 DOCX/JAR results confirm the M2+M3a unwrap path generalizes from PE-DLL ZIPs to real-world XML/class-file ZIPs (DOCX exceeds the PE-DLL win because XML deflates more thoroughly when re-fed to zstd-19 solid). MP3 result is M3c-mp3 (packMP3 routing). Note: the original 10 s 440 Hz tone was replaced by a 30 s synthesized stereo signal (sine + phaser + chorus) because pure-tone MP3 frames are dominated by repetition and compress trivially under xz-9e (−45% with no help), masking packMP3's structural win.
 
@@ -93,13 +96,15 @@ The 8-file corpus contains no containers, so M2 doesn't change these numbers vs 
 
 ---
 
-## Next session — after zstd frame-header probing (2026-05-05)
+## Next session — after M3i-xztar (2026-05-05)
 
-Min-pack fallthrough cured the small-tarball regression; zstd frame-header probing closed the `.pkg.tar.zst` reproducibility gap (engages on `which.pkg.tar.zst`, RT OK). One concrete miss still on the board:
+zstd frame-header probing closed the `.pkg.tar.zst` reproducibility gap; M3i-xztar adds KIND_XZ coverage (ties xz-9e on mixed `.tar.xz`, wins on media-heavy). The largest remaining shaped misses are companion in-tar/in-ar OPs and real-world fixture coverage:
 
-### KIND_XZ — `.tar.xz` (Linux source / kernel / modern .deb data layer)
+- **OP_XZ_STORE / OP_ZSTD_STORE** — `.xz` and `.zst` files inside tar / ar entries. Cheap follow-on, mirrors OP_GZIP_STORE / OP_BZ2_STORE. Adds correctness coverage on modern `.deb` data layers and nested zst layouts.
+- **Real `.deb` re-fixture** — replace synthetic `mixed.deb` (uses inner `.tar.gz`) with a real Debian package whose data layer is `.tar.xz` or `.tar.zst`. Confirms M3f-ar headline holds on the actually-shipped layout. Now that KIND_XZ exists, the inner pipeline can route `.tar.xz` end-to-end.
+- **Real-world `.tar.xz` corpus** — pull a kernel patch / GNU release tarball / source distribution to measure where the inner-tar wins exceed recipe overhead and where they don't. The `mixed.tar.xz` tie on the synthetic corpus is the worst case (binary-heavy, xz already at floor); typical real-world `.tar.xz` is text-heavy source code where xz is also strong but per-entry routing might net non-trivial wins on embedded media / generated artifacts.
 
-See "2." below — same content, promoted to "next" since the zstd item is shipped.
+See "Future work" below for the broader gap inventory.
 
 ### Done (kept for context): zstd ladder cannot reproduce real `.pkg.tar.zst`
 
@@ -139,13 +144,9 @@ for each level:
 
 **Risk**: makepkg uses multi-threaded zstd (`-T0` / `--auto-threads`) on larger packages. Multi-threaded output is non-deterministic per worker assignment and won't reproduce single-threaded. For small packages like `which` (one frame, single-threaded effectively), this isn't a problem. For larger Arch packages it may be — pull a 5–10 MB package into the bench corpus to measure. If multi-threaded output breaks reproducibility, document and accept fall-through-to-OPAQUE for that subclass.
 
-### KIND_XZ (still worthwhile, but narrower than originally framed)
+### Done (kept for context): KIND_XZ (shipped 2026-05-05 as M3i-xztar)
 
-`.tar.xz` is structurally the largest current real-world miss (Linux source tarballs, modern .deb data layers, kernel patches, GNU releases). Same pack pattern as KIND_BZIP2 / KIND_ZSTD: shell out to `xz -d` to inflate, re-encode with `xz -9e` (verified deterministic for a given xz version) + cmp, ladder of `(level, --extreme on/off, --lzma2 preset)` if needed. Inner-kind dispatch routes ustar tar through `pack_tar`. Recipe stores `(level, extreme_flag, raw_len, orig_len, inner_kind, [tar_recipe])`.
-
-**Expected headline shape:** mixed-content `.tar.xz` will be roughly tie with xz-9e (xz already crunches mixed.tar to its theoretical floor — same shape as M3e-tar's +0.04% number). Media-heavy `.tar.xz` will win substantially via brunsli/PNG IDAT recompression. Source-tarball `.tar.xz` (mostly text) will likely tie or slightly regress (xz already very strong on text); the value is correctness coverage, not headline.
-
-If the real-world bench reveals that `.tar.xz` is everywhere *and* xz-9e ties us on real source code, the right move is not to keep adding container kinds but to start improving per-stream handlers (e.g., text/source code → run preflate-equivalent on the deflate path; PE → reconsider ZXL once it has solid mode; etc.).
+Predicted shape held: mixed-content `.tar.xz` ties xz-9e (xz already crushes mixed.tar to its floor; min-pack picks opaque); media-heavy `.tar.xz` wins ~−8.6% via inner-tar + PNG/JPEG-aware routing. See `M3i-xztar` sub-milestone under M3 for implementation details. Source-tarball `.tar.xz` measurement still pending — it's the next-session item if real-world coverage reveals headroom.
 
 ---
 
@@ -155,7 +156,6 @@ Roughly ordered by real-world impact-to-effort ratio. The ones near the top shou
 
 ### Coverage gaps the synthetic corpus doesn't surface
 
-- **`.tar.xz`** — see "Next session" above. Dominant Linux source / kernel format. Currently KIND_OPAQUE.
 - **xz files inside tar/ar entries (OP_XZ_STORE)** — companion to KIND_XZ; needed for modern `.deb` data layers (`.tar.xz` inside `ar`) and possibly nested layouts.
 - **zstd files inside tar/ar entries (OP_ZSTD_STORE)** — companion to KIND_ZSTD; mirrors OP_BZ2_STORE / OP_GZIP_STORE. Cheap.
 - **Real `.deb` re-fixture** — replace `mixed.deb` (synthetic, uses inner `.tar.gz`) with a real Debian package whose data layer is `.tar.xz` or `.tar.zst`. Confirms M3f-ar headline holds on the actually-shipped layout.
@@ -308,6 +308,12 @@ Route each stream to its strongest recompressor. Tracked as sub-milestones.
 - Measured on `which.pkg.tar.zst` (Arch makepkg `core/which-2.23-1`, 16,366 B): kind=tar (zst engaged → inner ustar dispatched, 3 gzip-store + 3 store entries), matched at `level=19 long=25 io=stdin check=on`, RT OK. Headline unchanged at −0.09% vs xz-9e because the file is small enough that min-pack picks the opaque candidate, but the structural fixture-only constraint is gone. All synthetic and real-world fixtures preserved (mixed.tar.zst gained 1 byte for the new `flags` recipe byte).
 - Limitations: dictionary frames bail to KIND_OPAQUE. Multi-threaded zstd (`-T0`) output is non-deterministic per worker assignment; not addressed here, will fall through to KIND_OPAQUE on larger packages.
 
+#### M3i-xztar — xz-wrapped tar (shipped 2026-05-05)
+- New container kind `KIND_XZ = 10`. Detection at top level: 6-byte xz magic `FD 37 7A 58 5A 00`. Pack shells out to `xz -dc` to inflate, then probes a small `(level, --extreme)` ladder — `{9e, 9, 6e, 6, 3e, 3, 1, 0}` — pinning `--threads=1` for determinism. First match (`cmp` byte-for-byte) wins; mismatches fall through to KIND_OPAQUE. Recipe: `(u8 level, u8 flags, u32 raw_len, u32 orig_len, u8 inner_kind, [tar_recipe])`; `flags` bit `0x01 = --extreme`.
+- Inner-kind dispatch mirrors M3g-bz2tar / M3h-zsttar: ustar tar payloads (`raw_n >= 1024` and `"ustar"` at offset 257) route through `pack_tar` so per-entry payloads (PNG / JPEG / gzip / bzip2 inside) get format-aware treatment.
+- Measured on `mixed.tar.xz` (xz -9e wrap of `mixed.tar`, 1,188,332 B): zxle 1,188,412 vs xz-9e 1,188,460 → **tie (−0.00%)**. xz already crushes the mixed corpus to its theoretical floor, so the inner-tar candidate (1,232,231) loses to opaque-solid (1,188,412) and min-pack picks opaque. Media-only variant `media.tar.xz` (PNG + JPEG ustar in xz -9e, 313,780 B): zxle 286,833 → **−8.59%** via inner-tar + PNG IDAT recompression (RT exercised via the unwrap path). RT OK across both. All other fixtures preserved byte-exactly.
+- Reproducibility: xz-utils single-threaded encode is deterministic for a given liblzma version; pack-time cmp is the gate. Multi-threaded inputs (`-T0`) are non-deterministic across worker assignments and fall through to KIND_OPAQUE — same caveat as zstd.
+
 #### min-pack fallthrough (shipped 2026-05-05)
 - New `pack_run(out, n, files, force_opaque, ...)` helper: lifted from `do_pack`'s body. When `force_opaque=1` every input is stored as KIND_OPAQUE (all magic-detection branches gated on `!force_opaque`); otherwise the unwrap chain runs as before. Returns the count of unwrapped entries plus the produced file size.
 - New `do_pack` driver: pack with unwrap engaged → if any entry was unwrapped, also pack as all-opaque to a sibling `.opq.tmp` → keep the smaller; emit `min-pack: opaque <a> < unwrap <b> -> using opaque` to stderr on the rare opaque-wins path. Cost: 2× pack time on container-shaped inputs (single-pass on plain inputs, since nothing was unwrapped to begin with).
@@ -333,6 +339,7 @@ Route each stream to its strongest recompressor. Tracked as sub-milestones.
 - ~~bzip2-wrapped tar~~ — shipped as M3g-bz2tar above.
 - ~~bzip2 files inside tar/ar~~ — shipped (added `OP_BZ2_STORE` to the OP vocabulary, wired into `pack_tar` and `pack_ar` alongside `OP_GZIP_STORE`).
 - ~~zstd-wrapped tar~~ — shipped as M3h-zsttar above.
+- ~~xz-wrapped tar~~ — shipped as M3i-xztar above.
 
 Each recompressor lives behind an availability check; missing recompressors fall through to opaque-zstd.
 
