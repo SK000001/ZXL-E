@@ -8,10 +8,28 @@ PREFLATE_DIR = third_party/preflate
 PREFLATE_LIB = $(PREFLATE_DIR)/build/libpreflate.a
 PREFLATE_INC = -I$(PREFLATE_DIR)
 
-SRC_C   = src/zxle.c
+# Each translation unit listed here. zxle.c is the driver; everything else is a
+# format/helper module described in graph.md. Adding a new module: drop foo.c
+# next to its foo.h, list foo.c in SRC_C, and update graph.md.
+SRC_C = \
+    src/zxle.c \
+    src/util.c \
+    src/deflate.c \
+    src/zip.c \
+    src/recipe.c \
+    src/png.c \
+    src/gz.c \
+    src/bz2.c \
+    src/zst.c \
+    src/xz.c \
+    src/tar.c \
+    src/ar.c \
+    src/jpeg.c \
+    src/mp3.c
+
 SRC_CXX = src/preflate_shim.cpp
-OBJ_C   = src/zxle.o
-OBJ_CXX = src/preflate_shim.o
+OBJ_C   = $(SRC_C:.c=.o)
+OBJ_CXX = $(SRC_CXX:.cpp=.o)
 BIN     = zxle$(if $(filter Windows_NT,$(OS)),.exe,)
 
 all: $(BIN)
@@ -19,10 +37,11 @@ all: $(BIN)
 $(BIN): $(OBJ_C) $(OBJ_CXX) $(PREFLATE_LIB)
 	$(CXX) $(CXXFLAGS) -o $@ $(OBJ_C) $(OBJ_CXX) $(PREFLATE_LIB) $(LDFLAGS)
 
-$(OBJ_C): $(SRC_C)
+# All C sources share the same flags; pattern rule for any src/*.c.
+src/%.o: src/%.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-$(OBJ_CXX): $(SRC_CXX)
+src/%.o: src/%.cpp
 	$(CXX) $(CXXFLAGS) $(PREFLATE_INC) -c -o $@ $<
 
 $(PREFLATE_LIB):
