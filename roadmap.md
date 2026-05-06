@@ -100,13 +100,22 @@ The 8-file corpus contains no containers, so M2 doesn't change these numbers vs 
 
 ---
 
-## Next session — after M3j-store-ops (2026-05-05)
+## Next session — after real-deb measurement (2026-05-06)
 
-The OP vocabulary is now structurally complete for the gz/bz2/xz/zst container family. The biggest remaining items are **measurement / fixture-coverage**, not new code:
+The OP vocabulary is now structurally complete for the gz/bz2/xz/zst container family. Remaining items are **measurement / fixture-coverage**, not new code:
 
-- **Real `.deb` re-fixture** — replace synthetic `mixed.deb` (uses inner `.tar.gz`) with a real Debian package whose data layer is `.tar.xz` or `.tar.zst`. Now that KIND_XZ + OP_XZ_STORE exist, the `ar → tar.xz → DLLs` pipeline can route end-to-end. This is the most likely place to find a positive headline next session because real `.deb`s often contain text-heavy source / config and the cross-stream win could materialize.
 - **Real-world `.tar.xz` corpus** — pull a kernel patch / GNU release tarball / source distribution to measure where inner-tar wins exceed recipe overhead. The `mixed.tar.xz` tie and `xz-in.tar` +1.55% are the *worst-case shape* (binary-heavy, xz already at floor); typical real-world `.tar.xz` is text-heavy source where xz is strong but per-entry routing might net wins on embedded media / generated artifacts.
+- **Real `.tar.zst` package** — Debian Trixie / Arch packages with zstd inner. The shipped frame-header probing in `pack_zst` should engage on these (where the synthetic `pack_xz` ladder failed on real .debs — see "Done" below). Verify KIND_ZSTD fires and measure headline.
+- **Widen pack_xz reproducibility** — real Debian .debs use non-preset lzma2 params (`mf=bt4,mode=normal` close but not exact, even with matching `dict=8MiB`). Either widen the probe ladder with `mf`/`mode`/`nice`/`depth` permutations, or accept that real .debs fall through to opaque on the inner-xz members and only the ar-frame is captured. See "Done" finding below for the empirical data.
 - **Validation gaps from "Future work"** — competitor benchmarks (precomp / freearc / zpaq), size-scaling data past the 128 MiB long-window, fuzz testing of container parsers. Pick whichever the next-session bench surfaces as the limiting factor.
+
+### Done (kept for context): real `.deb` ties xz-9e (measured 2026-05-06)
+
+Pulled `hello_2.10-3_amd64.deb` (53,080 B; data layer `.tar.xz`, dict=8MiB, CRC64) into `tests/corpus/real_hello.deb` (gitignored). Result: `zxle=53133` vs `xz-9e=53148` — **−0.03%** (15 B win), round-trip OK. Same shape as M3i-xztar tie: when the input is already-compressed at high ratio, xz-9e barely compresses further and our opaque path stores+overhead → near-tie.
+
+**Why the synthetic `mixed.deb` headline (−13.31%) does NOT generalize:** synthetic uses inner `.tar.gz` whose deflate streams reproduce via preflate, so OP_GZIP_STORE fires on the data member and per-entry routing wins. Real Debian `.deb`s use inner `.tar.xz` whose lzma2 stream uses non-preset encoder params (probed: dict=8MiB matches but `mf/mode/nice/depth` don't match any of `xz -0..9` or `-0e..9e`; closest is `mf=bt4,mode=normal,dict=8MiB` at 51012 B vs target 51020 B — 8 B off). pack_xz's preset-only ladder returns -1 → all 3 ar members fall through to OP_STORE → opaque path picked by min-pack.
+
+**Implication:** `mixed.deb` as the only `.deb` fixture overstated real-world wins. Real `.deb` is now in the bench as `M3f-ar real .deb (hello_2.10-3)` documenting the actual shape. Headline-positive routing on real .debs requires either (a) widening pack_xz to probe `mf/mode` permutations (large search, slow), or (b) Debian Trixie's `.tar.zst` data-layer .debs where pack_zst's frame-header probing should match.
 
 See "Future work" below for the broader gap inventory.
 

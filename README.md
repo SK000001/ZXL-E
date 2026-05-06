@@ -19,7 +19,7 @@ Goal: be the smallest archive across **every** file type, not just one. Sister p
 | M3e ustar tar (per-entry format dispatch) | shipped — ties xz-9e (+0.04%) on mixed.tar; closes the 5%+ gap to xz-9e that opaque tar would leave |
 | M3e-targz gzip-wrapped tar | shipped — −16.04% vs xz-9e on mixed.tar.gz |
 | M3e-tar gzip-in-tar (OP_GZIP_STORE) | shipped — −9.37% vs xz-9e on gz-in.tar |
-| M3f-ar Unix archive (.a / .deb) | shipped — −13.31% vs xz-9e on .deb-shape archive |
+| M3f-ar Unix archive (.a / .deb) | shipped — −13.31% on synthetic .deb (gz inner); −0.03% tie on real `hello_2.10-3` (xz inner, dpkg-deb's lzma2 non-preset) |
 | M3g-bz2tar bzip2-wrapped tar | shipped — −14.80% vs xz-9e on mixed.tar.bz2 |
 | M3g bz2-in-tar (OP_BZ2_STORE) | shipped — −6.03% vs xz-9e on bz2-in.tar |
 | M3h-zsttar zstd-wrapped tar (level/window ladder) | shipped — −15.79% vs xz-9e on default-level mixed.tar.zst3; −5.16% on level-19 mixed.tar.zst |
