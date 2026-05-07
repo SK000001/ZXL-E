@@ -4,55 +4,67 @@ Recursive format-aware transform pipeline for general-purpose compression.
 
 Goal: be the smallest archive across **every** file type, not just one. Sister project to [ZXL](../Zxl) (which targets PE binaries specifically). ZXL-E uses ZXL as one of its backends when it detects PE streams.
 
-## Status (2026-05-08, M5 --slow shipped)
+## Status (2026-05-08, M6 v2 shipped)
 
-Default mode (xz-9e final-step) ties or beats xz-9e on the standard Silesia corpus and beats it by 6–60% on container-shaped artifacts. Optional `--slow` mode (zpaq -m5 final-step) matches the SOTA general-purpose codec on Silesia (ratio 0.1891) and stacks the gain on top of container unwrap (−29% to −47% vs xz-9e baseline on container fixtures).
+Default mode (xz-9e final-step + BCJ-x86 sub-stream for PE/ELF content) ties or beats xz-9e on the standard Silesia corpus and beats it by 6–60% on container-shaped artifacts. Optional `--slow` mode (zpaq -m5 final-step) matches the SOTA general-purpose codec on Silesia (ratio 0.1891) and stacks the gain on top of container unwrap (−29% to −47% vs xz-9e baseline on container fixtures).
 
 | Stage | Status |
 |---|---|
 | M0 Phase-0 measurement | done — ZIP unwrap saves 20.45% over opaque-xz-9e on a 3-DLL test ZIP |
-| M1 Walking skeleton (manifest + solid stream) | shipped; per-file 0.3453, solid 0.3391 on 8-file corpus (beats xz-9e 0.3524) |
-| M2 ZIP-family unwrap (zlib-DEFLATE) | shipped — −20.45% vs xz-9e on pe-deflate.zip; −19.23% on sample.docx |
-| M3a DEFLATE recompressor (preflate) | shipped — −20.78% vs xz-9e on zlib-L6 ZIP fixture |
-| M3b JPEG recompressor (brunsli) | shipped — −27.14% vs xz-9e on synth.jpg; −19.85% on JPEG-in-ZIP fixture |
-| M3c-mp3 MP3 recompressor (packMP3) | shipped — −13.04% vs xz-9e on synth.mp3 |
-| M3c-png PNG IDAT recompressor (zlib-L9 / preflate) | shipped — −34.04% vs xz-9e on test.png; −22.07% on PNG-in-ZIP fixture |
-| M3d gzip wrapper (zlib-L9 / preflate) | shipped — −16.69% vs xz-9e on ntdll.dll.gz |
-| M3e ustar tar (per-entry format dispatch) | shipped — ties xz-9e on mixed.tar; closes the 5%+ gap to xz-9e that opaque tar would leave |
+| M1 Walking skeleton (manifest + solid stream) | shipped; per-file 0.3383, solid 0.3326 on 8-file corpus (beats xz-9e 0.3524 by −5.6%) |
+| M2 ZIP-family unwrap (zlib-DEFLATE) | shipped — −22.44% vs xz-9e on pe-deflate.zip |
+| M3a DEFLATE recompressor (preflate) | shipped — −22.76% vs xz-9e on zlib-L6 ZIP fixture |
+| M3b JPEG recompressor (brunsli) | shipped — −27.15% vs xz-9e on synth.jpg; −21.95% on JPEG-in-ZIP fixture |
+| M3c-mp3 MP3 recompressor (packMP3) | shipped — −13.05% vs xz-9e on synth.mp3 |
+| M3c-png PNG IDAT recompressor (zlib-L9 / preflate) | shipped — −34.04% vs xz-9e on test.png; −23.26% on PNG-in-ZIP fixture |
+| M3d gzip wrapper (zlib-L9 / preflate) | shipped — −19.23% vs xz-9e on ntdll.dll.gz |
+| M3e ustar tar (per-entry format dispatch) | shipped — −6.67% vs xz-9e on mixed.tar |
 | M3e-targz gzip-wrapped tar | shipped — −21.66% vs xz-9e on mixed.tar.gz |
-| M3e-tar gzip-in-tar (OP_GZIP_STORE) | shipped — −14.68% vs xz-9e on gz-in.tar |
+| M3e-tar gzip-in-tar (OP_GZIP_STORE) | shipped — −17.10% vs xz-9e on gz-in.tar |
 | M3f-ar Unix archive (.a / .deb) | shipped — −18.37% on synthetic .deb (gz inner); ~tie on real `hello_2.10-3` (xz inner, dpkg-deb's lzma2 non-preset) |
 | M3g-bz2tar bzip2-wrapped tar | shipped — −20.51% vs xz-9e on mixed.tar.bz2 |
-| M3g bz2-in-tar (OP_BZ2_STORE) | shipped — −11.53% vs xz-9e on bz2-in.tar |
-| M3h-zsttar zstd-wrapped tar | shipped — −21.44% on default-level mixed.tar.zst3; −11.57% on level-19 mixed.tar.zst |
+| M3g bz2-in-tar (OP_BZ2_STORE) | shipped — −14.09% vs xz-9e on bz2-in.tar |
+| M3h-zsttar zstd-wrapped tar | shipped — −21.44% on default-level mixed.tar.zst3; −11.53% on level-19 mixed.tar.zst |
 | M3i-xztar xz-wrapped tar | shipped — −6.68% vs xz-9e on mixed.tar.xz |
 | M3j-store-ops in-tar/in-ar `.xz` / `.zst` | shipped — completes the OP_*_STORE family |
 | min-pack fallthrough | shipped — runs unwrap + force_opaque per pack and keeps the smaller |
 | ZXLE_VER 3 final-step xz-9e | shipped — solid stream is xz -9e --threads=1 instead of zstd-19 long=27 |
 | M4 Cross-stream content-defined ordering | parked — solid window already spans the corpus |
-| **M5 `--slow` zpaq-m5 final-step** | **shipped** — Silesia 0.1891 (matches zpaq -m5); −29% to −47% vs xz-9e on container fixtures |
+| M5 `--slow` zpaq-m5 final-step | shipped — Silesia 0.1891 (matches zpaq -m5); −29% to −47% vs xz-9e on container fixtures |
+| min-pack `--slow` per-fixture tier | shipped — `--slow` is now a strict pareto improvement over default |
+| **M6 v1 BCJ x86 routing for KIND_OPAQUE** | **shipped** — PE DLLs gain ~3% on per-file pack (ZXLE_VER 3 → 4) |
+| **M6 v2 container-aware BCJ routing** | **shipped** — +2.0–2.8 pp on pure-PE containers (ZIP/TAR/AR/GZIP/BZIP2/ZSTD/XZ); ZXLE_VER 4 → 5 |
 
 ## Headline numbers (2026-05-08)
 
 | Fixture | xz-9e | zxle (default) | zxle --slow |
 |---|---|---|---|
-| 8-file corpus (per-file ratio) | 0.3524 | **0.3453** | (not measured per-file) |
+| 8-file corpus (per-file ratio) | 0.3524 | **0.3383** | (not measured per-file) |
+| 8-file corpus (solid ratio) | — | **0.3326** | — |
 | Silesia 211 MB (ratio) | 0.2284 | 0.2284 | **0.1891** (matches zpaq -m5) |
-| pe-deflate.zip | — | −20.45% | **−32.73%** vs xz-9e |
+| pe-deflate.zip | — | **−22.44%** | **−32.73%** vs xz-9e |
+| pe-deflate-l6.zip | — | **−22.76%** | **−33.00%** vs xz-9e |
 | sample.docx | — | −19.23% | **−47.41%** vs xz-9e |
-| ntdll.dll.gz | — | −16.69% | **−29.43%** vs xz-9e |
+| ntdll.dll.gz | — | **−19.23%** | **−29.43%** vs xz-9e |
 | mixed.tar.gz | — | −21.66% | **−30.65%** vs xz-9e |
 | mixed.deb | — | −18.37% | **−31.16%** vs xz-9e |
-| sample.jar | — | −59.58% | −57.07% (small input; default wins) |
+| zip-with-jpeg.zip | — | **−21.95%** | — |
+| zip-with-png.zip | — | **−23.26%** | — |
+| gz-in.tar | — | **−17.10%** | — |
+| bz2-in.tar | — | **−14.09%** | — |
+| xz-in.tar | — | **−4.22%** | — |
+| zst-in.tar | — | **−8.47%** | — |
+| sample.jar | — | −59.58% | −59.58% (--slow tier picks default) |
 
 ## Architecture
 
-Four-stage pipeline:
+Five-stage pipeline:
 
 1. **Recursive container unwrap** — peel ZIP / tar / ar / .deb / gzip / bzip2 / zstd / xz down to raw streams plus a recipe to rebuild byte-identical originals.
-2. **Per-stream format-aware recompression** — DEFLATE → preflate (or zlib-L9 redeflate fast path), JPEG → brunsli, PNG IDAT → preflate over inflated pixels, MP3 → packMP3, PE → ZXL.
-3. **Cross-stream solid mode** — concatenate the inflated raw bytes of all unwrapped streams; finalize with xz -9e (default) or zpaq -m5 (`--slow`).
-4. **min-pack fallthrough** — every pack runs both the unwrap path and an all-opaque path; the smaller wins. Saves us from regressions on tightly-deflated tiny inputs.
+2. **Per-stream format-aware recompression** — DEFLATE → preflate (or zlib-L9 redeflate fast path), JPEG → brunsli, PNG IDAT → preflate over inflated pixels, MP3 → packMP3.
+3. **Per-content-type bucket routing (M6)** — KIND_OPAQUE entries and unwrap kinds (ZIP/TAR/AR/GZIP/BZIP2/ZSTD/XZ) detected as PE/ELF route to a dedicated sub-stream finalized with `xz -9e --x86` (BCJ filter); everything else stays in the main bucket.
+4. **Cross-stream solid mode** — main bucket finalized with xz -9e (default) or zpaq -m5 (`--slow`); BCJ bucket always finalized with xz -9e --x86.
+5. **min-pack fallthrough** — every pack runs both the unwrap path and an all-opaque path; the smaller wins. Saves us from regressions on tightly-deflated tiny inputs. With `--slow`, also tiers default-mode candidate on small inputs and keeps the smaller — guaranteeing pareto optimality.
 
 Each stage is known in isolation; the integrated product does not exist publicly.
 
