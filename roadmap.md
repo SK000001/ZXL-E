@@ -4,6 +4,12 @@ Single source of truth for where ZXL-E is, where it's going, and what not to ret
 
 ---
 
+## Current state (2026-05-08, M6 v2 shipped)
+
+M1 + M2 + M3a–j + ZXLE_VER 3 final-step xz-9e + M5 --slow + per-fixture min-pack tier + M6 v1 (top-level OPAQUE BCJ routing) + **M6 v2 (container-aware BCJ routing)** ship end-to-end.
+
+**Headline M6 v2 result (2026-05-08):** sniffers detect PE-heavy ZIP/TAR/AR via filename, and PE-heavy GZIP/BZIP2/ZSTD/XZ via inflate-first-2KiB-and-scan. Pure-PE container fixtures gain +2.0–2.8 pp vs M6 v1. ZXLE_VER bumped to 5; manifest gains a u8 unwrap_bucket per non-OPAQUE recipe-bearing kind.
+
 ## Current state (2026-05-08, M6 v1 shipped)
 
 M1 + M2 + M3a–j + ZXLE_VER 3 final-step xz-9e + M5 --slow + per-fixture min-pack tier + **M6 v1 (BCJ x86 routing)** ship end-to-end.
@@ -156,8 +162,9 @@ Plateau reached on the existing-codec ladder: default mode beats xz-9e on every 
 
 Going *beyond* zpaq -m5 on raw text/binary (the only place we don't already win) requires either heavier codecs (paq8/cmix at 100–1000× slowdown) or new architecture. The new milestones in the Roadmap section below are framed against that:
 
-- **M6 v1** — shipped 2026-05-08. PE/ELF top-level entries route to xz+BCJ bucket. +2.0% on per-file/solid corpus, +3.1% on PE DLLs. Container fixtures unchanged (covered by v2).
-- **M6 v2** — route inflated PE/ELF bytes from ZIP/TAR/AR unwrap through the BCJ bucket. Per-OP bucket routing in recipe.c. ~3% additional gain on container fixtures with PE content. Next near-term step.
+- **M6 v1** — shipped 2026-05-08. PE/ELF top-level entries route to xz+BCJ bucket. +2.0% on per-file/solid corpus, +3.1% on PE DLLs.
+- **M6 v2** — shipped 2026-05-08. Container-aware bucket routing for ZIP/TAR/AR/GZIP/BZIP2/ZSTD/XZ. +2.0–2.8 pp on pure-PE container fixtures. Mixed-content fixtures unchanged (per-container choice not granular enough; M6 v3 would close).
+- **M6 v3** — per-OP bucket routing inside the recipe walker. Mixed-content fixtures (mixed.tar.gz, mixed.deb, etc.) where DLL+image content shares a container would gain ~3-5%. Bigger refactor: each OP gets a bucket-id byte, recipe.c walker dispatches per op, every pack_*.c traces which bytes go where. Defer until fuzz/quality work surfaces other priorities.
 - **M7** — CPU parallelism (probe ladders + min-pack tiers in parallel; optional `--fast` for multi-threaded final codec). 2–8× pack-time speedup, zero ratio cost.
 - **M8** — GPU / ML backend. Aspirational; only attempt after M6/M7 land.
 - **M9** — corpus-specific trained model. Deferred until a deployment target appears.
@@ -548,9 +555,32 @@ Pack-time: 5–10× default xz mode (Silesia 327 s vs 204 s). Unpack: similar (z
 - vs xz-9e baseline (0.3524): was −3.8% smaller → now **−5.6% smaller**
 - Container fixtures: byte-identical (their inflated bytes flow through bucket 0 by design)
 
-**v2 remaining (planned):**
-- Route inflated PE/ELF bytes from ZIP/TAR/AR unwrap through bucket 1 too. Currently inflated bytes from `pack_zip` etc. all land in bucket 0. Detecting PE/ELF magic on inflated bytes and rerouting them would let M2/M3 ZIP/TAR fixtures gain ~3% from BCJ on top of current wins. Requires per-OP bucket routing in the recipe walker, not just per-entry. Bigger refactor (~200 LoC in recipe.c + opcodes).
+**v2 shipped 2026-05-08:** container-aware bucket routing for KIND_ZIP/TAR/AR/GZIP/BZIP2/ZSTD/XZ. Each kind has its own sniffer:
+
+- ZIP/TAR/AR: walk in-memory directory, count PE-extension filenames (.dll/.exe/.sys/.drv/.efi/.so/.o/.obj), bucket 1 if ≥ 50%.
+- GZIP/BZIP2/ZSTD/XZ: shell out to inflate first ~2 KiB and scan for MZ / 7F E L F magic anywhere. Catches gz-of-PE, gz-of-tar-of-PE, xz-of-PE, etc.
+
+Each kind's manifest entry gains a u8 unwrap_bucket after the kind byte; unpack dispatches the recipe walker to `bucket_bytes[unwrap_bucket]`. PNG keeps bucket 0 fixed (pixel data is never x86). ZXLE_VER bumped 4 → 5.
+
+Headline impact (default mode):
+| Fixture | M6 v1 | **M6 v2** | Δ |
+|---|---|---|---|
+| pe-deflate.zip | −20.45% | **−22.44%** | +2.0 pp |
+| pe-deflate-l6.zip | −20.78% | **−22.76%** | +2.0 pp |
+| zip-with-jpeg.zip | −19.85% | **−21.95%** | +2.1 pp |
+| zip-with-png.zip | −22.07% | **−23.26%** | +1.2 pp |
+| ntdll.dll.gz | −16.69% | **−19.23%** | +2.5 pp |
+| gz-in.tar | −14.68% | **−17.10%** | +2.4 pp |
+| bz2-in.tar | −11.57% | **−14.09%** | +2.5 pp |
+| xz-in.tar | −1.41% | **−4.22%** | +2.8 pp |
+| zst-in.tar | −5.79% | **−8.47%** | +2.7 pp |
+
+Mixed-content tarballs (mixed.tar.gz, mixed.deb, mixed.tar.bz2 etc.) unchanged — wrapper sniff routes them to bucket 1 (PE majority by bytes), but BCJ's gain on the PE half is offset by small overhead on the JPEG/PNG portions that share the bucket. Per-OP bucket routing (M6 v3, see below) would close that.
+
+**v3 remaining (planned):**
+- Per-OP bucket routing in the recipe walker. Each OP_STORE/OP_REDEFLATE/OP_PREFLATE op gains a bucket-id byte; pack_xxx routes individual entries (not whole containers) to the right bucket. Lets a mixed.tar.gz route DLL bytes to BCJ and JPEG/PNG bytes to LZMA2 simultaneously. ~200 LoC change in recipe.c + bumps every op encoder/decoder.
 - Extend sniffer beyond magic bytes: entropy + printable-ratio for text-vs-binary classification. Lets us route Silesia's `dickens`/`webster`/`samba` text to zpaq `-mt` (text-tuned config) at the same time we route ooffice/sao binaries to xz+BCJ. Modest additional gain (~1-3%) on heterogeneous flat corpora.
+- Deeper AR member sniff (peek inside data.tar.gz/xz/zst). Currently ar_is_pe_heavy looks only at member names so .deb's data layer goes undetected. Would close the ~3% gap currently sitting on mixed.deb / real .deb fixtures (where the codec floor is ALSO at play).
 - Add a third bucket: delta filter for PCM-ish data (audio, sensor logs). Niche; skip until a fixture surfaces.
 
 ### M7 — CPU parallelism / multi-threading (planned)
