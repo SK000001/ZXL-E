@@ -10,12 +10,17 @@
 /* v3 (2026-05-07): solid stream codec switched from zstd -19 --long=27 to
  * xz -9e --threads=1. Manifest layout is unchanged; only the trailing
  * payload's compression scheme changed.
- * v4 (2026-05-08): M6 per-content-type routing. KIND_OPAQUE entries gain
+ * v4 (2026-05-08): M6 v1 per-content-type routing. KIND_OPAQUE entries gain
  * a u8 opaque_bucket immediately after the kind byte (manifest); the
  * trailing payload is now multi-bucket: u8 num_buckets, then per-bucket
  * (u8 codec_id, u32 csize, csize bytes). codec_id: 0=xz-9e, 1=xz-9e+x86,
- * 2=zpaq-m5. v3 and v4 files cannot interoperate. */
-#define ZXLE_VER 4
+ * 2=zpaq-m5.
+ * v5 (2026-05-08): M6 v2 extends bucket routing to non-OPAQUE container
+ * kinds. Each of KIND_ZIP/TAR/AR/GZIP/BZIP2/ZSTD/XZ entries now stores a
+ * u8 unwrap_bucket after the kind byte (and BEFORE the recipe length),
+ * so a PE-heavy ZIP/TAR/AR/wrapped stream routes its inflated bytes
+ * through bucket 1 (xz+BCJ). v3/v4/v5 cannot interoperate. */
+#define ZXLE_VER 5
 
 /* Top-level container kind tag (one byte per manifest entry). */
 #define KIND_OPAQUE 0

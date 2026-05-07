@@ -24,7 +24,8 @@ typedef struct {
     uint64_t    orig_size;
     uint32_t    mode;
     uint8_t     kind;
-    uint8_t     opaque_bucket;  /* M6: which solid bucket KIND_OPAQUE bytes go to */
+    uint8_t     opaque_bucket;  /* M6 v1: which solid bucket KIND_OPAQUE bytes go to */
+    uint8_t     unwrap_bucket;  /* M6 v2: which solid bucket non-OPAQUE container kinds feed */
     Buf         recipe;     /* most kinds */
     Buf         brn;        /* KIND_JPEG */
     Buf         pmp;        /* KIND_MP3  */
@@ -48,6 +49,140 @@ static uint8_t opaque_bucket_for(const uint8_t *p, size_t n) {
 #define CODEC_XZ_9E       0
 #define CODEC_XZ_9E_X86   1
 #define CODEC_ZPAQ_M5     2
+
+/* M6 v2: filename-based PE sniffer. Returns 1 if `name` ends with one of
+ * the common PE/ELF extensions; 0 otherwise. Case-insensitive. */
+static int filename_looks_pe(const char *name, size_t nlen) {
+    static const char *exts[] = {
+        ".dll", ".exe", ".sys", ".drv", ".efi", ".so", ".o", ".obj"
+    };
+    for (size_t i = 0; i < sizeof(exts)/sizeof(exts[0]); i++) {
+        size_t el = strlen(exts[i]);
+        if (nlen < el) continue;
+        const char *tail = name + (nlen - el);
+        int match = 1;
+        for (size_t j = 0; j < el; j++) {
+            char a = tail[j], b = exts[i][j];
+            if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+            if (a != b) { match = 0; break; }
+        }
+        if (match) return 1;
+    }
+    return 0;
+}
+
+/* M6 v2: walk a ZIP central directory, count PE-extension filenames.
+ * Returns 1 if PE entries are >= half of total entry count. */
+static int zip_is_pe_heavy(const uint8_t *p, size_t n) {
+    if (n < 22) return 0;
+    /* Find EOCD (end of central directory) by scanning back from EOF. */
+    size_t eocd = (size_t)-1;
+    for (size_t i = n - 22; i > (n > 65557 ? n - 65557 : 0); i--) {
+        if (p[i] == 0x50 && p[i+1] == 0x4B && p[i+2] == 0x05 && p[i+3] == 0x06) {
+            eocd = i; break;
+        }
+        if (i == 0) break;
+    }
+    if (eocd == (size_t)-1) return 0;
+    if (eocd + 22 > n) return 0;
+    uint32_t cd_off  = (uint32_t)p[eocd+16] | ((uint32_t)p[eocd+17]<<8) |
+                       ((uint32_t)p[eocd+18]<<16) | ((uint32_t)p[eocd+19]<<24);
+    uint16_t entries = (uint16_t)p[eocd+10] | ((uint16_t)p[eocd+11]<<8);
+    if (entries == 0 || cd_off + 46 > n) return 0;
+    int pe = 0, total = 0;
+    size_t off = cd_off;
+    for (uint16_t k = 0; k < entries && off + 46 <= n; k++) {
+        if (p[off] != 0x50 || p[off+1] != 0x4B || p[off+2] != 0x01 || p[off+3] != 0x02) break;
+        uint16_t fnlen  = (uint16_t)p[off+28] | ((uint16_t)p[off+29]<<8);
+        uint16_t exlen  = (uint16_t)p[off+30] | ((uint16_t)p[off+31]<<8);
+        uint16_t cmlen  = (uint16_t)p[off+32] | ((uint16_t)p[off+33]<<8);
+        if (off + 46 + fnlen > n) break;
+        if (filename_looks_pe((const char *)(p + off + 46), fnlen)) pe++;
+        total++;
+        off += 46 + fnlen + exlen + cmlen;
+    }
+    return total > 0 && pe * 2 >= total;
+}
+
+/* M6 v2: walk ustar headers, count PE-extension filenames. */
+static int tar_is_pe_heavy(const uint8_t *p, size_t n) {
+    int pe = 0, total = 0;
+    size_t off = 0;
+    while (off + 512 <= n && total < 64) {
+        if (memcmp(p + off + 257, "ustar", 5) != 0) break;
+        const char *name = (const char *)(p + off);
+        if (name[0] == 0) break;
+        size_t nlen = strnlen(name, 100);
+        if (nlen > 0) {
+            if (filename_looks_pe(name, nlen)) pe++;
+            total++;
+        }
+        /* Parse octal size; skip header (512) + payload (rounded to 512). */
+        char szbuf[13]; memcpy(szbuf, p + off + 124, 12); szbuf[12] = 0;
+        unsigned long long sz = 0;
+        for (size_t i = 0; i < 12 && szbuf[i] >= '0' && szbuf[i] <= '7'; i++)
+            sz = sz * 8 + (unsigned)(szbuf[i] - '0');
+        size_t skip = 512 + ((sz + 511) & ~(size_t)511);
+        if (skip == 0 || off + skip > n) break;
+        off += skip;
+    }
+    return total > 0 && pe * 2 >= total;
+}
+
+/* M6 v2: walk ar member headers (8-byte magic + 60-byte headers). */
+static int ar_is_pe_heavy(const uint8_t *p, size_t n) {
+    if (n < 8 || memcmp(p, "!<arch>\n", 8) != 0) return 0;
+    int pe = 0, total = 0;
+    size_t off = 8;
+    while (off + 60 <= n && total < 64) {
+        const char *name = (const char *)(p + off);
+        size_t nlen = 0;
+        while (nlen < 16 && name[nlen] != ' ' && name[nlen] != '/') nlen++;
+        if (nlen > 0 && filename_looks_pe(name, nlen)) pe++;
+        total++;
+        char szbuf[11]; memcpy(szbuf, p + off + 48, 10); szbuf[10] = 0;
+        unsigned long long sz = 0;
+        for (size_t i = 0; i < 10 && szbuf[i] >= '0' && szbuf[i] <= '9'; i++)
+            sz = sz * 10 + (unsigned)(szbuf[i] - '0');
+        size_t skip = 60 + sz + (sz & 1);
+        if (skip == 60 || off + skip > n) break;
+        off += skip;
+    }
+    return total > 0 && pe * 2 >= total;
+}
+
+/* M6 v2: shell out to a wrapper-codec to inflate first ~2 KiB and scan for
+ * PE/ELF magic anywhere in those bytes. Catches gzip-of-PE, gzip-of-tar-of-
+ * PE, etc. without re-implementing each codec. tmp_prefix is a unique-per-
+ * call file prefix for the input/peek temp files. Returns 1 if PE heavy. */
+static int wrapped_is_pe_heavy(const uint8_t *p, size_t n,
+                               const char *codec_dec_cmd_fmt,
+                               const char *tmp_prefix) {
+    char in_path[1024], peek_path[1024], cmd[4096];
+    snprintf(in_path,   sizeof(in_path),   "%s.peek.in",   tmp_prefix);
+    snprintf(peek_path, sizeof(peek_path), "%s.peek.out",  tmp_prefix);
+    FILE *wf = fopen(in_path, "wb");
+    if (!wf) return 0;
+    if (fwrite(p, 1, n, wf) != n) { fclose(wf); unlink(in_path); return 0; }
+    fclose(wf);
+    snprintf(cmd, sizeof(cmd), codec_dec_cmd_fmt, in_path, peek_path);
+    int rc = try_run(cmd);
+    unlink(in_path);
+    if (rc != 0) { unlink(peek_path); return 0; }
+    size_t plen = 0;
+    uint8_t *peek = read_whole_file(peek_path, &plen);
+    unlink(peek_path);
+    if (!peek) return 0;
+    int found = 0;
+    for (size_t i = 0; i + 3 < plen; i++) {
+        if (peek[i] == 0x4D && peek[i+1] == 0x5A) { found = 1; break; }
+        if (peek[i] == 0x7F && peek[i+1] == 0x45 && peek[i+2] == 0x4C && peek[i+3] == 0x46) {
+            found = 1; break;
+        }
+    }
+    free(peek);
+    return found;
+}
 
 /* pack_run — main pack body. force_opaque=1 skips all container-unwrap routing
  * and stores every input as KIND_OPAQUE. slow=1 finalizes the solid stream
@@ -84,11 +219,19 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
         buf_init(&ents[i].pmp);
 
         int unwrapped = 0;
+        /* M6 v2: pre-sniff the input to decide which solid bucket to feed.
+         * For multi-entry containers (ZIP/TAR/AR) walk the directory; for
+         * single-stream wrappers (GZIP/BZIP2/ZSTD/XZ) shell out to inflate
+         * a small prefix and scan for PE/ELF magic. PNG inflated bytes are
+         * raw pixel data, not x86 -- always bucket 0. */
         if (!force_opaque && fsz >= 22 && fb[0]==0x50 && fb[1]==0x4B) {
+            int b = zip_is_pe_heavy(fb, fsz);
+            Buf *t = b ? &solid_x86 : &solid;
             char tp[1024];
             snprintf(tp, sizeof(tp), "%s.%d", out, i);
-            if (pack_zip(fb, fsz, tp, &ents[i].recipe, &solid) == 0) {
+            if (pack_zip(fb, fsz, tp, &ents[i].recipe, t) == 0) {
                 ents[i].kind = KIND_ZIP;
+                ents[i].unwrap_bucket = (uint8_t)b;
                 unwrapped = 1;
             }
         }
@@ -111,6 +254,7 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
         if (!force_opaque && !unwrapped && fsz >= 8 && memcmp(fb, PNG_SIG, 8) == 0) {
             if (pack_png(fb, fsz, &ents[i].recipe, &solid) == 0) {
                 ents[i].kind = KIND_PNG;
+                ents[i].unwrap_bucket = 0;
                 unwrapped = 1;
             } else {
                 buf_free(&ents[i].recipe);
@@ -120,8 +264,12 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
         if (!force_opaque && !unwrapped && fsz >= 18 && fb[0]==0x1F && fb[1]==0x8B && fb[2]==0x08) {
             char tp[1024];
             snprintf(tp, sizeof(tp), "%s.%d", out, i);
-            if (pack_gz(fb, fsz, tp, &ents[i].recipe, &solid) == 0) {
+            int b = wrapped_is_pe_heavy(fb, fsz,
+                "gzip -dc \"%s\" 2>" ZXLE_DEVNULL " | head -c 2048 > \"%s\"", tp);
+            Buf *t = b ? &solid_x86 : &solid;
+            if (pack_gz(fb, fsz, tp, &ents[i].recipe, t) == 0) {
                 ents[i].kind = KIND_GZIP;
+                ents[i].unwrap_bucket = (uint8_t)b;
                 unwrapped = 1;
             } else {
                 buf_free(&ents[i].recipe);
@@ -131,8 +279,12 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
         if (!force_opaque && !unwrapped && fsz >= 8 && fb[0]==0x28 && fb[1]==0xB5 && fb[2]==0x2F && fb[3]==0xFD) {
             char tp[1024];
             snprintf(tp, sizeof(tp), "%s.%d", out, i);
-            if (pack_zst(fb, fsz, tp, &ents[i].recipe, &solid) == 0) {
+            int b = wrapped_is_pe_heavy(fb, fsz,
+                "zstd -dc \"%s\" 2>" ZXLE_DEVNULL " | head -c 2048 > \"%s\"", tp);
+            Buf *t = b ? &solid_x86 : &solid;
+            if (pack_zst(fb, fsz, tp, &ents[i].recipe, t) == 0) {
                 ents[i].kind = KIND_ZSTD;
+                ents[i].unwrap_bucket = (uint8_t)b;
                 unwrapped = 1;
             } else {
                 buf_free(&ents[i].recipe);
@@ -143,8 +295,12 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
             fb[0]==0xFD && fb[1]==0x37 && fb[2]==0x7A && fb[3]==0x58 && fb[4]==0x5A && fb[5]==0x00) {
             char tp[1024];
             snprintf(tp, sizeof(tp), "%s.%d", out, i);
-            if (pack_xz(fb, fsz, tp, &ents[i].recipe, &solid) == 0) {
+            int b = wrapped_is_pe_heavy(fb, fsz,
+                "xz -dc \"%s\" 2>" ZXLE_DEVNULL " | head -c 2048 > \"%s\"", tp);
+            Buf *t = b ? &solid_x86 : &solid;
+            if (pack_xz(fb, fsz, tp, &ents[i].recipe, t) == 0) {
                 ents[i].kind = KIND_XZ;
+                ents[i].unwrap_bucket = (uint8_t)b;
                 unwrapped = 1;
             } else {
                 buf_free(&ents[i].recipe);
@@ -155,8 +311,12 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
             fb[3] >= '1' && fb[3] <= '9') {
             char tp[1024];
             snprintf(tp, sizeof(tp), "%s.%d", out, i);
-            if (pack_bz2(fb, fsz, tp, &ents[i].recipe, &solid) == 0) {
+            int b = wrapped_is_pe_heavy(fb, fsz,
+                "bzip2 -dc \"%s\" 2>" ZXLE_DEVNULL " | head -c 2048 > \"%s\"", tp);
+            Buf *t = b ? &solid_x86 : &solid;
+            if (pack_bz2(fb, fsz, tp, &ents[i].recipe, t) == 0) {
                 ents[i].kind = KIND_BZIP2;
+                ents[i].unwrap_bucket = (uint8_t)b;
                 unwrapped = 1;
             } else {
                 buf_free(&ents[i].recipe);
@@ -164,10 +324,13 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
             }
         }
         if (!force_opaque && !unwrapped && fsz >= 1024 && memcmp(fb + 257, "ustar", 5) == 0) {
+            int b = tar_is_pe_heavy(fb, fsz);
+            Buf *t = b ? &solid_x86 : &solid;
             char tp[1024];
             snprintf(tp, sizeof(tp), "%s.%d", out, i);
-            if (pack_tar(fb, fsz, tp, &ents[i].recipe, &solid) == 0) {
+            if (pack_tar(fb, fsz, tp, &ents[i].recipe, t) == 0) {
                 ents[i].kind = KIND_TAR;
+                ents[i].unwrap_bucket = (uint8_t)b;
                 unwrapped = 1;
             } else {
                 buf_free(&ents[i].recipe);
@@ -175,10 +338,13 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
             }
         }
         if (!force_opaque && !unwrapped && fsz >= 8 && memcmp(fb, "!<arch>\n", 8) == 0) {
+            int b = ar_is_pe_heavy(fb, fsz);
+            Buf *t = b ? &solid_x86 : &solid;
             char tp[1024];
             snprintf(tp, sizeof(tp), "%s.%d", out, i);
-            if (pack_ar(fb, fsz, tp, &ents[i].recipe, &solid) == 0) {
+            if (pack_ar(fb, fsz, tp, &ents[i].recipe, t) == 0) {
                 ents[i].kind = KIND_AR;
+                ents[i].unwrap_bucket = (uint8_t)b;
                 unwrapped = 1;
             } else {
                 buf_free(&ents[i].recipe);
@@ -259,22 +425,25 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
         unlink(tmp_payload);
     }
 
-    /* Compute manifest size. KIND_OPAQUE has no recipe blob in v3 -- v4
-     * adds a u8 opaque_bucket immediately after the kind byte. */
+    /* Compute manifest size. v4 added u8 opaque_bucket for KIND_OPAQUE. v5
+     * adds u8 unwrap_bucket for KIND_ZIP/TAR/AR/GZIP/BZIP2/ZSTD/XZ (anything
+     * with a recipe that consumes from solid). PNG also has a recipe but
+     * its inflated bytes are pixel data, never x86 -- hardcode bucket 0
+     * for PNG and don't store the byte. */
     size_t mlen = 0;
     for (int i = 0; i < n; i++) {
         mlen += 2 + strlen(ents[i].name) + 8 + 4 + 1;
         if (ents[i].kind == KIND_OPAQUE) mlen += 1;  /* opaque_bucket */
-        if (ents[i].kind == KIND_ZIP)   mlen += 4 + ents[i].recipe.n;
+        if (ents[i].kind == KIND_ZIP)   mlen += 1 + 4 + ents[i].recipe.n;  /* +1 unwrap_bucket */
         if (ents[i].kind == KIND_JPEG)  mlen += 4 + ents[i].brn.n;
         if (ents[i].kind == KIND_MP3)   mlen += 4 + ents[i].pmp.n;
-        if (ents[i].kind == KIND_PNG)   mlen += 4 + ents[i].recipe.n;
-        if (ents[i].kind == KIND_GZIP)  mlen += 4 + ents[i].recipe.n;
-        if (ents[i].kind == KIND_TAR)   mlen += 4 + ents[i].recipe.n;
-        if (ents[i].kind == KIND_AR)    mlen += 4 + ents[i].recipe.n;
-        if (ents[i].kind == KIND_BZIP2) mlen += 4 + ents[i].recipe.n;
-        if (ents[i].kind == KIND_ZSTD)  mlen += 4 + ents[i].recipe.n;
-        if (ents[i].kind == KIND_XZ)    mlen += 4 + ents[i].recipe.n;
+        if (ents[i].kind == KIND_PNG)   mlen += 4 + ents[i].recipe.n;       /* PNG bucket fixed at 0 */
+        if (ents[i].kind == KIND_GZIP)  mlen += 1 + 4 + ents[i].recipe.n;
+        if (ents[i].kind == KIND_TAR)   mlen += 1 + 4 + ents[i].recipe.n;
+        if (ents[i].kind == KIND_AR)    mlen += 1 + 4 + ents[i].recipe.n;
+        if (ents[i].kind == KIND_BZIP2) mlen += 1 + 4 + ents[i].recipe.n;
+        if (ents[i].kind == KIND_ZSTD)  mlen += 1 + 4 + ents[i].recipe.n;
+        if (ents[i].kind == KIND_XZ)    mlen += 1 + 4 + ents[i].recipe.n;
     }
 
     FILE *o = fopen(out, "wb");
@@ -293,6 +462,14 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
         wu32(o, ents[i].mode);
         fputc(ents[i].kind, o);
         if (ents[i].kind == KIND_OPAQUE) fputc(ents[i].opaque_bucket, o);
+        /* v5: unwrap_bucket for kinds whose recipe consumes from solid (excl. PNG). */
+        switch (ents[i].kind) {
+        case KIND_ZIP: case KIND_GZIP: case KIND_TAR: case KIND_AR:
+        case KIND_BZIP2: case KIND_ZSTD: case KIND_XZ:
+            fputc(ents[i].unwrap_bucket, o);
+            break;
+        default: break;
+        }
 
         const Buf *blob = NULL;
         switch (ents[i].kind) {
@@ -428,7 +605,8 @@ typedef struct {
     uint64_t orig_size;
     uint32_t mode;
     uint8_t  kind;
-    uint8_t  opaque_bucket;  /* M6: which solid bucket KIND_OPAQUE bytes come from */
+    uint8_t  opaque_bucket;  /* M6 v1: which solid bucket KIND_OPAQUE bytes come from */
+    uint8_t  unwrap_bucket;  /* M6 v2: which solid bucket non-OPAQUE container kinds read from */
     uint8_t *recipe;        /* points into manifest buffer */
     uint32_t recipe_len;
     uint8_t *brn;
@@ -550,9 +728,19 @@ static int do_unpack(int argc, char **argv) {
         ents[count].mode = r32(manifest + mp); mp += 4;
         ents[count].kind = manifest[mp]; mp += 1;
         ents[count].opaque_bucket = 0;
+        ents[count].unwrap_bucket = 0;
         if (ents[count].kind == KIND_OPAQUE) {
             if (mp + 1 > mlen) die("opaque_bucket truncated");
             ents[count].opaque_bucket = manifest[mp]; mp += 1;
+        }
+        /* v5: unwrap_bucket for ZIP/TAR/AR/GZIP/BZIP2/ZSTD/XZ. */
+        switch (ents[count].kind) {
+        case KIND_ZIP: case KIND_GZIP: case KIND_TAR: case KIND_AR:
+        case KIND_BZIP2: case KIND_ZSTD: case KIND_XZ:
+            if (mp + 1 > mlen) die("unwrap_bucket truncated");
+            ents[count].unwrap_bucket = manifest[mp]; mp += 1;
+            break;
+        default: break;
         }
         ents[count].recipe = NULL; ents[count].recipe_len = 0;
         ents[count].brn    = NULL; ents[count].brn_len    = 0;
@@ -608,18 +796,21 @@ static int do_unpack(int argc, char **argv) {
 
     if (ZXLE_MKDIR(outdir) != 0 && errno != EEXIST) die("mkdir outdir");
 
-    /* All format-aware unwrap kinds (KIND_ZIP/TAR/AR/PNG/GZIP/BZIP2/ZSTD/XZ)
-     * read from bucket 0 (main) only. KIND_OPAQUE entries dispatch by their
-     * opaque_bucket field. */
-    uint8_t *main_solid = bucket_bytes[0];
-    size_t   main_len   = bucket_len[0];
-    size_t  *main_pos   = &bucket_pos[0];
-
+    /* PNG inflated bytes are pixel data, never x86 -- always bucket 0. Other
+     * recipe-bearing kinds dispatch by their unwrap_bucket field. KIND_OPAQUE
+     * dispatches by opaque_bucket. */
     for (int i = 0; i < count; i++) {
         char p[2048];
         snprintf(p, sizeof(p), "%s/%s", outdir, ents[i].name);
         FILE *of = fopen(p, "wb");
         if (!of) { fprintf(stderr, "fopen %s\n", p); die("fopen out"); }
+        /* Resolve which bucket this entry reads from (for non-OPAQUE recipe
+         * kinds). PNG forced to 0. */
+        uint8_t rb = ents[i].unwrap_bucket;
+        if (rb >= num_buckets) die("unwrap_bucket out of range");
+        uint8_t *rec_solid = bucket_bytes[rb];
+        size_t   rec_len   = bucket_len[rb];
+        size_t  *rec_pos   = &bucket_pos[rb];
         if (ents[i].kind == KIND_OPAQUE) {
             int b = ents[i].opaque_bucket;
             if (b >= num_buckets) die("opaque_bucket out of range");
@@ -631,7 +822,7 @@ static int do_unpack(int argc, char **argv) {
             fclose(of);
         } else if (ents[i].kind == KIND_ZIP || ents[i].kind == KIND_TAR || ents[i].kind == KIND_AR) {
             unpack_recipe(ents[i].recipe, ents[i].recipe_len,
-                          main_solid, main_len, main_pos,
+                          rec_solid, rec_len, rec_pos,
                           of, ents[i].orig_size, p);
             fclose(of);
         } else if (ents[i].kind == KIND_JPEG) {
@@ -647,27 +838,27 @@ static int do_unpack(int argc, char **argv) {
             unlink(tmp_brn);
         } else if (ents[i].kind == KIND_PNG) {
             unpack_png(ents[i].recipe, ents[i].recipe_len,
-                       main_solid, main_len, main_pos,
+                       bucket_bytes[0], bucket_len[0], &bucket_pos[0],
                        of, ents[i].orig_size);
             fclose(of);
         } else if (ents[i].kind == KIND_GZIP) {
             unpack_gz(ents[i].recipe, ents[i].recipe_len,
-                      main_solid, main_len, main_pos,
+                      rec_solid, rec_len, rec_pos,
                       of, ents[i].orig_size, p);
             fclose(of);
         } else if (ents[i].kind == KIND_BZIP2) {
             unpack_bz2(ents[i].recipe, ents[i].recipe_len,
-                       main_solid, main_len, main_pos,
+                       rec_solid, rec_len, rec_pos,
                        of, ents[i].orig_size, p);
             fclose(of);
         } else if (ents[i].kind == KIND_ZSTD) {
             unpack_zst(ents[i].recipe, ents[i].recipe_len,
-                       main_solid, main_len, main_pos,
+                       rec_solid, rec_len, rec_pos,
                        of, ents[i].orig_size, p);
             fclose(of);
         } else if (ents[i].kind == KIND_XZ) {
             unpack_xz(ents[i].recipe, ents[i].recipe_len,
-                      main_solid, main_len, main_pos,
+                      rec_solid, rec_len, rec_pos,
                       of, ents[i].orig_size, p);
             fclose(of);
         } else if (ents[i].kind == KIND_MP3) {
