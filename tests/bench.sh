@@ -204,3 +204,55 @@ if [ -f "$JPG" ]; then
     printf "  zxle vs xz-9e: %s\n" "$(awk -v a="$J_ZXLE" -v b="$J_XZ" 'BEGIN{printf "%.2f%%", (a-b)*100/b}')"
     printf "  perf: pack=%dms unpack=%dms\n" "$J_PACK_MS" "$J_UNP_MS"
 fi
+
+# Competitor: precomp v0.4.7 (closest peer — also unwrap-and-recompress with
+# preflate; uses LZMA2 as final step where we use zstd-19 long=27). We RT-verify
+# every result; size compared against zxle and xz-9e on the same fixture.
+PRECOMP=""
+[ -x third_party/precomp/precomp.exe ] && PRECOMP=third_party/precomp/precomp.exe
+[ -z "$PRECOMP" ] && [ -x third_party/precomp/precomp ] && PRECOMP=third_party/precomp/precomp
+if [ -n "$PRECOMP" ]; then
+    echo
+    echo "=== Competitor: precomp v0.4.7 vs zxle (size + RT) ==="
+    bench_precomp() {
+        local label="$1" SRC="$2"
+        [ -f "$SRC" ] || return 0
+        local base; base=$(basename "$SRC")
+        local pcf="tests/baseline/$base.pcf" rec="tests/unpacked/$base.precomp.bin"
+        rm -f "$pcf" "$rec"
+        local t0 pc_ms rec_ms PC_RT
+        t0=$EPOCHREALTIME
+        "$PRECOMP" -o"$pcf" "$SRC" >/dev/null 2>&1 || { echo "  $label: precomp failed"; return; }
+        pc_ms=$(elapsed_ms "$t0")
+        t0=$EPOCHREALTIME
+        "$PRECOMP" -r -o"$rec" "$pcf" >/dev/null 2>&1 || { echo "  $label: precomp -r failed"; return; }
+        rec_ms=$(elapsed_ms "$t0")
+        cmp -s "$SRC" "$rec" && PC_RT=OK || PC_RT=FAIL
+        local SZ ORIG XZ ZX
+        ORIG=$(stat -c%s "$SRC")
+        SZ=$(stat -c%s "$pcf")
+        ZX=$(stat -c%s "tests/baseline/$base.zxle" 2>/dev/null || echo 0)
+        XZ=$(xz -9e -c "$SRC" 2>/dev/null | wc -c)
+        printf "  %s (%s):\n" "$label" "$base"
+        printf "    orig=%d  zxle=%d  precomp=%d  xz-9e=%d  rt=%s\n" "$ORIG" "$ZX" "$SZ" "$XZ" "$PC_RT"
+        if [ "$ZX" -gt 0 ]; then
+            printf "    precomp vs zxle: %s   precomp vs xz-9e: %s   perf: pack=%dms restore=%dms\n" \
+                "$(awk -v a="$SZ" -v b="$ZX" 'BEGIN{printf "%+.2f%%", (a-b)*100/b}')" \
+                "$(awk -v a="$SZ" -v b="$XZ" 'BEGIN{printf "%+.2f%%", (a-b)*100/b}')" \
+                "$pc_ms" "$rec_ms"
+        fi
+        rm -f "$pcf" "$rec"
+    }
+    # Headline-positive zxle fixtures: shapes where we beat xz-9e via unwrap.
+    # Limited set chosen to span format families without bloating bench time.
+    bench_precomp "ZIP unwrap"            tests/corpus/pe-deflate.zip
+    bench_precomp "ZIP/L6 (preflate)"     tests/corpus/pe-deflate-l6.zip
+    bench_precomp "DOCX (real ZIP/L6)"    tests/corpus/sample.docx
+    bench_precomp "JAR (real ZIP/L6)"     tests/corpus/sample.jar
+    bench_precomp "gzip wrapper"          tests/corpus/ntdll.dll.gz
+    bench_precomp "gz of mixed.tar"       tests/corpus/mixed.tar.gz
+    bench_precomp "deb-shape ar"          tests/corpus/mixed.deb
+    bench_precomp "JPEG (brunsli)"        tests/corpus/synth.jpg
+    bench_precomp "PNG (IDAT zlib-L9)"    "$CORPUS/test.png"
+    bench_precomp "MP3 (packMP3)"         tests/corpus/synth.mp3
+fi
