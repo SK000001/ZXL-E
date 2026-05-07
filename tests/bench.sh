@@ -256,3 +256,64 @@ if [ -n "$PRECOMP" ]; then
     bench_precomp "PNG (IDAT zlib-L9)"    "$CORPUS/test.png"
     bench_precomp "MP3 (packMP3)"         tests/corpus/synth.mp3
 fi
+
+# Silesia corpus (12 files, 211 MB) — the standard general-purpose codec
+# benchmark. Gated by ZXLE_SILESIA=1 because pack time on 211 MB through
+# xz-9e single-threaded is several minutes.
+if [ "${ZXLE_SILESIA:-0}" = "1" ] && [ -d tests/corpus/silesia ]; then
+    echo
+    echo "=== Silesia corpus benchmark (211,938,580 B; 12 files) ==="
+    SIL_DIR=tests/corpus/silesia
+    SIL_FILES="$SIL_DIR/dickens $SIL_DIR/mozilla $SIL_DIR/mr $SIL_DIR/nci $SIL_DIR/ooffice $SIL_DIR/osdb $SIL_DIR/reymont $SIL_DIR/samba $SIL_DIR/sao $SIL_DIR/webster $SIL_DIR/x-ray $SIL_DIR/xml"
+    SIL_SUM=0
+    for f in $SIL_FILES; do
+        [ -f "$f" ] || { echo "  missing: $f"; SIL_FILES=""; break; }
+        SIL_SUM=$((SIL_SUM + $(stat -c%s "$f")))
+    done
+    if [ -n "$SIL_FILES" ]; then
+        # Tar baseline once (used by xz-9e and zstd-19 baselines).
+        SIL_TAR=tests/baseline/silesia.tar
+        tar cf "$SIL_TAR" -C "$SIL_DIR" \
+            dickens mozilla mr nci ooffice osdb reymont samba sao webster x-ray xml
+        SIL_TAR_SZ=$(stat -c%s "$SIL_TAR")
+        echo "tar size:           $SIL_TAR_SZ B (overhead $((SIL_TAR_SZ - SIL_SUM)) B)"
+        echo
+        echo "Mode: solid zxle pack (12 files)"
+        t0=$EPOCHREALTIME
+        "$BIN" pack tests/baseline/silesia.zxle $SIL_FILES >/dev/null 2>&1
+        SIL_PACK_MS=$(elapsed_ms "$t0")
+        SIL_ZX=$(stat -c%s tests/baseline/silesia.zxle)
+        rm -rf tests/unpacked/silesia.d && mkdir -p tests/unpacked/silesia.d
+        t0=$EPOCHREALTIME
+        "$BIN" unpack tests/baseline/silesia.zxle tests/unpacked/silesia.d >/dev/null 2>&1
+        SIL_UNP_MS=$(elapsed_ms "$t0")
+        SIL_RT=OK
+        for f in $SIL_FILES; do
+            b=$(basename "$f")
+            cmp -s "$f" "tests/unpacked/silesia.d/$b" || SIL_RT=FAIL
+        done
+        echo
+        echo "Baselines (tar + codec):"
+        echo "  tar | xz -9e --threads=1 ..."
+        t0=$EPOCHREALTIME
+        SIL_XZ=$(xz -9e --threads=1 -c "$SIL_TAR" 2>/dev/null | wc -c)
+        SIL_XZ_MS=$(elapsed_ms "$t0")
+        echo "  tar | zstd -19 --long=27 ..."
+        t0=$EPOCHREALTIME
+        SIL_ZSTD=$(zstd -19 --long=27 -q -c "$SIL_TAR" 2>/dev/null | wc -c)
+        SIL_ZSTD_MS=$(elapsed_ms "$t0")
+        echo
+        printf "Results (vs sum of orig sizes %d B):\n" "$SIL_SUM"
+        printf "  zxle solid       %12d  ratio=%s  rt=%s  pack=%dms unpack=%dms\n" \
+            "$SIL_ZX" "$(ratio "$SIL_ZX" "$SIL_SUM")" "$SIL_RT" "$SIL_PACK_MS" "$SIL_UNP_MS"
+        printf "  tar + xz-9e      %12d  ratio=%s  pack=%dms\n" \
+            "$SIL_XZ" "$(ratio "$SIL_XZ" "$SIL_SUM")" "$SIL_XZ_MS"
+        printf "  tar + zstd-19    %12d  ratio=%s  pack=%dms\n" \
+            "$SIL_ZSTD" "$(ratio "$SIL_ZSTD" "$SIL_SUM")" "$SIL_ZSTD_MS"
+        printf "  zxle vs tar+xz-9e:    %s\n" \
+            "$(awk -v a="$SIL_ZX" -v b="$SIL_XZ" 'BEGIN{printf "%+.2f%%", (a-b)*100/b}')"
+        printf "  zxle vs tar+zstd-19:  %s\n" \
+            "$(awk -v a="$SIL_ZX" -v b="$SIL_ZSTD" 'BEGIN{printf "%+.2f%%", (a-b)*100/b}')"
+        rm -f "$SIL_TAR"
+    fi
+fi
