@@ -22,6 +22,17 @@ int pack_zst(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *recipe, Bu
     }
     int has_fcs = (fcs_flag != 0) || single_segment;
 
+    /* Multi-frame fast-fail: zstd -T0 worker output emits one frame per
+     * worker, each prefixed with the 28 B5 2F FD magic. We only reproduce
+     * single-frame inputs, so any second magic occurrence means bail before
+     * the probe ladder. False-positive prob (magic appearing by chance in
+     * a compressed body) is ~n/2^32; a false positive just falls through
+     * to KIND_OPAQUE which is the correct behavior anyway. */
+    for (size_t i = 4; i + 3 < n; i++) {
+        if (p[i]==0x28 && p[i+1]==0xB5 && p[i+2]==0x2F && p[i+3]==0xFD)
+            return -1;
+    }
+
     char in_zst[1024], raw_path[1024], rt_zst[1024], cmd[4096];
     snprintf(in_zst,   sizeof(in_zst),   "%s.in.zst",  tmp_prefix);
     snprintf(raw_path, sizeof(raw_path), "%s.raw.bin", tmp_prefix);
@@ -42,7 +53,12 @@ int pack_zst(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *recipe, Bu
         free(raw); unlink(in_zst); unlink(raw_path); return -1;
     }
 
-    static const uint8_t levels[] = {19, 22, 20, 21, 18, 17, 9, 6, 3, 1};
+    /* Levels ordered by real-world frequency: -3 is the zstd CLI default and
+     * the typical encoder for makepkg/dpkg-style packagers; -19 is the common
+     * high-effort default; -22 next; remainder rounds out coverage. The
+     * 8-probe cap below assumes the matching encoder is in the first ~3
+     * levels for any current fixture. */
+    static const uint8_t levels[] = {3, 19, 22, 20, 18, 17, 9, 6, 1, 21};
     uint8_t long_tries[3];
     int n_long = 0;
     long_tries[n_long++] = 27;
@@ -53,9 +69,19 @@ int pack_zst(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *recipe, Bu
 
     int matched_level = -1;
     uint8_t matched_long = 0;
+    /* Cap probes at 8 to bound encode time on inputs the CLI can't reproduce
+     * (e.g., dpkg-deb's libzstd-direct uses non-CLI-reachable encoder params).
+     * With the {3, 19, 22, ...} reorder above, every current matching fixture
+     * lands by probe 5 (mixed.tar.zst3 at probe 3, mixed.tar.zst at 3-4,
+     * which.pkg.tar.zst at 5). On no-match inputs this turns ~30 probes
+     * (~50 s on a 1.4 MB stream) into 8 probes (~12 s). */
+    int probes = 0;
     for (size_t li = 0; li < sizeof(levels); li++) {
+        if (probes >= 8) break;
         uint8_t level = levels[li];
         for (int lj = 0; lj < n_long; lj++) {
+            if (probes >= 8) break;
+            probes++;
             uint8_t lw = long_tries[lj];
             char long_part[32];
             if (lw == 0) long_part[0] = 0;
