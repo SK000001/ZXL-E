@@ -171,6 +171,7 @@ bench_file "M3e-targz (gz of mixed.tar)" tests/corpus/mixed.tar.gz
 bench_file "M3e-tar gzip-in-tar"         tests/corpus/gz-in.tar
 bench_file "M3f-ar (.deb shape)"          tests/corpus/mixed.deb
 [ -f tests/corpus/real_hello.deb ] && bench_file "M3f-ar real .deb (hello_2.10-3)" tests/corpus/real_hello.deb
+[ -f tests/corpus/real_coreutils.deb ] && bench_file "M3h real .deb zst (coreutils 9.5)" tests/corpus/real_coreutils.deb
 bench_file "M3g-bz2tar (bz2 of mixed.tar)" tests/corpus/mixed.tar.bz2
 bench_file "M3g bz2-in-tar"                tests/corpus/bz2-in.tar
 bench_file "M3h-zsttar (zst of mixed.tar)" tests/corpus/mixed.tar.zst
