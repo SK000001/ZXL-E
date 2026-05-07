@@ -24,10 +24,30 @@ typedef struct {
     uint64_t    orig_size;
     uint32_t    mode;
     uint8_t     kind;
+    uint8_t     opaque_bucket;  /* M6: which solid bucket KIND_OPAQUE bytes go to */
     Buf         recipe;     /* most kinds */
     Buf         brn;        /* KIND_JPEG */
     Buf         pmp;        /* KIND_MP3  */
 } PackEntry;
+
+/* M6: detect content type for solid-bucket routing. Returns the bucket id:
+ *   0 = main bucket  (text, mixed binary, already-compressed, etc.)
+ *   1 = x86 bucket   (PE / ELF -- benefits from xz BCJ filter)
+ * Sniffer is cheap (magic-byte check at offset 0). False positives on
+ * non-x86 data routed to bucket 1 still round-trip correctly (BCJ is
+ * reversible) but lose a small ratio. */
+static uint8_t opaque_bucket_for(const uint8_t *p, size_t n) {
+    if (n < 4) return 0;
+    if (p[0] == 0x4D && p[1] == 0x5A) return 1;                      /* PE: "MZ" */
+    if (p[0] == 0x7F && p[1] == 0x45 && p[2] == 0x4C && p[3] == 0x46)
+        return 1;                                                     /* ELF: 7F 'E' 'L' 'F' */
+    return 0;
+}
+
+/* M6 codec ids stored in the v4 trailing payload's per-bucket header. */
+#define CODEC_XZ_9E       0
+#define CODEC_XZ_9E_X86   1
+#define CODEC_ZPAQ_M5     2
 
 /* pack_run — main pack body. force_opaque=1 skips all container-unwrap routing
  * and stores every input as KIND_OPAQUE. slow=1 finalizes the solid stream
@@ -40,7 +60,13 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
                     int slow, long long *out_size, uint64_t *out_total) {
     PackEntry *ents = calloc((size_t)n, sizeof(PackEntry));
     if (!ents) die("calloc ents");
-    Buf solid; buf_init(&solid);
+    /* M6: two solid buckets. solid (bucket 0) holds main-codec bytes (xz or
+     * zpaq depending on --slow); solid_x86 (bucket 1) holds PE/ELF bytes
+     * which always go through xz with the BCJ x86 filter. All format-aware
+     * unwrap kinds (KIND_ZIP/TAR/AR/etc.) still feed bucket 0 only -- M6 v1
+     * routes only top-level KIND_OPAQUE entries. */
+    Buf solid;     buf_init(&solid);
+    Buf solid_x86; buf_init(&solid_x86);
 
     uint64_t total = 0;
     int unwrapped_count = 0;
@@ -161,7 +187,12 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
         }
         if (!unwrapped) {
             ents[i].kind = KIND_OPAQUE;
-            buf_append(&solid, fb, fsz);
+            ents[i].opaque_bucket = opaque_bucket_for(fb, fsz);
+            if (ents[i].opaque_bucket == 1) {
+                buf_append(&solid_x86, fb, fsz);
+            } else {
+                buf_append(&solid, fb, fsz);
+            }
         } else {
             unwrapped_count++;
         }
@@ -169,36 +200,71 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
         free(fb);
     }
 
-    char tmp_concat[1024], tmp_zst[1024];
-    snprintf(tmp_concat, sizeof(tmp_concat), "%s.concat.tmp", out);
-    snprintf(tmp_zst,    sizeof(tmp_zst),    "%s.zst.tmp",    out);
-
-    FILE *cf = fopen(tmp_concat, "wb");
-    if (!cf) die("fopen concat");
-    if (solid.n > 0 && fwrite(solid.p, 1, solid.n, cf) != solid.n) die("fwrite solid");
-    fclose(cf);
-
+    /* M6 finalize: pack each non-empty bucket separately. Bucket 0 ("main")
+     * uses the requested codec (xz-9e or zpaq-m5 per slow); bucket 1 ("x86")
+     * always uses xz-9e with the BCJ x86 filter regardless of slow because
+     * BCJ's win is filter-not-codec, and the bucket only contains x86 code. */
     char cmd[4096];
-    if (slow) {
-        /* zpaq -m5: cmix-class context-mixing. Archive is journaling-format
-         * (not a stream); zpaq creates tmp_zst itself and we read it back
-         * verbatim into the trailing payload. */
-        unlink(tmp_zst);
-        snprintf(cmd, sizeof(cmd),
-                 "zpaq a \"%s\" \"%s\" -m5 >%s 2>&1",
-                 tmp_zst, tmp_concat, ZXLE_DEVNULL);
-    } else {
-        snprintf(cmd, sizeof(cmd),
-                 "xz -9e -c --threads=1 \"%s\" > \"%s\" 2>%s",
-                 tmp_concat, tmp_zst, ZXLE_DEVNULL);
-    }
-    run(cmd);
+    char tmp_concat[1024], tmp_payload[1024];
+    int  bucket_codec[2] = {
+        slow ? CODEC_ZPAQ_M5 : CODEC_XZ_9E,
+        CODEC_XZ_9E_X86,
+    };
+    Buf *bucket_solid[2] = { &solid, &solid_x86 };
+    Buf  bucket_payload[2];
+    buf_init(&bucket_payload[0]);
+    buf_init(&bucket_payload[1]);
 
-    /* Compute manifest size. KIND_OPAQUE has no recipe blob; every other kind
-     * carries `(u32 len)(len bytes)` after the kind byte. */
+    for (int b = 0; b < 2; b++) {
+        if (bucket_solid[b]->n == 0) continue;
+        snprintf(tmp_concat,  sizeof(tmp_concat),  "%s.b%d.concat.tmp", out, b);
+        snprintf(tmp_payload, sizeof(tmp_payload), "%s.b%d.pack.tmp",   out, b);
+
+        FILE *cf = fopen(tmp_concat, "wb");
+        if (!cf) die("fopen concat");
+        if (fwrite(bucket_solid[b]->p, 1, bucket_solid[b]->n, cf) != bucket_solid[b]->n)
+            die("fwrite solid");
+        fclose(cf);
+
+        switch (bucket_codec[b]) {
+        case CODEC_ZPAQ_M5:
+            unlink(tmp_payload);
+            snprintf(cmd, sizeof(cmd),
+                     "zpaq a \"%s\" \"%s\" -m5 >%s 2>&1",
+                     tmp_payload, tmp_concat, ZXLE_DEVNULL);
+            break;
+        case CODEC_XZ_9E_X86:
+            snprintf(cmd, sizeof(cmd),
+                     "xz -9e --x86 --lzma2=preset=9e -c --threads=1 \"%s\" > \"%s\" 2>%s",
+                     tmp_concat, tmp_payload, ZXLE_DEVNULL);
+            break;
+        case CODEC_XZ_9E:
+        default:
+            snprintf(cmd, sizeof(cmd),
+                     "xz -9e -c --threads=1 \"%s\" > \"%s\" 2>%s",
+                     tmp_concat, tmp_payload, ZXLE_DEVNULL);
+            break;
+        }
+        run(cmd);
+
+        /* Read packed bytes into the per-bucket buffer; we'll concatenate
+         * them with bucket headers after writing the manifest. */
+        size_t plen = 0;
+        uint8_t *pbytes = read_whole_file(tmp_payload, &plen);
+        if (!pbytes) die("read packed bucket");
+        buf_append(&bucket_payload[b], pbytes, plen);
+        free(pbytes);
+
+        unlink(tmp_concat);
+        unlink(tmp_payload);
+    }
+
+    /* Compute manifest size. KIND_OPAQUE has no recipe blob in v3 -- v4
+     * adds a u8 opaque_bucket immediately after the kind byte. */
     size_t mlen = 0;
     for (int i = 0; i < n; i++) {
         mlen += 2 + strlen(ents[i].name) + 8 + 4 + 1;
+        if (ents[i].kind == KIND_OPAQUE) mlen += 1;  /* opaque_bucket */
         if (ents[i].kind == KIND_ZIP)   mlen += 4 + ents[i].recipe.n;
         if (ents[i].kind == KIND_JPEG)  mlen += 4 + ents[i].brn.n;
         if (ents[i].kind == KIND_MP3)   mlen += 4 + ents[i].pmp.n;
@@ -215,7 +281,8 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
     if (!o) die("fopen out");
     fwrite(ZXLE_MAGIC, 1, 4, o);
     fputc(ZXLE_VER, o);
-    /* Flags byte: bit 0 = trailing payload codec (0 = xz-9e, 1 = zpaq -m5). */
+    /* Flags byte: bit 0 = bucket-0 codec (0 = xz-9e, 1 = zpaq -m5). v4 always
+     * has 1 or 2 buckets; bucket 1 (when present) is always xz-9e+x86 BCJ. */
     fputc(slow ? 0x01 : 0x00, o);
     wu32(o, (uint32_t)mlen);
     for (int i = 0; i < n; i++) {
@@ -225,6 +292,7 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
         wu64(o, ents[i].orig_size);
         wu32(o, ents[i].mode);
         fputc(ents[i].kind, o);
+        if (ents[i].kind == KIND_OPAQUE) fputc(ents[i].opaque_bucket, o);
 
         const Buf *blob = NULL;
         switch (ents[i].kind) {
@@ -245,18 +313,25 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
             if (blob->n > 0) fwrite(blob->p, 1, blob->n, o);
         }
     }
-    FILE *zf = fopen(tmp_zst, "rb");
-    if (!zf) die("fopen zst");
-    char buf[65536]; size_t got;
-    while ((got = fread(buf, 1, sizeof(buf), zf)) > 0)
-        if (fwrite(buf, 1, got, o) != got) die("fwrite payload");
-    fclose(zf);
+
+    /* Trailing payload header: u8 num_buckets, then per-bucket
+     * (u8 codec_id, u32 csize, csize bytes). num_buckets is 1 if no x86
+     * entries, else 2. */
+    int num_buckets = (bucket_solid[1]->n > 0) ? 2 : 1;
+    fputc((uint8_t)num_buckets, o);
+    for (int b = 0; b < num_buckets; b++) {
+        fputc((uint8_t)bucket_codec[b], o);
+        wu32(o, (uint32_t)bucket_payload[b].n);
+        if (bucket_payload[b].n > 0)
+            fwrite(bucket_payload[b].p, 1, bucket_payload[b].n, o);
+    }
     fclose(o);
 
-    unlink(tmp_concat);
-    unlink(tmp_zst);
     for (int i = 0; i < n; i++) { buf_free(&ents[i].recipe); buf_free(&ents[i].brn); buf_free(&ents[i].pmp); }
     buf_free(&solid);
+    buf_free(&solid_x86);
+    buf_free(&bucket_payload[0]);
+    buf_free(&bucket_payload[1]);
     free(ents);
 
     long long osz = fsize(out);
@@ -353,6 +428,7 @@ typedef struct {
     uint64_t orig_size;
     uint32_t mode;
     uint8_t  kind;
+    uint8_t  opaque_bucket;  /* M6: which solid bucket KIND_OPAQUE bytes come from */
     uint8_t *recipe;        /* points into manifest buffer */
     uint32_t recipe_len;
     uint8_t *brn;
@@ -360,6 +436,86 @@ typedef struct {
     uint8_t *pmp;
     uint32_t pmp_len;
 } UnpackEntry;
+
+/* Decompress one trailing-payload bucket: write the codec-input bytes from
+ * `f` (current offset) of length `csize` to a temp file, run the inverse
+ * codec, return the decompressed bytes. Caller frees. */
+static uint8_t *decompress_bucket(FILE *f, uint32_t csize, uint8_t codec_id,
+                                  const char *tmp_prefix, size_t *out_len) {
+    /* Empty bucket: nothing to decompress, but allocate a 1-byte sentinel
+     * so the caller's bucket_bytes[b] is non-NULL; consume zero file bytes. */
+    if (csize == 0) {
+        if (out_len) *out_len = 0;
+        uint8_t *empty = (uint8_t *)malloc(1);
+        if (!empty) die("malloc empty bucket");
+        empty[0] = 0;
+        return empty;
+    }
+    char tmp_in[1024], tmp_out[1024];
+    snprintf(tmp_in,  sizeof(tmp_in),  "%s.b.in.tmp",  tmp_prefix);
+    snprintf(tmp_out, sizeof(tmp_out), "%s.b.out.tmp", tmp_prefix);
+
+    FILE *bf = fopen(tmp_in, "wb");
+    if (!bf) die("fopen bucket in");
+    {
+        uint8_t buf[65536];
+        size_t left = csize;
+        while (left > 0) {
+            size_t want = left < sizeof(buf) ? left : sizeof(buf);
+            size_t got = fread(buf, 1, want, f);
+            if (got == 0) die("read bucket short");
+            if (fwrite(buf, 1, got, bf) != got) die("write bucket in");
+            left -= got;
+        }
+    }
+    fclose(bf);
+
+    char cmd[4096];
+    if (codec_id == CODEC_ZPAQ_M5) {
+        char recdir[1024];
+        snprintf(recdir, sizeof(recdir), "%s.b.zpaq.d", tmp_prefix);
+        ZXLE_MKDIR(recdir);
+        snprintf(cmd, sizeof(cmd),
+                 "zpaq x \"%s\" -to \"%s/\" -f >%s 2>&1",
+                 tmp_in, recdir, ZXLE_DEVNULL);
+        run(cmd);
+        char find_cmd[4096], found_meta[1024];
+        snprintf(found_meta, sizeof(found_meta), "%s.b.found", tmp_prefix);
+        snprintf(find_cmd, sizeof(find_cmd),
+                 "find \"%s\" -type f -print -quit > \"%s\" 2>%s",
+                 recdir, found_meta, ZXLE_DEVNULL);
+        run(find_cmd);
+        char found_path[2048] = {0};
+        FILE *ff = fopen(found_meta, "rb");
+        if (!ff) die("zpaq extract: no file found");
+        if (fgets(found_path, sizeof(found_path), ff) == NULL) die("zpaq extract: empty find");
+        fclose(ff);
+        unlink(found_meta);
+        size_t fpl = strlen(found_path);
+        while (fpl > 0 && (found_path[fpl-1]=='\n' || found_path[fpl-1]=='\r'))
+            found_path[--fpl] = 0;
+        unlink(tmp_out);
+        if (rename(found_path, tmp_out) != 0) die("rename zpaq extract");
+        char rmcmd[2048];
+        snprintf(rmcmd, sizeof(rmcmd), "rm -rf \"%s\" >%s 2>&1", recdir, ZXLE_DEVNULL);
+        run(rmcmd);
+    } else {
+        /* CODEC_XZ_9E and CODEC_XZ_9E_X86 both decode via plain `xz -d` --
+         * the BCJ filter is recorded in the xz block header so the decoder
+         * applies it automatically. */
+        snprintf(cmd, sizeof(cmd),
+                 "xz -d -c \"%s\" > \"%s\" 2>%s",
+                 tmp_in, tmp_out, ZXLE_DEVNULL);
+        run(cmd);
+    }
+
+    size_t plen = 0;
+    uint8_t *bytes = read_whole_file(tmp_out, &plen);
+    unlink(tmp_in);
+    unlink(tmp_out);
+    if (out_len) *out_len = plen;
+    return bytes;
+}
 
 static int do_unpack(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: zxle unpack <in.zxle> <outdir>\n"); return 1; }
@@ -372,7 +528,7 @@ static int do_unpack(int argc, char **argv) {
     if (fread(magic,1,4,f) != 4 || memcmp(magic, ZXLE_MAGIC, 4) != 0) die("bad magic");
     int ver = fgetc(f), flags = fgetc(f);
     if (ver != ZXLE_VER) die("bad version");
-    int slow = (flags & 0x01);
+    (void)flags;  /* v4: codec is per-bucket in the trailing payload header, not in flags */
 
     uint8_t mlen_b[4];
     if (fread(mlen_b, 1, 4, f) != 4) die("read mlen");
@@ -393,6 +549,11 @@ static int do_unpack(int argc, char **argv) {
         ents[count].orig_size = (uint64_t)r32(manifest + mp) | ((uint64_t)r32(manifest + mp + 4) << 32); mp += 8;
         ents[count].mode = r32(manifest + mp); mp += 4;
         ents[count].kind = manifest[mp]; mp += 1;
+        ents[count].opaque_bucket = 0;
+        if (ents[count].kind == KIND_OPAQUE) {
+            if (mp + 1 > mlen) die("opaque_bucket truncated");
+            ents[count].opaque_bucket = manifest[mp]; mp += 1;
+        }
         ents[count].recipe = NULL; ents[count].recipe_len = 0;
         ents[count].brn    = NULL; ents[count].brn_len    = 0;
         ents[count].pmp    = NULL; ents[count].pmp_len    = 0;
@@ -423,84 +584,54 @@ static int do_unpack(int argc, char **argv) {
         count++;
     }
 
-    char tmp_zst[1024], tmp_concat[1024];
-    snprintf(tmp_zst,    sizeof(tmp_zst),    "%s.unpack.zst.tmp",    in);
-    snprintf(tmp_concat, sizeof(tmp_concat), "%s.unpack.concat.tmp", in);
-
-    FILE *zf = fopen(tmp_zst, "wb");
-    if (!zf) die("fopen tmp zst");
-    char buf[65536]; size_t got;
-    while ((got = fread(buf, 1, sizeof(buf), f)) > 0)
-        if (fwrite(buf, 1, got, zf) != got) die("fwrite tmp zst");
-    fclose(zf);
-    fclose(f);
-
-    char cmd[4096];
-    if (slow) {
-        /* zpaq archive: extract via `zpaq x` to a scratch dir, then read the
-         * single file out. zpaq stores the path as given (we passed
-         * tmp_concat which is e.g. "<in>.unpack.concat.tmp"); on extract it
-         * lands at <recdir>/<resolved-tmp_concat-path>, which we resolve by
-         * scanning for the first regular file under recdir. */
-        char recdir[1024];
-        snprintf(recdir, sizeof(recdir), "%s.unpack.zpaq.d", in);
-        ZXLE_MKDIR(recdir);
-        snprintf(cmd, sizeof(cmd),
-                 "zpaq x \"%s\" -to \"%s/\" -f >%s 2>&1",
-                 tmp_zst, recdir, ZXLE_DEVNULL);
-        run(cmd);
-        /* Move the extracted file (at some nested path) to tmp_concat. We
-         * know it's the only regular file under recdir, since the archive
-         * was created with one input. Use `find` shell-out for portability
-         * across the path quirks we already hit in the bench. */
-        char find_cmd[4096];
-        snprintf(find_cmd, sizeof(find_cmd),
-                 "find \"%s\" -type f -print -quit > \"%s.found\" 2>%s",
-                 recdir, tmp_concat, ZXLE_DEVNULL);
-        run(find_cmd);
-        char found_path[2048] = {0};
-        char found_meta[2048];
-        snprintf(found_meta, sizeof(found_meta), "%s.found", tmp_concat);
-        FILE *ff = fopen(found_meta, "rb");
-        if (!ff) die("zpaq extract: no file found");
-        if (fgets(found_path, sizeof(found_path), ff) == NULL) die("zpaq extract: empty find");
-        fclose(ff);
-        unlink(found_meta);
-        size_t fpl = strlen(found_path);
-        while (fpl > 0 && (found_path[fpl-1]=='\n' || found_path[fpl-1]=='\r'))
-            found_path[--fpl] = 0;
-        unlink(tmp_concat);
-        if (rename(found_path, tmp_concat) != 0) die("rename zpaq extract -> tmp_concat");
-        /* Best-effort cleanup of the empty dir tree zpaq left behind. */
-        char rmcmd[2048];
-        snprintf(rmcmd, sizeof(rmcmd), "rm -rf \"%s\" >%s 2>&1", recdir, ZXLE_DEVNULL);
-        run(rmcmd);
-    } else {
-        snprintf(cmd, sizeof(cmd),
-                 "xz -d -c \"%s\" > \"%s\" 2>%s",
-                 tmp_zst, tmp_concat, ZXLE_DEVNULL);
-        run(cmd);
+    /* Read the trailing-payload bucket header: u8 num_buckets, then
+     * per-bucket (u8 codec_id, u32 csize, csize bytes). Decompress each
+     * bucket into its own buffer; KIND_OPAQUE entries dispatch by their
+     * opaque_bucket field, other kinds always read from bucket 0. */
+    int num_buckets = fgetc(f);
+    if (num_buckets <= 0 || num_buckets > 2) die("invalid num_buckets");
+    uint8_t *bucket_bytes[2] = {0};
+    size_t bucket_len[2] = {0};
+    size_t bucket_pos[2] = {0};
+    for (int b = 0; b < num_buckets; b++) {
+        int codec_id = fgetc(f);
+        if (codec_id < 0) die("codec_id eof");
+        uint8_t cs[4];
+        if (fread(cs, 1, 4, f) != 4) die("csize eof");
+        uint32_t csize = r32(cs);
+        char tprefix[1024];
+        snprintf(tprefix, sizeof(tprefix), "%s.bucket%d", in, b);
+        bucket_bytes[b] = decompress_bucket(f, csize, (uint8_t)codec_id, tprefix, &bucket_len[b]);
+        if (!bucket_bytes[b]) die("decompress bucket");
     }
-
-    size_t solid_len = 0;
-    uint8_t *solid = read_whole_file(tmp_concat, &solid_len);
+    fclose(f);
 
     if (ZXLE_MKDIR(outdir) != 0 && errno != EEXIST) die("mkdir outdir");
 
-    size_t solid_pos = 0;
+    /* All format-aware unwrap kinds (KIND_ZIP/TAR/AR/PNG/GZIP/BZIP2/ZSTD/XZ)
+     * read from bucket 0 (main) only. KIND_OPAQUE entries dispatch by their
+     * opaque_bucket field. */
+    uint8_t *main_solid = bucket_bytes[0];
+    size_t   main_len   = bucket_len[0];
+    size_t  *main_pos   = &bucket_pos[0];
+
     for (int i = 0; i < count; i++) {
         char p[2048];
         snprintf(p, sizeof(p), "%s/%s", outdir, ents[i].name);
         FILE *of = fopen(p, "wb");
         if (!of) { fprintf(stderr, "fopen %s\n", p); die("fopen out"); }
         if (ents[i].kind == KIND_OPAQUE) {
-            if (solid_pos + ents[i].orig_size > solid_len) die("opaque overflow");
-            if (ents[i].orig_size > 0 && fwrite(solid + solid_pos, 1, ents[i].orig_size, of) != ents[i].orig_size) die("fwrite opaque");
-            solid_pos += ents[i].orig_size;
+            int b = ents[i].opaque_bucket;
+            if (b >= num_buckets) die("opaque_bucket out of range");
+            if (bucket_pos[b] + ents[i].orig_size > bucket_len[b]) die("opaque overflow");
+            if (ents[i].orig_size > 0 &&
+                fwrite(bucket_bytes[b] + bucket_pos[b], 1, ents[i].orig_size, of) != ents[i].orig_size)
+                die("fwrite opaque");
+            bucket_pos[b] += ents[i].orig_size;
             fclose(of);
         } else if (ents[i].kind == KIND_ZIP || ents[i].kind == KIND_TAR || ents[i].kind == KIND_AR) {
             unpack_recipe(ents[i].recipe, ents[i].recipe_len,
-                          solid, solid_len, &solid_pos,
+                          main_solid, main_len, main_pos,
                           of, ents[i].orig_size, p);
             fclose(of);
         } else if (ents[i].kind == KIND_JPEG) {
@@ -516,27 +647,27 @@ static int do_unpack(int argc, char **argv) {
             unlink(tmp_brn);
         } else if (ents[i].kind == KIND_PNG) {
             unpack_png(ents[i].recipe, ents[i].recipe_len,
-                       solid, solid_len, &solid_pos,
+                       main_solid, main_len, main_pos,
                        of, ents[i].orig_size);
             fclose(of);
         } else if (ents[i].kind == KIND_GZIP) {
             unpack_gz(ents[i].recipe, ents[i].recipe_len,
-                      solid, solid_len, &solid_pos,
+                      main_solid, main_len, main_pos,
                       of, ents[i].orig_size, p);
             fclose(of);
         } else if (ents[i].kind == KIND_BZIP2) {
             unpack_bz2(ents[i].recipe, ents[i].recipe_len,
-                       solid, solid_len, &solid_pos,
+                       main_solid, main_len, main_pos,
                        of, ents[i].orig_size, p);
             fclose(of);
         } else if (ents[i].kind == KIND_ZSTD) {
             unpack_zst(ents[i].recipe, ents[i].recipe_len,
-                       solid, solid_len, &solid_pos,
+                       main_solid, main_len, main_pos,
                        of, ents[i].orig_size, p);
             fclose(of);
         } else if (ents[i].kind == KIND_XZ) {
             unpack_xz(ents[i].recipe, ents[i].recipe_len,
-                      solid, solid_len, &solid_pos,
+                      main_solid, main_len, main_pos,
                       of, ents[i].orig_size, p);
             fclose(of);
         } else if (ents[i].kind == KIND_MP3) {
@@ -557,13 +688,13 @@ static int do_unpack(int argc, char **argv) {
             die("unknown kind");
         }
     }
-    if (solid_pos != solid_len) die("solid stream not fully consumed");
+    for (int b = 0; b < num_buckets; b++) {
+        if (bucket_pos[b] != bucket_len[b]) die("bucket stream not fully consumed");
+        free(bucket_bytes[b]);
+    }
 
-    free(solid);
     free(manifest);
     free(ents);
-    unlink(tmp_zst);
-    unlink(tmp_concat);
 
     fprintf(stderr, "unpacked %d file(s) to %s\n", count, outdir);
     return 0;
