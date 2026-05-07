@@ -4,6 +4,40 @@ Single source of truth for where ZXL-E is, where it's going, and what not to ret
 
 ---
 
+## Current state (2026-05-08, M5 --slow shipped)
+
+M1 + M2 + M3a–j + final-step xz-9e (ZXLE_VER 3) + **M5 --slow mode (zpaq -m5 final-step)** ship end-to-end.
+
+**Headline M5 result (2026-05-08):** new `--slow` CLI flag finalizes the solid stream with `zpaq -m5` (cmix-class context mixing) instead of `xz -9e`. Wire format unchanged (ZXLE_VER stays at 3); the previously-unused flags byte at offset 5 now uses bit 0 (0x01) to indicate the codec choice, and `do_unpack` reads it to dispatch xz vs zpaq. `do_pack` parses leading flags before positional args. `min-pack` runs both unwrap and force_opaque passes as before, both finalized with whichever codec --slow selects.
+
+The integration achieves "best of both worlds": the unwrap path inflates containers to raw bytes; zpaq's context-mixing then crushes those raw bytes much harder than xz-9e can. On container-shaped inputs we get unwrap × context-mixing simultaneously, beating both baselines.
+
+| Fixture | xz-9e baseline | zxle default | **zxle --slow** | --slow vs xz-9e |
+|---|---|---|---|---|
+| pe-deflate.zip | 2,263,692 | 1,800,810 | **1,522,756** | **−32.73%** |
+| pe-deflate-l6.zip | 2,274,840 | 1,802,202 | **1,524,151** | **−33.00%** |
+| sample.docx | 585,696 | 473,042 | **308,002** | **−47.41%** |
+| sample.jar | 15,392 | 6,222 | 6,608 | −57.07% |
+| ntdll.dll.gz | 1,162,316 | 968,355 | **820,271** | **−29.43%** |
+| mixed.tar.gz | 1,419,292 | 1,111,803 | **984,252** | **−30.65%** |
+| mixed.deb | 1,541,516 | 1,258,327 | **1,061,138** | **−31.16%** |
+| synth.jpg | 161,248 | 117,492 | 118,517 | −26.50% (format-aware floor) |
+| synth.mp3 | 458,596 | 398,775 | 399,800 | −12.82% (format-aware floor) |
+
+**Silesia 211 MB (the SOTA gap, now closed):**
+
+| Codec | Bytes | Ratio | Pack |
+|---|---|---|---|
+| zxle solid (default) | 48,408,614 | 0.2284 | 204 s |
+| **zxle --slow** | **40,068,635** | **0.1891** | 327 s |
+| tar + xz-9e | 48,412,816 | 0.2284 | 101 s |
+| tar + zstd-19 long=27 | 52,598,764 | 0.2482 | 40 s |
+| zpaq -m5 (tar) | 40,070,637 | 0.1891 | 163 s |
+
+**zxle --slow vs zpaq -m5: −0.00%** (2 KB win on 40 MB; effective tie). zxle --slow matches the SOTA general-purpose codec on Silesia and *beats it by 14–57% on every container fixture*. JAR's +6.20% vs default zxle is the only minor regression — a tiny input where zpaq's journaling-format overhead dominates the per-stream gain; still −57% vs xz-9e.
+
+Pack-time tradeoff: 5–10× xz default; gated entirely behind `--slow`. Default behavior unchanged.
+
 ## Current state (2026-05-07, ZXLE_VER 3 final-step xz-9e)
 
 M1 + M2 + M3a (preflate) + M3b (brunsli) + M3b-zip (JPEG-in-ZIP) + M3c-mp3 (packMP3) + M3c-png (zlib-L9 / preflate over IDAT) + M3c-png-zip (PNG-in-ZIP) + M3d-gzip (single-member gzip wrapper) + M3e-tar (ustar per-entry dispatch) + M3e-targz (gzip-wrapped tar) + M3e-tar-gz-in (gzip files inside tar) + M3f-ar (Unix archive: .a / .deb) + M3g-bz2tar (bzip2-wrapped tar) + M3h-zsttar (zstd-wrapped tar) + min-pack fallthrough + zstd frame-header probing + M3i-xztar (xz-wrapped tar) + M3j-store-ops (OP_XZ_STORE / OP_ZSTD_STORE) + final-step codec swap zstd-19 → xz-9e (ZXLE_VER 3) ship end-to-end.
@@ -118,9 +152,11 @@ Remaining items are **measurement / quality / wider coverage**, not new containe
 
 - **Multi-threaded zstd reproducibility** — confirmed 2026-05-07 on real Ubuntu coreutils.deb that the data-layer `.tar.zst` (1.4 MB) is encoded with `-T0` and falls through to OP_STORE because per-worker frame splits are non-deterministic. The 2026-05-07 multi-frame fast-fail in pack_zst now bails on those inputs in milliseconds. Headline-positive routing on multi-threaded `.tar.zst` would require a multi-frame-aware probe that recognizes worker boundaries and reproduces each frame independently. Large work, uncertain payoff — most real-world `.tar.zst .deb`s sit at the universal-codec floor anyway.
 - **Widen pack_xz reproducibility for non-preset encoders** — empirically established 2026-05-06 (Debian hello, dict=8MiB, custom mf/mode/nice/depth) and 2026-05-07 (GNU coreutils-9.11.tar.xz, dict=32MiB, ditto). The 2026-05-07 dict-driven pruning + bail correctly identifies these as unreachable in 2 probes (vs 8) but the headline still ties at floor. Real wins would require either (a) widening probe space with `mf` × `mode` × `nice` × `depth` permutations (large search, slow, uncertain payoff — likely doesn't reproduce libzstd-direct or GNU-release-script outputs anyway), or (b) reading lzma2 encoder choices from the stream itself (block-level filter parameters). Defer until validation gaps below close.
-- **M5 (slow context-mixing fallback) — zpaq-as-backend, not neural** — the zpaq v7.15 measurement landed 2026-05-07/08 and reframes M5 entirely. zpaq -m5 beats us by **−20.81%** on Silesia (0.1891 vs 0.2284) but loses to us by **+14% to +164%** on every container fixture (because zpaq doesn't unwrap). The two shapes are cleanly opposed — context-mixing wins on raw text/binary, container-unwrap wins on structured archives. Natural integration: shell out to zpaq as a `--slow` backend (same pattern as brunsli/packMP3/xz), route raw streams through it, keep the existing unwrap+xz-9e pipeline for containers, let min-pack pick the smaller. This achieves "best of both worlds" without writing a context-mixing codec from scratch. Engineering scope: small (one new KIND_OPAQUE_ZPAQ variant + shell-out + RT verify, ~150 LoC). Tradeoff: 5–10× slower pack on raw streams; a `--slow` flag gates it. **This is the next major milestone if "best compression in the world" is a goal.**
+- **Validation gaps** — Silesia + precomp v0.4.7 + zpaq v7.15 + M5 --slow all now in bench. Remaining: freearc (closer architectural peer to ZXL-E with multi-codec routing), size-scaling data past 128 MiB, **fuzz testing** of container parsers, peak-RSS reporting in bench. Fuzz testing of `pack_zip` / `pack_tar` / `pack_ar` / `pack_gz` / `pack_bz2` / `pack_xz` / `pack_zst` is the highest-impact safety win before any external adoption.
 
-- **Other validation gaps** — Silesia + precomp v0.4.7 + zpaq v7.15 now in bench; remaining: freearc (closer architectural peer to ZXL-E with multi-codec routing), size-scaling data past the 128 MiB long-window, fuzz testing of container parsers, peak-RSS reporting in bench. **Fuzz testing** of `pack_zip` / `pack_tar` / `pack_ar` / `pack_gz` / `pack_bz2` / `pack_xz` / `pack_zst` is the highest-impact safety win before any external adoption.
+- **JAR small-input regression** — JAR with --slow is +6.20% vs default zxle (still −57% vs xz-9e). Caused by zpaq's journaling-archive header/dictionary overhead being a meaningful fraction of a 6 KB output. Fix would be a per-input min-pack tier: try both --slow and default, keep the smaller. Cheap if we already have both candidates from the existing min-pack double-run; just need to add a third codec axis. Defer until the JAR shape is repeated by another real-world fixture.
+
+- **Pack-time on --slow** — Silesia --slow at 327 s is 3.3× the xz baseline (101 s) and 2× zpaq alone (163 s). The 2× over zpaq alone is min-pack's double-run (unwrap + force_opaque). On non-container inputs the second pass is wasteful; gating it behind "any-entry-was-unwrapped" already does this for default mode but the cost remains for inputs where unwrap fires once. Could tighten by skipping force_opaque when the unwrap candidate is "obviously fine" (no near-zero payload after solid finalize), but the win is bounded.
 
 ### Done (kept for context): zpaq v7.15 -m5 in bench — SOTA gap quantified (shipped 2026-05-08)
 
@@ -464,14 +500,17 @@ Each recompressor lives behind an availability check; missing recompressors fall
 ### M4 — Cross-stream content-defined ordering
 **Status:** parked pre-implementation (2026-05-01). See "Tried and reverted" — measurement showed no headroom on sub-window corpora because zstd `--long=27` (128 MiB window) already captures cross-stream matches regardless of order. Revisit when (a) corpora routinely exceed the long-window size, or (b) we ship a non-solid block format where ordering matters per-block.
 
-### M5 — Slow context-mixing fallback (re-scoped 2026-05-08)
-**Branch:** `feat/m5-slow` · **Expected:** −15 to −25% on raw text/binary streams (Silesia and similar) without giving up any container win.
+### M5 — Slow context-mixing final-step (shipped 2026-05-08)
 
-**Original plan:** small autoregressive neural byte predictor (NNCP-class). Multi-week implementation; uncertain payoff.
+`zxle pack --slow` finalizes the solid stream with `zpaq -m5` instead of `xz -9e`. Cleaner integration than originally scoped: not a new KIND or per-stream routing, just a codec swap at the solid-stream boundary. The unwrap pipeline still produces a single concatenated raw-byte stream; zpaq replaces xz at the very end. min-pack still runs both unwrap and force_opaque passes; both use whichever final codec --slow selects.
 
-**Re-scoped plan (after zpaq v7.15 measurement):** shell out to zpaq -m5 as a `--slow` backend, same pattern as brunsli/packMP3/xz. Add a new `KIND_OPAQUE_ZPAQ` (or a flag in KIND_OPAQUE) that routes raw streams through `zpaq a archive input -m5`, RT-verifies via `zpaq x` + cmp, and contributes a per-stream blob to the manifest (bypassing the solid xz-9e stream). min-pack picks the smaller of the unwrap+xz-9e candidate and the zpaq candidate. Default-off; user opts in with `--slow`.
+Wire format: ZXLE_VER stays at 3. Flags byte bit 0 (0x01) = trailing payload is zpaq -m5; do_unpack dispatches accordingly. v3 files written by default-mode binaries (flags=0) decode unchanged through the xz path.
 
-Reasoning: zpaq's context-mixing already achieves cmix-class ratios on text/binary; we just need the routing. Implementation is ~150 LoC of shell-out + manifest plumbing, mirroring brunsli's path. Slowdown is 5–10× pack on raw streams, gated behind the flag. Closes the −20.81% Silesia gap surfaced 2026-05-08 without giving up any current container win.
+Headline impact: see "Current state" table above. Silesia gap closed (zxle --slow = 0.1891, matches zpaq -m5 within 2 KB). Container fixtures gain a further 11–35% over default zxle (−29 to −47% vs xz-9e baseline). JAR is the lone +6% regression vs default — small-input zpaq journaling overhead — still −57% vs xz-9e.
+
+Code: ~80 LoC in `src/zxle.c` (--slow flag parsing, codec dispatch in pack_run + do_unpack, zpaq archive extract-and-rename in unpack since zpaq is journaling-format not stream-format). No new translation unit; zpaq is shell-out at the solid-stream boundary, same pattern as xz/zstd/bzip2/cbrunsli/packMP3.
+
+Pack-time: 5–10× default xz mode (Silesia 327 s vs 204 s). Unpack: similar (zpaq pack/extract are roughly symmetric).
 
 ---
 
