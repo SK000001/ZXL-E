@@ -38,9 +38,10 @@ BIN=./zxle
 [ -x ./zxle.exe ] && BIN=./zxle.exe
 
 ratio() { awk -v a="$1" -v b="$2" 'BEGIN{ if (b==0) print "n/a"; else printf "%.4f", a/b }'; }
+elapsed_ms() { awk -v s="$1" -v e="$EPOCHREALTIME" 'BEGIN{printf "%d", (e-s)*1000}'; }
 
-printf "%-16s %10s %10s %10s %10s %10s  %s\n" "file" "orig" "zxle" "zstd-19" "xz-9e" "ratio" "rt"
-printf -- "----                  ----       ----       -------    -----      -----     --\n"
+printf "%-16s %10s %10s %10s %10s %10s  %-3s  %6s %6s\n" "file" "orig" "zxle" "zstd-19" "xz-9e" "ratio" "rt" "pk_ms" "un_ms"
+printf -- "----                  ----       ----       -------    -----      -----     --   ------ ------\n"
 
 SUM_ORIG=0
 SUM_ZXLE=0
@@ -54,9 +55,13 @@ for f in $FILES; do
 
     # zxle pack/unpack
     out="tests/baseline/$f.zxle"
+    t0=$EPOCHREALTIME
     "$BIN" pack "$out" "$src" >/dev/null 2>&1
+    pack_ms=$(elapsed_ms "$t0")
     zxle_sz=$(stat -c%s "$out")
+    t0=$EPOCHREALTIME
     "$BIN" unpack "$out" tests/unpacked >/dev/null 2>&1
+    unp_ms=$(elapsed_ms "$t0")
     if cmp -s "$src" "tests/unpacked/$f"; then rt=OK; else rt=FAIL; fi
 
     # zstd-19 baseline
@@ -64,8 +69,8 @@ for f in $FILES; do
     # xz-9e baseline
     xz_sz=$(xz -9e -c "$src" 2>/dev/null | wc -c)
 
-    printf "%-16s %10d %10d %10d %10d %10s  %s\n" \
-        "$f" "$orig" "$zxle_sz" "$zstd_sz" "$xz_sz" "$(ratio "$zxle_sz" "$orig")" "$rt"
+    printf "%-16s %10d %10d %10d %10d %10s  %-3s  %6d %6d\n" \
+        "$f" "$orig" "$zxle_sz" "$zstd_sz" "$xz_sz" "$(ratio "$zxle_sz" "$orig")" "$rt" "$pack_ms" "$unp_ms"
 
     SUM_ORIG=$((SUM_ORIG + orig))
     SUM_ZXLE=$((SUM_ZXLE + zxle_sz))
@@ -73,7 +78,7 @@ for f in $FILES; do
     SUM_XZ=$((SUM_XZ + xz_sz))
 done
 
-printf -- "----                  ----       ----       -------    -----      -----     --\n"
+printf -- "----                  ----       ----       -------    -----      -----     --   ------ ------\n"
 printf "%-16s %10d %10d %10d %10d\n" "sum-individual" "$SUM_ORIG" "$SUM_ZXLE" "$SUM_ZSTD" "$SUM_XZ"
 echo
 echo "ratios vs orig:"
@@ -84,9 +89,13 @@ printf "  xz-9e              %s\n" "$(ratio "$SUM_XZ"   "$SUM_ORIG")"
 # Solid run: pack all files into one container.
 SOLID_INPUTS=""
 for f in $FILES; do [ -f "$CORPUS/$f" ] && SOLID_INPUTS="$SOLID_INPUTS $CORPUS/$f"; done
+t0=$EPOCHREALTIME
 "$BIN" pack tests/baseline/solid.zxle $SOLID_INPUTS >/dev/null 2>&1
+SOLID_PACK_MS=$(elapsed_ms "$t0")
 SOLID_SZ=$(stat -c%s tests/baseline/solid.zxle)
+t0=$EPOCHREALTIME
 "$BIN" unpack tests/baseline/solid.zxle tests/unpacked/solid >/dev/null 2>&1
+SOLID_UNP_MS=$(elapsed_ms "$t0")
 SOLID_RT=OK
 for f in $FILES; do
     [ -f "$CORPUS/$f" ] || continue
@@ -96,6 +105,7 @@ echo
 echo "solid (one zxle archive, all files):"
 printf "  zxle solid         %d  ratio=%s  rt=%s\n" "$SOLID_SZ" "$(ratio "$SOLID_SZ" "$SUM_ORIG")" "$SOLID_RT"
 printf "  vs sum-individual  %s smaller\n" "$(awk -v a="$SOLID_SZ" -v b="$SUM_ZXLE" 'BEGIN{printf "%.2f%%", (b-a)*100/b}')"
+printf "  perf               pack=%dms unpack=%dms\n" "$SOLID_PACK_MS" "$SOLID_UNP_MS"
 
 bench_zip() {
     local label="$1" ZIP="$2"
@@ -103,8 +113,13 @@ bench_zip() {
     local base; base=$(basename "$ZIP")
     echo
     echo "$label ($base):"
+    local t0 Z_PACK_MS Z_UNP_MS
+    t0=$EPOCHREALTIME
     "$BIN" pack "tests/baseline/$base.zxle" "$ZIP" >/dev/null 2>&1
+    Z_PACK_MS=$(elapsed_ms "$t0")
+    t0=$EPOCHREALTIME
     "$BIN" unpack "tests/baseline/$base.zxle" "tests/unpacked/$base.d" >/dev/null 2>&1
+    Z_UNP_MS=$(elapsed_ms "$t0")
     if cmp -s "$ZIP" "tests/unpacked/$base.d/$base"; then ZRT=OK; else ZRT=FAIL; fi
     local Z_ORIG Z_ZXLE Z_XZ Z_ZSTD
     Z_ORIG=$(stat -c%s "$ZIP")
@@ -113,6 +128,7 @@ bench_zip() {
     Z_ZSTD=$(zstd -19 --long=27 -q -c "$ZIP" 2>/dev/null | wc -c)
     printf "  orig=%d  zxle=%d  zstd-19=%d  xz-9e=%d  rt=%s\n" "$Z_ORIG" "$Z_ZXLE" "$Z_ZSTD" "$Z_XZ" "$ZRT"
     printf "  zxle vs xz-9e: %s\n" "$(awk -v a="$Z_ZXLE" -v b="$Z_XZ" 'BEGIN{printf "%.2f%%", (a-b)*100/b}')"
+    printf "  perf: pack=%dms unpack=%dms\n" "$Z_PACK_MS" "$Z_UNP_MS"
 }
 
 bench_zip "M2 ZIP-unwrap"       tests/corpus/pe-deflate.zip
@@ -128,9 +144,14 @@ bench_file() {
     local base; base=$(basename "$SRC")
     echo
     echo "$label ($base):"
+    local t0 F_PACK_MS F_UNP_MS
+    t0=$EPOCHREALTIME
     "$BIN" pack "tests/baseline/$base.zxle" "$SRC" >/dev/null 2>&1
+    F_PACK_MS=$(elapsed_ms "$t0")
     rm -rf "tests/unpacked/$base.d" && mkdir -p "tests/unpacked/$base.d"
+    t0=$EPOCHREALTIME
     "$BIN" unpack "tests/baseline/$base.zxle" "tests/unpacked/$base.d" >/dev/null 2>&1
+    F_UNP_MS=$(elapsed_ms "$t0")
     local F_RT=OK
     cmp -s "$SRC" "tests/unpacked/$base.d/$base" || F_RT=FAIL
     local F_ORIG F_ZXLE F_XZ F_ZSTD
@@ -140,6 +161,7 @@ bench_file() {
     F_ZSTD=$(zstd -19 -q -c "$SRC" 2>/dev/null | wc -c)
     printf "  orig=%d  zxle=%d  zstd-19=%d  xz-9e=%d  rt=%s\n" "$F_ORIG" "$F_ZXLE" "$F_ZSTD" "$F_XZ" "$F_RT"
     printf "  zxle vs xz-9e: %s\n" "$(awk -v a="$F_ZXLE" -v b="$F_XZ" 'BEGIN{printf "%.2f%%", (a-b)*100/b}')"
+    printf "  perf: pack=%dms unpack=%dms\n" "$F_PACK_MS" "$F_UNP_MS"
 }
 
 bench_file "M3c packmp3 (MP3)" tests/corpus/synth.mp3
@@ -164,9 +186,13 @@ if [ -f "$JPG" ]; then
     base=$(basename "$JPG")
     echo
     echo "M3b brunsli (JPEG) ($base):"
+    t0=$EPOCHREALTIME
     "$BIN" pack "tests/baseline/$base.zxle" "$JPG" >/dev/null 2>&1
+    J_PACK_MS=$(elapsed_ms "$t0")
     rm -rf "tests/unpacked/$base.d" && mkdir -p "tests/unpacked/$base.d"
+    t0=$EPOCHREALTIME
     "$BIN" unpack "tests/baseline/$base.zxle" "tests/unpacked/$base.d" >/dev/null 2>&1
+    J_UNP_MS=$(elapsed_ms "$t0")
     if cmp -s "$JPG" "tests/unpacked/$base.d/$base"; then JRT=OK; else JRT=FAIL; fi
     J_ORIG=$(stat -c%s "$JPG")
     J_ZXLE=$(stat -c%s "tests/baseline/$base.zxle")
@@ -174,4 +200,5 @@ if [ -f "$JPG" ]; then
     J_ZSTD=$(zstd -19 -q -c "$JPG" 2>/dev/null | wc -c)
     printf "  orig=%d  zxle=%d  zstd-19=%d  xz-9e=%d  rt=%s\n" "$J_ORIG" "$J_ZXLE" "$J_ZSTD" "$J_XZ" "$JRT"
     printf "  zxle vs xz-9e: %s\n" "$(awk -v a="$J_ZXLE" -v b="$J_XZ" 'BEGIN{printf "%.2f%%", (a-b)*100/b}')"
+    printf "  perf: pack=%dms unpack=%dms\n" "$J_PACK_MS" "$J_UNP_MS"
 fi
