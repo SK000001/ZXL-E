@@ -34,6 +34,12 @@ if [ -x third_party/packmp3/source/packMP3.exe ] || \
     export PATH
 fi
 
+# Auto-discover the zpaq binary so --slow mode (final-step zpaq -m5) works.
+if [ -x third_party/zpaq/zpaq.exe ] || [ -x third_party/zpaq/zpaq ]; then
+    PATH="$PWD/third_party/zpaq:$PATH"
+    export PATH
+fi
+
 BIN=./zxle
 [ -x ./zxle.exe ] && BIN=./zxle.exe
 
@@ -315,6 +321,53 @@ if [ -n "$ZPAQ" ]; then
     bench_zpaq "MP3 (packMP3)"         tests/corpus/synth.mp3
 fi
 
+# ZXL-E --slow mode (zpaq -m5 final-step) on headline fixtures. Gated by
+# ZXLE_SLOW=1 because per-fixture pack adds ~5-10x over default xz-9e, and
+# the typical bench run shouldn't double its wall time.
+if [ "${ZXLE_SLOW:-0}" = "1" ] && [ -n "$ZPAQ" ]; then
+    echo
+    echo "=== ZXL-E --slow (zpaq -m5 final-step) vs default (size + RT) ==="
+    bench_slow() {
+        local label="$1" SRC="$2"
+        [ -f "$SRC" ] || return 0
+        local base; base=$(basename "$SRC")
+        local sout="tests/baseline/$base.slow.zxle"
+        local sd="tests/unpacked/$base.slow.d"
+        rm -f "$sout"; rm -rf "$sd"; mkdir -p "$sd"
+        local t0 sl_ms un_ms SL_RT
+        t0=$EPOCHREALTIME
+        "$BIN" pack --slow "$sout" "$SRC" >/dev/null 2>&1 || { echo "  $label: pack --slow failed"; return 0; }
+        sl_ms=$(elapsed_ms "$t0")
+        t0=$EPOCHREALTIME
+        "$BIN" unpack "$sout" "$sd" >/dev/null 2>&1 || { echo "  $label: unpack failed"; return 0; }
+        un_ms=$(elapsed_ms "$t0")
+        cmp -s "$SRC" "$sd/$base" && SL_RT=OK || SL_RT=FAIL
+        local ORIG SL DEFAULT XZ
+        ORIG=$(stat -c%s "$SRC")
+        SL=$(stat -c%s "$sout")
+        DEFAULT=$(stat -c%s "tests/baseline/$base.zxle" 2>/dev/null || echo 0)
+        XZ=$(xz -9e -c "$SRC" 2>/dev/null | wc -c)
+        printf "  %s (%s):\n" "$label" "$base"
+        printf "    orig=%d  zxle=%d  zxle--slow=%d  xz-9e=%d  rt=%s\n" "$ORIG" "$DEFAULT" "$SL" "$XZ" "$SL_RT"
+        if [ "$DEFAULT" -gt 0 ]; then
+            printf "    --slow vs zxle: %s   --slow vs xz-9e: %s   perf: pack=%dms unpack=%dms\n" \
+                "$(awk -v a="$SL" -v b="$DEFAULT" 'BEGIN{printf "%+.2f%%", (a-b)*100/b}')" \
+                "$(awk -v a="$SL" -v b="$XZ" 'BEGIN{printf "%+.2f%%", (a-b)*100/b}')" \
+                "$sl_ms" "$un_ms"
+        fi
+        rm -f "$sout"; rm -rf "$sd"
+    }
+    bench_slow "ZIP unwrap"            tests/corpus/pe-deflate.zip
+    bench_slow "ZIP/L6 (preflate)"     tests/corpus/pe-deflate-l6.zip
+    bench_slow "DOCX (real ZIP/L6)"    tests/corpus/sample.docx
+    bench_slow "JAR (real ZIP/L6)"     tests/corpus/sample.jar
+    bench_slow "gzip wrapper"          tests/corpus/ntdll.dll.gz
+    bench_slow "gz of mixed.tar"       tests/corpus/mixed.tar.gz
+    bench_slow "deb-shape ar"          tests/corpus/mixed.deb
+    bench_slow "JPEG (brunsli)"        tests/corpus/synth.jpg
+    bench_slow "MP3 (packMP3)"         tests/corpus/synth.mp3
+fi
+
 # Silesia corpus (12 files, 211 MB) — the standard general-purpose codec
 # benchmark. Gated by ZXLE_SILESIA=1 because pack time on 211 MB through
 # xz-9e single-threaded is several minutes.
@@ -350,6 +403,25 @@ if [ "${ZXLE_SILESIA:-0}" = "1" ] && [ -d tests/corpus/silesia ]; then
             b=$(basename "$f")
             cmp -s "$f" "tests/unpacked/silesia.d/$b" || SIL_RT=FAIL
         done
+        # --slow variant on the same input (gated; very slow on 211 MB).
+        SIL_ZX_SLOW=0; SIL_SLOW_PACK_MS=0; SIL_SLOW_UNP_MS=0; SIL_SLOW_RT=skip
+        if [ "${ZXLE_SLOW:-0}" = "1" ] && [ -n "$ZPAQ" ]; then
+            echo "Mode: solid zxle pack --slow (zpaq -m5 final)"
+            t0=$EPOCHREALTIME
+            "$BIN" pack --slow tests/baseline/silesia.slow.zxle $SIL_FILES >/dev/null 2>&1
+            SIL_SLOW_PACK_MS=$(elapsed_ms "$t0")
+            SIL_ZX_SLOW=$(stat -c%s tests/baseline/silesia.slow.zxle)
+            rm -rf tests/unpacked/silesia.slow.d && mkdir -p tests/unpacked/silesia.slow.d
+            t0=$EPOCHREALTIME
+            "$BIN" unpack tests/baseline/silesia.slow.zxle tests/unpacked/silesia.slow.d >/dev/null 2>&1
+            SIL_SLOW_UNP_MS=$(elapsed_ms "$t0")
+            SIL_SLOW_RT=OK
+            for f in $SIL_FILES; do
+                b=$(basename "$f")
+                cmp -s "$f" "tests/unpacked/silesia.slow.d/$b" || SIL_SLOW_RT=FAIL
+            done
+            rm -rf tests/baseline/silesia.slow.zxle tests/unpacked/silesia.slow.d
+        fi
         echo
         echo "Baselines (tar + codec):"
         echo "  tar | xz -9e --threads=1 ..."
@@ -374,6 +446,10 @@ if [ "${ZXLE_SILESIA:-0}" = "1" ] && [ -d tests/corpus/silesia ]; then
         printf "Results (vs sum of orig sizes %d B):\n" "$SIL_SUM"
         printf "  zxle solid       %12d  ratio=%s  rt=%s  pack=%dms unpack=%dms\n" \
             "$SIL_ZX" "$(ratio "$SIL_ZX" "$SIL_SUM")" "$SIL_RT" "$SIL_PACK_MS" "$SIL_UNP_MS"
+        if [ "$SIL_ZX_SLOW" -gt 0 ]; then
+            printf "  zxle --slow      %12d  ratio=%s  rt=%s  pack=%dms unpack=%dms\n" \
+                "$SIL_ZX_SLOW" "$(ratio "$SIL_ZX_SLOW" "$SIL_SUM")" "$SIL_SLOW_RT" "$SIL_SLOW_PACK_MS" "$SIL_SLOW_UNP_MS"
+        fi
         printf "  tar + xz-9e      %12d  ratio=%s  pack=%dms\n" \
             "$SIL_XZ" "$(ratio "$SIL_XZ" "$SIL_SUM")" "$SIL_XZ_MS"
         printf "  tar + zstd-19    %12d  ratio=%s  pack=%dms\n" \
@@ -389,6 +465,10 @@ if [ "${ZXLE_SILESIA:-0}" = "1" ] && [ -d tests/corpus/silesia ]; then
         if [ "$SIL_ZPAQ" -gt 0 ]; then
             printf "  zxle vs zpaq -m5:     %s\n" \
                 "$(awk -v a="$SIL_ZX" -v b="$SIL_ZPAQ" 'BEGIN{printf "%+.2f%%", (a-b)*100/b}')"
+            if [ "$SIL_ZX_SLOW" -gt 0 ]; then
+                printf "  zxle --slow vs zpaq:  %s\n" \
+                    "$(awk -v a="$SIL_ZX_SLOW" -v b="$SIL_ZPAQ" 'BEGIN{printf "%+.2f%%", (a-b)*100/b}')"
+            fi
         fi
         rm -f "$SIL_TAR"
     fi

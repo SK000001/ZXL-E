@@ -30,12 +30,14 @@ typedef struct {
 } PackEntry;
 
 /* pack_run — main pack body. force_opaque=1 skips all container-unwrap routing
- * and stores every input as KIND_OPAQUE. Used by do_pack() to compute a
- * fall-through baseline; see "min-pack" comment in do_pack. Returns the number
- * of files unwrapped (i.e. anything other than KIND_OPAQUE) on success.
- * *out_size receives the produced file size. */
+ * and stores every input as KIND_OPAQUE. slow=1 finalizes the solid stream
+ * with zpaq -m5 instead of xz -9e (cmix-class context-mixing on raw streams;
+ * 5-10x slower). Used by do_pack() to compute a fall-through baseline; see
+ * "min-pack" comment in do_pack. Returns the number of files unwrapped (i.e.
+ * anything other than KIND_OPAQUE) on success. *out_size receives the
+ * produced file size. */
 static int pack_run(const char *out, int n, char **files, int force_opaque,
-                    long long *out_size, uint64_t *out_total) {
+                    int slow, long long *out_size, uint64_t *out_total) {
     PackEntry *ents = calloc((size_t)n, sizeof(PackEntry));
     if (!ents) die("calloc ents");
     Buf solid; buf_init(&solid);
@@ -177,7 +179,19 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
     fclose(cf);
 
     char cmd[4096];
-    snprintf(cmd, sizeof(cmd), "xz -9e -c --threads=1 \"%s\" > \"%s\" 2>%s", tmp_concat, tmp_zst, ZXLE_DEVNULL);
+    if (slow) {
+        /* zpaq -m5: cmix-class context-mixing. Archive is journaling-format
+         * (not a stream); zpaq creates tmp_zst itself and we read it back
+         * verbatim into the trailing payload. */
+        unlink(tmp_zst);
+        snprintf(cmd, sizeof(cmd),
+                 "zpaq a \"%s\" \"%s\" -m5 >%s 2>&1",
+                 tmp_zst, tmp_concat, ZXLE_DEVNULL);
+    } else {
+        snprintf(cmd, sizeof(cmd),
+                 "xz -9e -c --threads=1 \"%s\" > \"%s\" 2>%s",
+                 tmp_concat, tmp_zst, ZXLE_DEVNULL);
+    }
     run(cmd);
 
     /* Compute manifest size. KIND_OPAQUE has no recipe blob; every other kind
@@ -201,7 +215,8 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
     if (!o) die("fopen out");
     fwrite(ZXLE_MAGIC, 1, 4, o);
     fputc(ZXLE_VER, o);
-    fputc(0, o);
+    /* Flags byte: bit 0 = trailing payload codec (0 = xz-9e, 1 = zpaq -m5). */
+    fputc(slow ? 0x01 : 0x00, o);
     wu32(o, (uint32_t)mlen);
     for (int i = 0; i < n; i++) {
         size_t plen = strlen(ents[i].name);
@@ -251,7 +266,15 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
 }
 
 static int do_pack(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "usage: zxle pack <out.zxle> <files...>\n"); return 1; }
+    /* Parse leading flags: --slow finalizes the solid stream with zpaq -m5
+     * (cmix-class context-mixing) instead of xz -9e. 5-10x slower on raw
+     * streams; closes the Silesia gap surfaced by the 2026-05-08 measurement. */
+    int slow = 0;
+    while (argc > 0 && argv[0][0] == '-') {
+        if (strcmp(argv[0], "--slow") == 0) { slow = 1; argc--; argv++; continue; }
+        break;
+    }
+    if (argc < 2) { fprintf(stderr, "usage: zxle pack [--slow] <out.zxle> <files...>\n"); return 1; }
     const char *out = argv[0];
     int n = argc - 1;
     char **files = argv + 1;
@@ -261,13 +284,13 @@ static int do_pack(int argc, char **argv) {
      * "small tightly-deflated input inflates to bigger solid" regression
      * (see tests/real_world.md, npm tarballs +144%/+247% before this fix). */
     long long osz = -1; uint64_t total = 0;
-    int unwrapped = pack_run(out, n, files, 0, &osz, &total);
+    int unwrapped = pack_run(out, n, files, 0, slow, &osz, &total);
 
     if (unwrapped > 0) {
         char opq[1024];
         snprintf(opq, sizeof(opq), "%s.opq.tmp", out);
         long long opq_osz = -1; uint64_t opq_total = 0;
-        pack_run(opq, n, files, 1, &opq_osz, &opq_total);
+        pack_run(opq, n, files, 1, slow, &opq_osz, &opq_total);
         if (opq_osz > 0 && opq_osz < osz) {
             fprintf(stderr, "min-pack: opaque %lld < unwrap %lld -> using opaque\n",
                     opq_osz, osz);
@@ -308,8 +331,8 @@ static int do_unpack(int argc, char **argv) {
     char magic[4];
     if (fread(magic,1,4,f) != 4 || memcmp(magic, ZXLE_MAGIC, 4) != 0) die("bad magic");
     int ver = fgetc(f), flags = fgetc(f);
-    (void)flags;
     if (ver != ZXLE_VER) die("bad version");
+    int slow = (flags & 0x01);
 
     uint8_t mlen_b[4];
     if (fread(mlen_b, 1, 4, f) != 4) die("read mlen");
@@ -373,8 +396,51 @@ static int do_unpack(int argc, char **argv) {
     fclose(f);
 
     char cmd[4096];
-    snprintf(cmd, sizeof(cmd), "xz -d -c \"%s\" > \"%s\" 2>%s", tmp_zst, tmp_concat, ZXLE_DEVNULL);
-    run(cmd);
+    if (slow) {
+        /* zpaq archive: extract via `zpaq x` to a scratch dir, then read the
+         * single file out. zpaq stores the path as given (we passed
+         * tmp_concat which is e.g. "<in>.unpack.concat.tmp"); on extract it
+         * lands at <recdir>/<resolved-tmp_concat-path>, which we resolve by
+         * scanning for the first regular file under recdir. */
+        char recdir[1024];
+        snprintf(recdir, sizeof(recdir), "%s.unpack.zpaq.d", in);
+        ZXLE_MKDIR(recdir);
+        snprintf(cmd, sizeof(cmd),
+                 "zpaq x \"%s\" -to \"%s/\" -f >%s 2>&1",
+                 tmp_zst, recdir, ZXLE_DEVNULL);
+        run(cmd);
+        /* Move the extracted file (at some nested path) to tmp_concat. We
+         * know it's the only regular file under recdir, since the archive
+         * was created with one input. Use `find` shell-out for portability
+         * across the path quirks we already hit in the bench. */
+        char find_cmd[4096];
+        snprintf(find_cmd, sizeof(find_cmd),
+                 "find \"%s\" -type f -print -quit > \"%s.found\" 2>%s",
+                 recdir, tmp_concat, ZXLE_DEVNULL);
+        run(find_cmd);
+        char found_path[2048] = {0};
+        char found_meta[2048];
+        snprintf(found_meta, sizeof(found_meta), "%s.found", tmp_concat);
+        FILE *ff = fopen(found_meta, "rb");
+        if (!ff) die("zpaq extract: no file found");
+        if (fgets(found_path, sizeof(found_path), ff) == NULL) die("zpaq extract: empty find");
+        fclose(ff);
+        unlink(found_meta);
+        size_t fpl = strlen(found_path);
+        while (fpl > 0 && (found_path[fpl-1]=='\n' || found_path[fpl-1]=='\r'))
+            found_path[--fpl] = 0;
+        unlink(tmp_concat);
+        if (rename(found_path, tmp_concat) != 0) die("rename zpaq extract -> tmp_concat");
+        /* Best-effort cleanup of the empty dir tree zpaq left behind. */
+        char rmcmd[2048];
+        snprintf(rmcmd, sizeof(rmcmd), "rm -rf \"%s\" >%s 2>&1", recdir, ZXLE_DEVNULL);
+        run(rmcmd);
+    } else {
+        snprintf(cmd, sizeof(cmd),
+                 "xz -d -c \"%s\" > \"%s\" 2>%s",
+                 tmp_zst, tmp_concat, ZXLE_DEVNULL);
+        run(cmd);
+    }
 
     size_t solid_len = 0;
     uint8_t *solid = read_whole_file(tmp_concat, &solid_len);
