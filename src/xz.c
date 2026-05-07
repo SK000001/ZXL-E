@@ -2,11 +2,91 @@
 #include "tar.h"
 #include "recipe.h"
 
+/* Parse xz block header to extract the LZMA2 dictionary-size byte (the single
+ * filter property byte for filter ID 0x21). Returns 0 on success and stores
+ * the byte in *dict_byte; -1 on parse failure or unexpected layout. We only
+ * handle the common shape: stream header (12 B) + one block with one LZMA2
+ * filter. */
+static int xz_parse_lzma2_dict(const uint8_t *p, size_t n, uint8_t *dict_byte) {
+    size_t off = 12;
+    if (off + 1 > n) return -1;
+    uint8_t hsize_b = p[off];
+    if (hsize_b == 0) return -1; /* 0 means index, not a block */
+    size_t hdr_size = ((size_t)hsize_b + 1) * 4;
+    if (off + hdr_size + 4 > n) return -1; /* +4 for block-header CRC32 */
+    size_t end = off + hdr_size; /* end of header, before its CRC32 */
+    uint8_t bflags = p[off + 1];
+    int n_filters  = (bflags & 0x03) + 1;
+    if (n_filters != 1) return -1;
+    int has_csize = (bflags >> 6) & 1;
+    int has_usize = (bflags >> 7) & 1;
+    size_t cur = off + 2;
+    /* skip variable-length integers (xz VLI: 7 bits per byte, top bit = more) */
+    int vli_n;
+    if (has_csize) {
+        for (vli_n = 0; vli_n < 9; vli_n++) {
+            if (cur >= end) return -1;
+            if ((p[cur++] & 0x80) == 0) break;
+        }
+        if (vli_n >= 9) return -1;
+    }
+    if (has_usize) {
+        for (vli_n = 0; vli_n < 9; vli_n++) {
+            if (cur >= end) return -1;
+            if ((p[cur++] & 0x80) == 0) break;
+        }
+        if (vli_n >= 9) return -1;
+    }
+    /* Filter: filter_id (vli) + prop_size (vli) + props. LZMA2 has filter_id
+     * 0x21 (1-byte vli) and prop_size 0x01 (1-byte vli); reject anything else. */
+    if (cur + 3 > end) return -1;
+    if (p[cur++] != 0x21) return -1;
+    if (p[cur++] != 0x01) return -1;
+    *dict_byte = p[cur];
+    return 0;
+}
+
+/* Map LZMA2 dict byte to xz preset-level candidates (--extreme / non-extreme
+ * share dict, so we'll probe both). Returns count; 0 means custom dict that
+ * no preset can reproduce (caller should bail to KIND_OPAQUE). */
+static int xz_dict_byte_to_levels(uint8_t b, uint8_t out[2]) {
+    switch (b) {
+    case 0x0C: out[0] = 0; return 1;                      /* 256 KiB */
+    case 0x10: out[0] = 1; return 1;                      /*   1 MiB */
+    case 0x12: out[0] = 2; return 1;                      /*   2 MiB */
+    case 0x14: out[0] = 3; out[1] = 4; return 2;          /*   4 MiB */
+    case 0x16: out[0] = 5; out[1] = 6; return 2;          /*   8 MiB */
+    case 0x18: out[0] = 7; return 1;                      /*  16 MiB */
+    case 0x1A: out[0] = 8; return 1;                      /*  32 MiB */
+    case 0x1C: out[0] = 9; return 1;                      /*  64 MiB */
+    default:   return 0;                                  /* custom */
+    }
+}
+
 int pack_xz(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *recipe, Buf *solid) {
     static const uint8_t XZ_MAGIC[6] = { 0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00 };
     if (n < 12) return -1;
     if (memcmp(p, XZ_MAGIC, 6) != 0) return -1;
     if (n > 0xFFFFFFFFu) return -1;
+
+    /* Multi-stream fast-fail: xz -T0 emits one stream per worker, each with
+     * the 6-byte magic. We only reproduce single-stream inputs; bail on any
+     * second magic. False-positive prob ~n/2^48 (cost: KIND_OPAQUE). */
+    for (size_t i = 6; i + 5 < n; i++) {
+        if (p[i]==0xFD && p[i+1]==0x37 && p[i+2]==0x7A &&
+            p[i+3]==0x58 && p[i+4]==0x5A && p[i+5]==0x00)
+            return -1;
+    }
+
+    /* Dict-driven probe pruning: parse the LZMA2 dict byte from the block
+     * header and probe only preset levels whose dict matches. If parsing
+     * fails (multi-block, multi-filter, unexpected shape), fall back to the
+     * full 8-probe ladder for compatibility. */
+    uint8_t dict_byte = 0xFF;
+    int dict_ok = (xz_parse_lzma2_dict(p, n, &dict_byte) == 0);
+    uint8_t dict_levels[2];
+    int n_dict_levels = dict_ok ? xz_dict_byte_to_levels(dict_byte, dict_levels) : 0;
+    if (dict_ok && n_dict_levels == 0) return -1; /* custom dict, unreachable */
 
     char in_xz[1024], raw_path[1024], rt_xz[1024], cmd[4096];
     snprintf(in_xz,    sizeof(in_xz),    "%s.in.xz",   tmp_prefix);
@@ -28,14 +108,25 @@ int pack_xz(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *recipe, Buf
         free(raw); unlink(in_xz); unlink(raw_path); return -1;
     }
 
-    static const struct { uint8_t level; uint8_t extreme; } ladder[] = {
-        {9, 1}, {9, 0},
-        {6, 1}, {6, 0},
-        {3, 1}, {3, 0},
-        {1, 0}, {0, 0},
-    };
+    struct LP { uint8_t level; uint8_t extreme; };
+    struct LP ladder[8];
+    int n_ladder;
+    if (dict_ok) {
+        n_ladder = 0;
+        for (int li = 0; li < n_dict_levels; li++) {
+            ladder[n_ladder++] = (struct LP){dict_levels[li], 1};
+            ladder[n_ladder++] = (struct LP){dict_levels[li], 0};
+        }
+    } else {
+        static const struct LP fallback[] = {
+            {9, 1}, {9, 0}, {6, 1}, {6, 0},
+            {3, 1}, {3, 0}, {1, 0}, {0, 0},
+        };
+        memcpy(ladder, fallback, sizeof(fallback));
+        n_ladder = (int)(sizeof(fallback)/sizeof(fallback[0]));
+    }
     int matched = -1;
-    for (size_t i = 0; i < sizeof(ladder)/sizeof(ladder[0]); i++) {
+    for (int i = 0; i < n_ladder; i++) {
         snprintf(cmd, sizeof(cmd),
                  "xz -%u%s -c --threads=1 \"%s\" > \"%s\" 2>%s",
                  (unsigned)ladder[i].level,
