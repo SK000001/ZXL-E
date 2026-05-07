@@ -11,3 +11,4 @@ tests/baseline/
 tests/scratch/
 logs/
 third_party/
+.claude/

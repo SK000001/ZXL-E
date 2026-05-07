@@ -56,23 +56,43 @@ Four-stage pipeline:
 
 Each stage is known in isolation; the integrated product does not exist publicly.
 
-## Build
+## Getting started
+
+From a fresh clone, the one-command path is:
 
 ```
-make preflate-deps   # one-time: clones + patches + builds third_party/preflate
-make brunsli-deps    # one-time: clones + builds third_party/brunsli (cbrunsli/dbrunsli)
-make packmp3-deps    # one-time: clones + builds third_party/packmp3 (packMP3)
+git clone <this-repo> ZXL-E && cd ZXL-E
+make all-deps                         # ~10 min: fetches third_party libs, tools, real-world fixtures
+make                                  # builds zxle.exe
+bash tests/make_fixtures.sh           # generates synthetic fixtures (sample.docx, .jar, etc.)
+bash tests/bench.sh                   # default bench (~5 min)
+ZXLE_SILESIA=1 ZXLE_SLOW=1 bash tests/bench.sh   # full bench incl. Silesia + --slow (~30-60 min)
+```
+
+`make all-deps` is the umbrella target: `preflate-deps brunsli-deps packmp3-deps zpaq-deps precomp-deps real-fixtures`. Each is also runnable individually if you want to skip something (e.g. only `preflate-deps` is required for the build itself; brunsli/packmp3/zpaq/precomp are only needed for their respective format routes / competitor benches).
+
+Host requirements:
+- `gcc` + `g++` (C11 / C++14)
+- `cmake` + `mingw32-make` (used by preflate and brunsli builds)
+- `git`, `curl`, `unzip`, `python`
+- system `zstd`, `xz`, `bzip2`
+- ~6 GB disk after `make all-deps` (most of it is the brunsli + preflate clones)
+
+The 8-file headline corpus (per-file table + solid mode at the top of the bench) lives in the sister project [ZXL](../Zxl)'s `tests/` dir. If `../Zxl/tests/` doesn't exist, `bench.sh` skips that section and runs everything else; container fixtures, Silesia, real-world fixtures, and the competitor sections all work standalone.
+
+## Build (manually, without `all-deps`)
+
+```
+make preflate-deps   # required: third_party/preflate (libpreflate.a)
+make brunsli-deps    # optional: cbrunsli/dbrunsli for JPEG routing
+make packmp3-deps    # optional: packMP3 for MP3 routing
+make zpaq-deps       # optional: zpaq for --slow mode
+make precomp-deps    # optional: precomp v0.4.7 competitor in bench
+make real-fixtures   # optional: silesia + real .deb + real .tar.xz
 make
 ```
 
-Optional for `--slow` mode:
-
-```
-# Drop zpaq.exe (or zpaq) into third_party/zpaq/. Bench auto-prepends to PATH;
-# zxle's shell-out invokes `zpaq` directly, so it must also be on PATH at run.
-```
-
-Requires `gcc`/`g++`, system `zstd`, `cmake` + `mingw32-make` (for the static libs), `xz`, `bzip2`, and `python` (used by some test fixtures). brunsli's `cbrunsli`/`dbrunsli` and packMP3 must be on `PATH` at runtime for those format routes to engage; `tests/bench.sh` auto-detects the locally-built copies.
+brunsli's `cbrunsli`/`dbrunsli`, packMP3, and zpaq must be on `PATH` at runtime for their respective routes to engage; `tests/bench.sh` auto-prepends `third_party/{brunsli/build/artifacts,packmp3/source,zpaq}` so locally-built copies just work.
 
 ## Use
 

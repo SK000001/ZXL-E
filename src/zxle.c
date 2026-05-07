@@ -536,8 +536,51 @@ static void usage(void) {
         "  zxle unpack <in.zxle>  <outdir>\n");
 }
 
+/* Auto-discover third_party/ tool dirs that sit alongside the zxle binary,
+ * and prepend them to PATH so direct invocation works after `make all-deps`
+ * without the user needing to manage PATH manually. Mirrors the same logic
+ * tests/bench.sh does. No-op if argv[0] doesn't resolve to a real dirname. */
+static void prepend_third_party_to_path(const char *argv0) {
+    char buf[2048];
+    if (!argv0) return;
+    size_t n = strnlen(argv0, sizeof(buf));
+    if (n == 0 || n >= sizeof(buf)) return;
+    memcpy(buf, argv0, n + 1);
+    /* Find last slash or backslash. */
+    char *slash = NULL;
+    for (size_t i = 0; i < n; i++) if (buf[i]=='/' || buf[i]=='\\') slash = &buf[i];
+    if (!slash) return;
+    *slash = 0; /* buf is now the bin's directory. */
+    static const char *subdirs[] = {
+        "third_party/brunsli/build/artifacts",
+        "third_party/packmp3/source",
+        "third_party/zpaq",
+    };
+    for (size_t i = 0; i < sizeof(subdirs)/sizeof(subdirs[0]); i++) {
+        char candidate[2048];
+        snprintf(candidate, sizeof(candidate), "%s/%s", buf, subdirs[i]);
+        struct stat st;
+        if (stat(candidate, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+        const char *cur = getenv("PATH");
+        char newpath[8192];
+#ifdef _WIN32
+        const char sep = ';';
+#else
+        const char sep = ':';
+#endif
+        if (cur && cur[0]) snprintf(newpath, sizeof(newpath), "%s%c%s", candidate, sep, cur);
+        else               snprintf(newpath, sizeof(newpath), "%s", candidate);
+#ifdef _WIN32
+        _putenv_s("PATH", newpath);
+#else
+        setenv("PATH", newpath, 1);
+#endif
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) { usage(); return 1; }
+    prepend_third_party_to_path(argv[0]);
     if (strcmp(argv[1], "pack")   == 0) return do_pack  (argc - 2, argv + 2);
     if (strcmp(argv[1], "unpack") == 0) return do_unpack(argc - 2, argv + 2);
     usage();

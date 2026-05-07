@@ -7,10 +7,14 @@ set -e
 cd "$(dirname "$0")/.."
 
 CORPUS="${ZXLE_CORPUS:-../Zxl/tests}"
+HAVE_CORPUS=1
 if [ ! -d "$CORPUS" ]; then
-    echo "corpus not found: $CORPUS"
-    echo "set ZXLE_CORPUS=<path> or place files in ../Zxl/tests"
-    exit 1
+    echo "note: 8-file headline corpus not found at $CORPUS"
+    echo "      (set ZXLE_CORPUS=<path> if you have it, e.g. the sister ZXL repo's tests/)"
+    echo "      Per-file table + solid bench skipped; container/format-aware fixtures"
+    echo "      under tests/corpus/ will still run. Run tests/fetch_real_fixtures.sh"
+    echo "      for the silesia + real-world fixtures."
+    HAVE_CORPUS=0
 fi
 
 # Default file list — mirror ZXL's bench but skip files that don't exist.
@@ -46,6 +50,7 @@ BIN=./zxle
 ratio() { awk -v a="$1" -v b="$2" 'BEGIN{ if (b==0) print "n/a"; else printf "%.4f", a/b }'; }
 elapsed_ms() { awk -v s="$1" -v e="$EPOCHREALTIME" 'BEGIN{printf "%d", (e-s)*1000}'; }
 
+if [ "$HAVE_CORPUS" = "1" ]; then
 printf "%-16s %10s %10s %10s %10s %10s  %-3s  %6s %6s\n" "file" "orig" "zxle" "zstd-19" "xz-9e" "ratio" "rt" "pk_ms" "un_ms"
 printf -- "----                  ----       ----       -------    -----      -----     --   ------ ------\n"
 
@@ -112,6 +117,8 @@ echo "solid (one zxle archive, all files):"
 printf "  zxle solid         %d  ratio=%s  rt=%s\n" "$SOLID_SZ" "$(ratio "$SOLID_SZ" "$SUM_ORIG")" "$SOLID_RT"
 printf "  vs sum-individual  %s smaller\n" "$(awk -v a="$SOLID_SZ" -v b="$SUM_ZXLE" 'BEGIN{printf "%.2f%%", (b-a)*100/b}')"
 printf "  perf               pack=%dms unpack=%dms\n" "$SOLID_PACK_MS" "$SOLID_UNP_MS"
+
+fi  # HAVE_CORPUS
 
 bench_zip() {
     local label="$1" ZIP="$2"

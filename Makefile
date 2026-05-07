@@ -82,7 +82,50 @@ packmp3-deps:
 	@cd $(PACKMP3_DIR)/source && $(MAKE) RES= || true
 	@echo "packmp3 built. Add $(PWD)/$(PACKMP3_DIR)/source to PATH, or use tests/bench.sh which auto-detects."
 
+ZPAQ_DIR = third_party/zpaq
+
+# zpaq-deps: required for `zxle pack --slow` (zpaq -m5 final-step). Pulls the
+# upstream Windows binary (zpaq 7.15) and aliases zpaq64.exe -> zpaq.exe so the
+# bare `zpaq` invocation works on PATH.
+zpaq-deps:
+	@if [ ! -x $(ZPAQ_DIR)/zpaq.exe ] && [ ! -x $(ZPAQ_DIR)/zpaq ]; then \
+	  mkdir -p $(ZPAQ_DIR) && \
+	  curl -fsSL -o /tmp/zpaq715.zip http://mattmahoney.net/dc/zpaq715.zip && \
+	  unzip -j -o /tmp/zpaq715.zip "zpaq64.exe" -d $(ZPAQ_DIR) >/dev/null && \
+	  cp $(ZPAQ_DIR)/zpaq64.exe $(ZPAQ_DIR)/zpaq.exe && \
+	  rm -f /tmp/zpaq715.zip; \
+	fi
+	@echo "zpaq ready at $(PWD)/$(ZPAQ_DIR)/. Add to PATH for --slow mode, or use tests/bench.sh which auto-detects."
+
+PRECOMP_DIR = third_party/precomp
+
+# precomp-deps: required only for the precomp competitor section of bench.sh.
+# Pulls the upstream Windows binary (precomp 0.4.7).
+precomp-deps:
+	@if [ ! -x $(PRECOMP_DIR)/precomp.exe ] && [ ! -x $(PRECOMP_DIR)/precomp ]; then \
+	  mkdir -p $(PRECOMP_DIR) && \
+	  curl -fsSL -o /tmp/precomp.zip https://github.com/schnaader/precomp-cpp/releases/download/v0.4.7/precomp.zip && \
+	  unzip -j -o /tmp/precomp.zip "windows/precomp.exe" -d $(PRECOMP_DIR) >/dev/null && \
+	  rm -f /tmp/precomp.zip; \
+	fi
+	@echo "precomp ready at $(PWD)/$(PRECOMP_DIR)/."
+
+# Convenience: fetch real-world fixtures (silesia, real .deb, real .tar.xz)
+# into tests/corpus/. Idempotent (skips files that already exist).
+real-fixtures:
+	@bash tests/fetch_real_fixtures.sh
+
+# Convenience: fetch + build everything a fresh clone needs to run the full
+# bench. ~10 min on a fresh machine (preflate + brunsli cmake builds dominate).
+all-deps: preflate-deps brunsli-deps packmp3-deps zpaq-deps precomp-deps real-fixtures
+	@echo
+	@echo "All deps ready. Next:"
+	@echo "  make                          # builds zxle"
+	@echo "  bash tests/make_fixtures.sh   # regenerates synthetic fixtures"
+	@echo "  bash tests/bench.sh           # runs the default bench"
+	@echo "  ZXLE_SILESIA=1 ZXLE_SLOW=1 bash tests/bench.sh   # full bench"
+
 clean:
 	rm -f $(BIN) src/*.o tests/*.zxle tests/*.tmp
 
-.PHONY: all clean preflate-deps brunsli-deps packmp3-deps
+.PHONY: all clean preflate-deps brunsli-deps packmp3-deps zpaq-deps precomp-deps real-fixtures all-deps
