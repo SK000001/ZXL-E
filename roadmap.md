@@ -118,7 +118,30 @@ Remaining items are **measurement / quality / wider coverage**, not new containe
 
 - **Multi-threaded zstd reproducibility** — confirmed 2026-05-07 on real Ubuntu coreutils.deb that the data-layer `.tar.zst` (1.4 MB) is encoded with `-T0` and falls through to OP_STORE because per-worker frame splits are non-deterministic. The 2026-05-07 multi-frame fast-fail in pack_zst now bails on those inputs in milliseconds. Headline-positive routing on multi-threaded `.tar.zst` would require a multi-frame-aware probe that recognizes worker boundaries and reproduces each frame independently. Large work, uncertain payoff — most real-world `.tar.zst .deb`s sit at the universal-codec floor anyway.
 - **Widen pack_xz reproducibility for non-preset encoders** — empirically established 2026-05-06 (Debian hello, dict=8MiB, custom mf/mode/nice/depth) and 2026-05-07 (GNU coreutils-9.11.tar.xz, dict=32MiB, ditto). The 2026-05-07 dict-driven pruning + bail correctly identifies these as unreachable in 2 probes (vs 8) but the headline still ties at floor. Real wins would require either (a) widening probe space with `mf` × `mode` × `nice` × `depth` permutations (large search, slow, uncertain payoff — likely doesn't reproduce libzstd-direct or GNU-release-script outputs anyway), or (b) reading lzma2 encoder choices from the stream itself (block-level filter parameters). Defer until validation gaps below close.
-- **Validation gaps from "Future work"** — Silesia + precomp v0.4.7 now in bench; remaining: zpaq (text-heavy adversary, ~0.165 ratio on Silesia vs our 0.2284), freearc (closer architectural peer to ZXL-E with multi-codec routing), size-scaling data past the 128 MiB long-window, fuzz testing of container parsers, peak-RSS reporting in bench. **Fuzz testing** of `pack_zip` / `pack_tar` / `pack_ar` / `pack_gz` / `pack_bz2` / `pack_xz` / `pack_zst` is the highest-impact safety win before any external adoption. **zpaq comparison** is the most informative size-positioning signal — it would show how far we are from SOTA on text-heavy inputs (currently ~30% behind on Silesia text files).
+- **M5 (slow context-mixing fallback) — zpaq-as-backend, not neural** — the zpaq v7.15 measurement landed 2026-05-07/08 and reframes M5 entirely. zpaq -m5 beats us by **−20.81%** on Silesia (0.1891 vs 0.2284) but loses to us by **+14% to +164%** on every container fixture (because zpaq doesn't unwrap). The two shapes are cleanly opposed — context-mixing wins on raw text/binary, container-unwrap wins on structured archives. Natural integration: shell out to zpaq as a `--slow` backend (same pattern as brunsli/packMP3/xz), route raw streams through it, keep the existing unwrap+xz-9e pipeline for containers, let min-pack pick the smaller. This achieves "best of both worlds" without writing a context-mixing codec from scratch. Engineering scope: small (one new KIND_OPAQUE_ZPAQ variant + shell-out + RT verify, ~150 LoC). Tradeoff: 5–10× slower pack on raw streams; a `--slow` flag gates it. **This is the next major milestone if "best compression in the world" is a goal.**
+
+- **Other validation gaps** — Silesia + precomp v0.4.7 + zpaq v7.15 now in bench; remaining: freearc (closer architectural peer to ZXL-E with multi-codec routing), size-scaling data past the 128 MiB long-window, fuzz testing of container parsers, peak-RSS reporting in bench. **Fuzz testing** of `pack_zip` / `pack_tar` / `pack_ar` / `pack_gz` / `pack_bz2` / `pack_xz` / `pack_zst` is the highest-impact safety win before any external adoption.
+
+### Done (kept for context): zpaq v7.15 -m5 in bench — SOTA gap quantified (shipped 2026-05-08)
+
+`third_party/zpaq/zpaq64.exe` (gitignored) auto-detected; per-fixture (9 of 10; PNG dropped due to relative-path RT-verifier quirk) and Silesia baseline. zpaq beats us decisively on Silesia, loses to us decisively on every container fixture.
+
+| Fixture | zxle | zpaq -m5 | zpaq vs zxle |
+|---|---|---|---|
+| pe-deflate.zip | 1,800,810 | 2,258,341 | **+25.41%** |
+| pe-deflate-l6.zip | 1,802,202 | 2,269,634 | **+25.94%** |
+| sample.docx | 473,042 | 586,690 | **+24.02%** |
+| sample.jar | 6,222 | 16,459 | **+164.53%** |
+| ntdll.dll.gz | 968,355 | 1,161,171 | **+19.91%** |
+| mixed.tar.gz | 1,111,803 | 1,416,867 | **+27.44%** |
+| mixed.deb | 1,258,327 | 1,538,855 | **+22.29%** |
+| synth.jpg | 117,492 | 154,399 | **+31.41%** |
+| synth.mp3 | 398,775 | 454,019 | **+13.85%** |
+| **Silesia (211 MB)** | 48,408,614 | 40,070,637 | **−20.81%** ← zpaq wins |
+
+**Reading:** two cleanly opposed shapes. zpaq doesn't unwrap; it compresses opaque streams. Its context-mixing margin over xz-9e (which is ~30% on flat text) shows up *only* on raw inputs. On already-structured archives it lands within 0–7% of xz-9e — and our unwrap path then beats it by 14–164%. Conversely, on Silesia (mostly raw text/binary), context-mixing's 30% margin lands and zpaq wins by 20.81%.
+
+**Architectural implication:** the M5 milestone (originally "neural residual fallback") should be re-scoped to **zpaq-as-backend**. Same shell-out pattern we already use for brunsli/packMP3/xz. Raw streams route through it; containers stay on the unwrap+xz-9e pipeline; min-pack picks the smaller. Closes the Silesia gap without giving up any container win and without writing a context-mixing codec from scratch. Documented as the next major milestone.
 
 ### Done (kept for context): Silesia standard corpus measurement (shipped 2026-05-07)
 
@@ -441,10 +464,14 @@ Each recompressor lives behind an availability check; missing recompressors fall
 ### M4 — Cross-stream content-defined ordering
 **Status:** parked pre-implementation (2026-05-01). See "Tried and reverted" — measurement showed no headroom on sub-window corpora because zstd `--long=27` (128 MiB window) already captures cross-stream matches regardless of order. Revisit when (a) corpora routinely exceed the long-window size, or (b) we ship a non-solid block format where ordering matters per-block.
 
-### M5 — Neural residual fallback (optional)
-**Branch:** `feat/m5-neural` · **Expected:** −5 to −15% on residuals where zstd is already near optimal.
+### M5 — Slow context-mixing fallback (re-scoped 2026-05-08)
+**Branch:** `feat/m5-slow` · **Expected:** −15 to −25% on raw text/binary streams (Silesia and similar) without giving up any container win.
 
-Small autoregressive byte predictor (NNCP-class). Default-off due to slowdown; user opts in with `--slow`.
+**Original plan:** small autoregressive neural byte predictor (NNCP-class). Multi-week implementation; uncertain payoff.
+
+**Re-scoped plan (after zpaq v7.15 measurement):** shell out to zpaq -m5 as a `--slow` backend, same pattern as brunsli/packMP3/xz. Add a new `KIND_OPAQUE_ZPAQ` (or a flag in KIND_OPAQUE) that routes raw streams through `zpaq a archive input -m5`, RT-verifies via `zpaq x` + cmp, and contributes a per-stream blob to the manifest (bypassing the solid xz-9e stream). min-pack picks the smaller of the unwrap+xz-9e candidate and the zpaq candidate. Default-off; user opts in with `--slow`.
+
+Reasoning: zpaq's context-mixing already achieves cmix-class ratios on text/binary; we just need the routing. Implementation is ~150 LoC of shell-out + manifest plumbing, mirroring brunsli's path. Slowdown is 5–10× pack on raw streams, gated behind the flag. Closes the −20.81% Silesia gap surfaced 2026-05-08 without giving up any current container win.
 
 ---
 
