@@ -100,14 +100,26 @@ The 8-file corpus contains no containers, so M2 doesn't change these numbers vs 
 
 ---
 
-## Next session — after real-deb measurement (2026-05-06)
+## Next session — after real-zst-deb measurement (2026-05-07)
 
 The OP vocabulary is now structurally complete for the gz/bz2/xz/zst container family. Remaining items are **measurement / fixture-coverage**, not new code:
 
 - **Real-world `.tar.xz` corpus** — pull a kernel patch / GNU release tarball / source distribution to measure where inner-tar wins exceed recipe overhead. The `mixed.tar.xz` tie and `xz-in.tar` +1.55% are the *worst-case shape* (binary-heavy, xz already at floor); typical real-world `.tar.xz` is text-heavy source where xz is strong but per-entry routing might net wins on embedded media / generated artifacts.
-- **Real `.tar.zst` package** — Debian Trixie / Arch packages with zstd inner. The shipped frame-header probing in `pack_zst` should engage on these (where the synthetic `pack_xz` ladder failed on real .debs — see "Done" below). Verify KIND_ZSTD fires and measure headline.
 - **Widen pack_xz reproducibility** — real Debian .debs use non-preset lzma2 params (`mf=bt4,mode=normal` close but not exact, even with matching `dict=8MiB`). Either widen the probe ladder with `mf`/`mode`/`nice`/`depth` permutations, or accept that real .debs fall through to opaque on the inner-xz members and only the ar-frame is captured. See "Done" finding below for the empirical data.
+- **Multi-threaded zstd reproducibility** — confirmed 2026-05-07 on real Ubuntu coreutils.deb that the data-layer `.tar.zst` (1.4 MB) is encoded with `-T0` and falls through to OP_STORE because per-worker frame splits are non-deterministic. Either accept the fall-through (current behavior; safe via min-pack) or build a multi-frame-aware probe that recognizes worker boundaries and reproduces each frame independently. Large work, uncertain payoff — most real-world `.tar.zst` `.deb`s sit at the universal-codec floor anyway.
+- **Encode-time hot spots** — surfaced by the new bench wall-time columns: M3h-zsttar level-3 ladder ~19.9 s on 1.4 MB; real coreutils.deb 51 s (zst probe ladder × 2 layers × min-pack double-run). If pack-time becomes a target, fast-fail the ladder when the first few probes diverge wildly from the input size, or memoize per-level results across min-pack passes.
 - **Validation gaps from "Future work"** — competitor benchmarks (precomp / freearc / zpaq), size-scaling data past the 128 MiB long-window, fuzz testing of container parsers. Pick whichever the next-session bench surfaces as the limiting factor.
+
+### Done (kept for context): real `.tar.zst` Debian-family `.deb` ties xz-9e (measured 2026-05-07)
+
+Pulled `coreutils_9.5-1ubuntu1_amd64.deb` (Ubuntu 24.04, 1,465,358 B; ar → control.tar.zst + data.tar.zst) into `tests/corpus/real_coreutils.deb` (gitignored). Result: `zxle=1,465,450` vs `xz-9e=1,465,500` — **−0.00%** (50 B win, effective tie), round-trip OK. All three universal codecs (xz/zstd/zxle) within 150 B of orig — canonical "already-compressed wall" shape, same as `real_hello.deb` (.tar.xz data layer).
+
+**Routing engagement (third-party `.tar.zst` first-time exercise):**
+- `control.tar.zst` (small, single-thread) → KIND_ZSTD via frame-header probing matched (`level=19 long=27 io=file check=on`), inner ustar tar dispatched. Confirms the M3h-zsttar frame-header-probing milestone works on a real third-party stream beyond `which.pkg.tar.zst`.
+- `data.tar.zst` (1.4 MB, multi-threaded `-T0`) → falls through to OP_STORE. Multi-threaded zstd splits the input across workers and emits multiple concatenated frames at non-deterministic boundaries; `pack_zst` only handles single-frame inputs and bails. **The documented `-T0` non-determinism risk from M3h-zsttar is now empirically confirmed** on real Ubuntu .debs.
+- min-pack picks opaque (1,465,450 < 1,472,779 unwrap candidate, 7-KB recipe overhead unrecovered).
+
+**Implication:** real `.tar.zst` .debs land in the same bucket as real `.tar.xz` .debs — opaque-wins ties at the codec floor, confirming both `.deb` shapes via the safe min-pack fallthrough. The KIND_ZSTD frame-header probe path is now proven on two real third-party streams (Arch `.pkg.tar.zst` and Ubuntu control layer); the multi-threaded data-layer gap is a known, bounded limitation.
 
 ### Done (kept for context): real `.deb` ties xz-9e (measured 2026-05-06)
 
