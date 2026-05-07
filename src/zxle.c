@@ -177,7 +177,7 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
     fclose(cf);
 
     char cmd[4096];
-    snprintf(cmd, sizeof(cmd), "zstd -19 --long=27 -q -f -o \"%s\" \"%s\"", tmp_zst, tmp_concat);
+    snprintf(cmd, sizeof(cmd), "xz -9e -c --threads=1 \"%s\" > \"%s\" 2>%s", tmp_concat, tmp_zst, ZXLE_DEVNULL);
     run(cmd);
 
     /* Compute manifest size. KIND_OPAQUE has no recipe blob; every other kind
@@ -373,7 +373,7 @@ static int do_unpack(int argc, char **argv) {
     fclose(f);
 
     char cmd[4096];
-    snprintf(cmd, sizeof(cmd), "zstd -d -q -f -o \"%s\" \"%s\"", tmp_concat, tmp_zst);
+    snprintf(cmd, sizeof(cmd), "xz -d -c \"%s\" > \"%s\" 2>%s", tmp_zst, tmp_concat, ZXLE_DEVNULL);
     run(cmd);
 
     size_t solid_len = 0;

@@ -7,7 +7,11 @@
  * vocabulary consumed by recipe.c (unpack_recipe). */
 
 #define ZXLE_MAGIC "ZXLE"
-#define ZXLE_VER 2
+/* v3 (2026-05-07): solid stream codec switched from zstd -19 --long=27 to
+ * xz -9e --threads=1. Manifest layout is unchanged; only the trailing
+ * payload's compression scheme changed. v2 files cannot round-trip with
+ * a v3 binary and vice versa. */
+#define ZXLE_VER 3
 
 /* Top-level container kind tag (one byte per manifest entry). */
 #define KIND_OPAQUE 0
