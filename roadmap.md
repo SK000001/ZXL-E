@@ -144,7 +144,22 @@ The 8-file corpus contains no containers, so M2 doesn't change these numbers vs 
 
 ---
 
-## Next session — after final-step codec swap to xz-9e (2026-05-07)
+## Next session — push past zpaq-m5 efficient frontier (planned 2026-05-08)
+
+Plateau reached on the existing-codec ladder: default mode beats xz-9e on every container fixture and ties it on flat input; `--slow` mode matches zpaq -m5 on Silesia and stacks the unwrap-path gain on top. `--slow` is now strict pareto over default (per-fixture min-pack tier shipped 2026-05-08). Three documented small-input regressions closed.
+
+Going *beyond* zpaq -m5 on raw text/binary (the only place we don't already win) requires either heavier codecs (paq8/cmix at 100–1000× slowdown) or new architecture. The new milestones in the Roadmap section below are framed against that:
+
+- **M6** — per-content-type codec routing within the solid stream. Concrete, +2–6% expected, no new deps. **Highest-leverage near-term work.**
+- **M7** — CPU parallelism (probe ladders + min-pack tiers in parallel; optional `--fast` for multi-threaded final codec). 2–8× pack-time speedup, zero ratio cost. Should follow M6.
+- **M8** — GPU / ML backend. Aspirational; only attempt after M6/M7 land.
+- **M9** — corpus-specific trained model. Deferred until a deployment target appears.
+
+Everything below this line is the prior session's plan, retained for context.
+
+---
+
+## Prior next-session list — after final-step codec swap to xz-9e (2026-05-07)
 
 The OP vocabulary is structurally complete, encode-time hot spots are bounded, real-world `.tar.xz` / `.tar.zst` fixtures land at the universal floor, and the v3 final-step codec swap delivered a uniform +4-7 pp headline gain — zxle now beats xz-9e on the per-file corpus and wins or ties precomp on 9/10 competitor-bench fixtures. The hypothesis "switch to LZMA2" was validated empirically (no flag, no fallback); ZXLE_VER bumped to 3.
 
@@ -506,11 +521,64 @@ Each recompressor lives behind an availability check; missing recompressors fall
 
 Wire format: ZXLE_VER stays at 3. Flags byte bit 0 (0x01) = trailing payload is zpaq -m5; do_unpack dispatches accordingly. v3 files written by default-mode binaries (flags=0) decode unchanged through the xz path.
 
-Headline impact: see "Current state" table above. Silesia gap closed (zxle --slow = 0.1891, matches zpaq -m5 within 2 KB). Container fixtures gain a further 11–35% over default zxle (−29 to −47% vs xz-9e baseline). JAR is the lone +6% regression vs default — small-input zpaq journaling overhead — still −57% vs xz-9e.
+Headline impact: see "Current state" table above. Silesia gap closed (zxle --slow = 0.1891, matches zpaq -m5 within 2 KB). Container fixtures gain a further 11–35% over default zxle (−29 to −47% vs xz-9e baseline). The original JAR/JPEG/MP3 small-input regressions (+6.20% / +0.87% / +0.26% vs default) were closed 2026-05-08 by the per-fixture min-pack tier — `--slow` is now a strict pareto improvement (never larger than default, often much smaller).
 
 Code: ~80 LoC in `src/zxle.c` (--slow flag parsing, codec dispatch in pack_run + do_unpack, zpaq archive extract-and-rename in unpack since zpaq is journaling-format not stream-format). No new translation unit; zpaq is shell-out at the solid-stream boundary, same pattern as xz/zstd/bzip2/cbrunsli/packMP3.
 
 Pack-time: 5–10× default xz mode (Silesia 327 s vs 204 s). Unpack: similar (zpaq pack/extract are roughly symmetric).
+
+---
+
+### M6 — Per-content-type codec routing within the solid stream (planned)
+
+**Branch:** `feat/m6-content-route` · **Expected:** 2–6% denser on heterogeneous corpora (Silesia, mixed source / binary / image archives) at zero speed cost; potentially more if the type detector is good.
+
+**Motivation:** today every byte of the solid stream is fed to a single final-step codec (xz-9e or zpaq-m5). Real-world corpora are heterogeneous — Silesia has flat text (dickens, webster), database (nci), images (mr, x-ray), binaries (ooffice, sao) all in one stream. zpaq's `-method` flag accepts content-type-specific configs (`-m5` is balanced; `-mt` is tuned for text; custom configs exist for binary). xz/lzma2 has filters (BCJ/BCJ2/delta) that help PE/ELF binaries by ~5–10%. xz with delta filter is denser on audio.
+
+**Plan:**
+1. Add a small content-type sniffer over each KIND_OPAQUE entry's bytes (entropy / per-byte distribution / printable-ratio classifies into {text, binary-with-x86-code, audio-pcm, generic-binary}).
+2. Bucket the solid stream into per-type sub-streams; finalize each with a tuned codec/filter choice.
+3. Manifest gains a u8 codec-id per OPAQUE entry; decode dispatches.
+
+**Why this is our natural edge:** ZXL-E already does per-stream format-aware routing for *containers* (JPEG → brunsli, PNG → preflate, MP3 → packMP3). M6 extends the same pattern to *flat* streams. zpaq itself doesn't unwrap *or* type-route, so this stacks cleanly on top of our existing wins.
+
+**Risks:** sniffer accuracy on edge cases; per-bucket framing overhead can dominate on small inputs (gate by stream size; route buckets <X bytes through a single fallback codec).
+
+### M7 — CPU parallelism / multi-threading (planned)
+
+**Branch:** `feat/m7-mt` · **Expected:** 2–8× pack-time speedup on multi-core machines (typical: 4–8 cores) with **zero ratio change** by default and an optional `--fast` flag that trades determinism for additional speed.
+
+**Motivation:** today's pack pipeline is largely serial. The previously-shipped speedups (parallel silesia baselines, skip force_opaque, sha256 cache) were all bench-side or redundancy-side. The pack itself still runs probe ladders sequentially, runs min-pack tiers sequentially, and shells out to single-threaded codecs.
+
+**Plan:**
+
+1. **Parallelize probe ladders in `pack_xz` / `pack_zst`** — each (level, --long-or-extreme) candidate runs as an independent subprocess; first cmp-match wins. Up to 4× on big inputs where the ladder dominates pack time (e.g., real_coreutils_src.tar.xz at 46 s currently).
+2. **Parallelize the per-fixture min-pack tier** (slow vs default) when both are needed. Concurrent fork/spawn; wait on both; pick smaller. Halves pack time on small `--slow` fixtures.
+3. **Parallelize the unwrap+force_opaque pair** when both are needed (silesia.mozilla shape). Same pattern as #2.
+4. **`--fast` flag**: opt into multi-threaded final-step codec (`xz -T0` or `zstd -T0`). Output isn't byte-identical across runs, but unpack is unaffected (decoder is single-threaded-deterministic). Gate behind the flag because some users want bit-exact reproducibility.
+5. **Multi-threaded sniffer** (M6 prerequisite) — once content-type sniffing is in, it can run per-entry in parallel during the unwrap walker.
+
+**Risks:** subprocess fan-out on Windows is heavier than POSIX `fork`; need to use `posix_spawn` consistently. Determinism gate (`--fast` flag) needs careful manifest-flag plumbing (similar to `--slow`).
+
+### M8 — GPU / ML backend (research; aspirational)
+
+**Branch:** `feat/m8-gpu` · **Expected:** if it works, push past the zpaq-m5 efficient frontier on Silesia (target ratio 0.16–0.17, vs current --slow 0.1891) at GPU-class speed (10–100× faster than CPU paq8/cmix). Big "if" — this is research, not engineering.
+
+**Two viable directions:**
+
+1. **nvCOMP fast-path** — NVIDIA's GPU-accelerated zstd/deflate. Same ratio class as CPU zstd (~0.25 on Silesia, i.e., looser than our default xz). Useful as a `--gpu-fast` flag for users who want very-fast pack at moderate ratio. Adds CUDA dep. Concrete, ~1 week of integration if a CUDA dev box is available.
+2. **Pretrained byte-level transformer / RNN backend** — bundle a small distilled model (10–50 MB), do GPU-accelerated arithmetic coding with it as the per-byte predictor. Could land in cmix territory at zpaq-class speed *on GPU*. CPU-only would still be slow. Adds onnxruntime / libtorch dep. Multi-week of work plus model selection / training.
+
+**Why this is properly research-grade:**
+- Both paths require a GPU dependency; without one, no win.
+- Determinism: GPU floating-point isn't bit-exact across hardware. Arithmetic coding requires the predictor's output to be deterministic across encode/decode pairs. Workable (use fixed-point or quantized models) but adds complexity.
+- The compression community has been chasing this for ~15 years; nothing off-the-shelf currently delivers cmix-class ratio at zpaq-class speed.
+
+**Decision gate:** don't start until M6 (content routing) and M7 (parallelism) are landed. Those have known payoff; M8's payoff is uncertain.
+
+### M9 — Specialized model training (research; deferred)
+
+If the project ever has a clear use case (e.g., "compress GitHub source-tree archives" or "compress backup tarballs of OS packages"), a small model trained on that distribution can outperform generic zpaq-m5 at lower cost than M8's universal model. Not worth pursuing without a concrete deployment target.
 
 ---
 
