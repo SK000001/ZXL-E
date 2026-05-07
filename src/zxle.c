@@ -282,11 +282,29 @@ static int do_pack(int argc, char **argv) {
     /* min-pack: pack with container unwrap engaged, then if any entry was
      * unwrapped, also pack as all-opaque and keep the smaller. Cures the
      * "small tightly-deflated input inflates to bigger solid" regression
-     * (see tests/real_world.md, npm tarballs +144%/+247% before this fix). */
+     * (see tests/real_world.md, npm tarballs +144%/+247% before this fix).
+     *
+     * Speed optimization: skip the second pass when EVERY input was
+     * unwrapped AND the unwrap candidate is comfortably smaller than the
+     * input (osz < 0.95 * total). The skip is safe because:
+     *   (a) all-unwrapped means no mixed flat+container case where one
+     *       entry's inflation drags everything else through a denser
+     *       solid stream than necessary (the silesia.mozilla shape);
+     *   (b) osz < 0.95 * total means the unwrap pipeline genuinely
+     *       compressed its input -- no documented opaque-wins case
+     *       (npm tarballs, real_hello.deb, real_coreutils.deb) lands here.
+     * For multi-file packs where unwrapped < n (silesia's 1/12 shape, the
+     * 8-file solid mode if any container is mixed in), the second pass
+     * still runs. Cuts pack time ~50% on single-input container fixtures
+     * (every container in the per-fixture sections) without changing any
+     * size headline. */
     long long osz = -1; uint64_t total = 0;
     int unwrapped = pack_run(out, n, files, 0, slow, &osz, &total);
 
-    if (unwrapped > 0) {
+    int run_opaque_pass =
+        (unwrapped > 0 &&
+         !(unwrapped == n && osz > 0 && (uint64_t)osz * 100 < total * 95));
+    if (run_opaque_pass) {
         char opq[1024];
         snprintf(opq, sizeof(opq), "%s.opq.tmp", out);
         long long opq_osz = -1; uint64_t opq_total = 0;
