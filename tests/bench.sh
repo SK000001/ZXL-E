@@ -257,6 +257,64 @@ if [ -n "$PRECOMP" ]; then
     bench_precomp "MP3 (packMP3)"         tests/corpus/synth.mp3
 fi
 
+# Competitor: zpaq 7.15 with -m5 (max effort, context-mixing). Slower per
+# fixture than precomp; gives the SOTA-ish baseline for general-purpose
+# codecs above xz-9e. Same fixture set as the precomp section.
+ZPAQ=""
+[ -x third_party/zpaq/zpaq64.exe ] && ZPAQ=third_party/zpaq/zpaq64.exe
+[ -z "$ZPAQ" ] && [ -x third_party/zpaq/zpaq.exe ] && ZPAQ=third_party/zpaq/zpaq.exe
+[ -z "$ZPAQ" ] && [ -x third_party/zpaq/zpaq ] && ZPAQ=third_party/zpaq/zpaq
+if [ -n "$ZPAQ" ]; then
+    echo
+    echo "=== Competitor: zpaq v7.15 -m5 vs zxle (size + RT) ==="
+    bench_zpaq() {
+        local label="$1" SRC="$2"
+        [ -f "$SRC" ] || return 0
+        local base; base=$(basename "$SRC")
+        local arc="tests/baseline/$base.zpaq"
+        local recdir="tests/unpacked/$base.zpaq.d"
+        rm -f "$arc"; rm -rf "$recdir"; mkdir -p "$recdir"
+        local t0 zp_ms ext_ms ZP_RT
+        t0=$EPOCHREALTIME
+        "$ZPAQ" a "$arc" "$SRC" -m5 >/dev/null 2>&1 || { echo "  $label: zpaq a failed"; return 0; }
+        zp_ms=$(elapsed_ms "$t0")
+        t0=$EPOCHREALTIME
+        "$ZPAQ" x "$arc" -to "$recdir/" >/dev/null 2>&1 || { echo "  $label: zpaq x failed"; return 0; }
+        ext_ms=$(elapsed_ms "$t0")
+        # zpaq preserves the full input path inside the archive, so extract
+        # places the file at recdir/<original-path>. find the lone file.
+        local extracted; extracted=$(find "$recdir" -type f 2>/dev/null | head -1)
+        cmp -s "$SRC" "$extracted" && ZP_RT=OK || ZP_RT=FAIL
+        local SZ ORIG XZ ZX
+        ORIG=$(stat -c%s "$SRC")
+        SZ=$(stat -c%s "$arc")
+        ZX=$(stat -c%s "tests/baseline/$base.zxle" 2>/dev/null || echo 0)
+        XZ=$(xz -9e -c "$SRC" 2>/dev/null | wc -c)
+        printf "  %s (%s):\n" "$label" "$base"
+        printf "    orig=%d  zxle=%d  zpaq-m5=%d  xz-9e=%d  rt=%s\n" "$ORIG" "$ZX" "$SZ" "$XZ" "$ZP_RT"
+        if [ "$ZX" -gt 0 ]; then
+            printf "    zpaq vs zxle: %s   zpaq vs xz-9e: %s   perf: pack=%dms restore=%dms\n" \
+                "$(awk -v a="$SZ" -v b="$ZX" 'BEGIN{printf "%+.2f%%", (a-b)*100/b}')" \
+                "$(awk -v a="$SZ" -v b="$XZ" 'BEGIN{printf "%+.2f%%", (a-b)*100/b}')" \
+                "$zp_ms" "$ext_ms"
+        fi
+        rm -f "$arc"; rm -rf "$recdir"
+    }
+    bench_zpaq "ZIP unwrap"            tests/corpus/pe-deflate.zip
+    bench_zpaq "ZIP/L6 (preflate)"     tests/corpus/pe-deflate-l6.zip
+    bench_zpaq "DOCX (real ZIP/L6)"    tests/corpus/sample.docx
+    bench_zpaq "JAR (real ZIP/L6)"     tests/corpus/sample.jar
+    bench_zpaq "gzip wrapper"          tests/corpus/ntdll.dll.gz
+    bench_zpaq "gz of mixed.tar"       tests/corpus/mixed.tar.gz
+    bench_zpaq "deb-shape ar"          tests/corpus/mixed.deb
+    bench_zpaq "JPEG (brunsli)"        tests/corpus/synth.jpg
+    # PNG fixture lives in $CORPUS (relative ../Zxl/tests/...), and zpaq's
+    # path-resolution behavior on relative paths trips the RT verifier even
+    # though the bytes match. Skip; signal would only confirm the same
+    # pattern (zpaq has no PNG-specific path).
+    bench_zpaq "MP3 (packMP3)"         tests/corpus/synth.mp3
+fi
+
 # Silesia corpus (12 files, 211 MB) — the standard general-purpose codec
 # benchmark. Gated by ZXLE_SILESIA=1 because pack time on 211 MB through
 # xz-9e single-threaded is several minutes.
@@ -302,6 +360,16 @@ if [ "${ZXLE_SILESIA:-0}" = "1" ] && [ -d tests/corpus/silesia ]; then
         t0=$EPOCHREALTIME
         SIL_ZSTD=$(zstd -19 --long=27 -q -c "$SIL_TAR" 2>/dev/null | wc -c)
         SIL_ZSTD_MS=$(elapsed_ms "$t0")
+        SIL_ZPAQ=0; SIL_ZPAQ_MS=0
+        if [ -n "$ZPAQ" ]; then
+            echo "  zpaq -m5 (a tar) -- slow context-mixing baseline"
+            ZARC="tests/baseline/silesia.zpaq"
+            rm -f "$ZARC"
+            t0=$EPOCHREALTIME
+            "$ZPAQ" a "$ZARC" "$SIL_TAR" -m5 >/dev/null 2>&1 && SIL_ZPAQ=$(stat -c%s "$ZARC") || SIL_ZPAQ=0
+            SIL_ZPAQ_MS=$(elapsed_ms "$t0")
+            rm -f "$ZARC"
+        fi
         echo
         printf "Results (vs sum of orig sizes %d B):\n" "$SIL_SUM"
         printf "  zxle solid       %12d  ratio=%s  rt=%s  pack=%dms unpack=%dms\n" \
@@ -310,10 +378,18 @@ if [ "${ZXLE_SILESIA:-0}" = "1" ] && [ -d tests/corpus/silesia ]; then
             "$SIL_XZ" "$(ratio "$SIL_XZ" "$SIL_SUM")" "$SIL_XZ_MS"
         printf "  tar + zstd-19    %12d  ratio=%s  pack=%dms\n" \
             "$SIL_ZSTD" "$(ratio "$SIL_ZSTD" "$SIL_SUM")" "$SIL_ZSTD_MS"
+        if [ "$SIL_ZPAQ" -gt 0 ]; then
+            printf "  zpaq -m5 (tar)   %12d  ratio=%s  pack=%dms\n" \
+                "$SIL_ZPAQ" "$(ratio "$SIL_ZPAQ" "$SIL_SUM")" "$SIL_ZPAQ_MS"
+        fi
         printf "  zxle vs tar+xz-9e:    %s\n" \
             "$(awk -v a="$SIL_ZX" -v b="$SIL_XZ" 'BEGIN{printf "%+.2f%%", (a-b)*100/b}')"
         printf "  zxle vs tar+zstd-19:  %s\n" \
             "$(awk -v a="$SIL_ZX" -v b="$SIL_ZSTD" 'BEGIN{printf "%+.2f%%", (a-b)*100/b}')"
+        if [ "$SIL_ZPAQ" -gt 0 ]; then
+            printf "  zxle vs zpaq -m5:     %s\n" \
+                "$(awk -v a="$SIL_ZX" -v b="$SIL_ZPAQ" 'BEGIN{printf "%+.2f%%", (a-b)*100/b}')"
+        fi
         rm -f "$SIL_TAR"
     fi
 fi
