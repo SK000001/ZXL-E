@@ -429,25 +429,80 @@ if [ "${ZXLE_SILESIA:-0}" = "1" ] && [ -d tests/corpus/silesia ]; then
             done
             rm -rf tests/baseline/silesia.slow.zxle tests/unpacked/silesia.slow.d
         fi
+        # Baselines: silesia.tar is deterministic (same 12 source files, same
+        # mtimes), so its xz / zstd / zpaq compressed sizes are pinned forever
+        # for a given codec version. Cache by sha256 prefix and recompute only
+        # when the cache is missing or the hash differs. When recomputing, run
+        # the three baselines in parallel via background subshells to halve
+        # wall time on machines with >=3 cores. Each subshell writes
+        # "size ms" to a small results file; we wait + read.
         echo
         echo "Baselines (tar + codec):"
-        echo "  tar | xz -9e --threads=1 ..."
-        t0=$EPOCHREALTIME
-        SIL_XZ=$(xz -9e --threads=1 -c "$SIL_TAR" 2>/dev/null | wc -c)
-        SIL_XZ_MS=$(elapsed_ms "$t0")
-        echo "  tar | zstd -19 --long=27 ..."
-        t0=$EPOCHREALTIME
-        SIL_ZSTD=$(zstd -19 --long=27 -q -c "$SIL_TAR" 2>/dev/null | wc -c)
-        SIL_ZSTD_MS=$(elapsed_ms "$t0")
-        SIL_ZPAQ=0; SIL_ZPAQ_MS=0
-        if [ -n "$ZPAQ" ]; then
-            echo "  zpaq -m5 (a tar) -- slow context-mixing baseline"
-            ZARC="tests/baseline/silesia.zpaq"
-            rm -f "$ZARC"
-            t0=$EPOCHREALTIME
-            "$ZPAQ" a "$ZARC" "$SIL_TAR" -m5 >/dev/null 2>&1 && SIL_ZPAQ=$(stat -c%s "$ZARC") || SIL_ZPAQ=0
-            SIL_ZPAQ_MS=$(elapsed_ms "$t0")
-            rm -f "$ZARC"
+        SIL_HASH=$(sha256sum "$SIL_TAR" 2>/dev/null | cut -c1-16)
+        SIL_CACHE=tests/baseline/silesia.cache.txt
+        SIL_CACHE_HIT=0
+        if [ -n "$SIL_HASH" ] && [ -f "$SIL_CACHE" ]; then
+            CACHE_LINE=$(cat "$SIL_CACHE")
+            CACHED_HASH=$(echo "$CACHE_LINE" | awk '{print $1}')
+            if [ "$CACHED_HASH" = "$SIL_HASH" ]; then
+                SIL_XZ=$(echo "$CACHE_LINE"     | awk '{print $2}')
+                SIL_XZ_MS=$(echo "$CACHE_LINE"  | awk '{print $3}')
+                SIL_ZSTD=$(echo "$CACHE_LINE"   | awk '{print $4}')
+                SIL_ZSTD_MS=$(echo "$CACHE_LINE"| awk '{print $5}')
+                SIL_ZPAQ=$(echo "$CACHE_LINE"   | awk '{print $6}')
+                SIL_ZPAQ_MS=$(echo "$CACHE_LINE"| awk '{print $7}')
+                SIL_CACHE_HIT=1
+                echo "  cached (sha256 prefix $SIL_HASH; rm $SIL_CACHE to force recompute)"
+            fi
+        fi
+
+        if [ "$SIL_CACHE_HIT" = "0" ]; then
+            echo "  computing in parallel: xz -9e, zstd -19, zpaq -m5..."
+            XZ_RES=tests/baseline/silesia.xz.res
+            ZSTD_RES=tests/baseline/silesia.zstd.res
+            ZPAQ_RES=tests/baseline/silesia.zpaq.res
+            rm -f "$XZ_RES" "$ZSTD_RES" "$ZPAQ_RES"
+            (
+                t0=$EPOCHREALTIME
+                SZ=$(xz -9e --threads=1 -c "$SIL_TAR" 2>/dev/null | wc -c)
+                MS=$(awk -v s="$t0" -v e="$EPOCHREALTIME" 'BEGIN{printf "%d", (e-s)*1000}')
+                echo "$SZ $MS" > "$XZ_RES"
+            ) &
+            P_XZ=$!
+            (
+                t0=$EPOCHREALTIME
+                SZ=$(zstd -19 --long=27 -q -c "$SIL_TAR" 2>/dev/null | wc -c)
+                MS=$(awk -v s="$t0" -v e="$EPOCHREALTIME" 'BEGIN{printf "%d", (e-s)*1000}')
+                echo "$SZ $MS" > "$ZSTD_RES"
+            ) &
+            P_ZSTD=$!
+            P_ZPAQ=0
+            if [ -n "$ZPAQ" ]; then
+                (
+                    ZARC="tests/baseline/silesia.zpaq"
+                    rm -f "$ZARC"
+                    t0=$EPOCHREALTIME
+                    "$ZPAQ" a "$ZARC" "$SIL_TAR" -m5 >/dev/null 2>&1 && SZ=$(stat -c%s "$ZARC") || SZ=0
+                    MS=$(awk -v s="$t0" -v e="$EPOCHREALTIME" 'BEGIN{printf "%d", (e-s)*1000}')
+                    echo "$SZ $MS" > "$ZPAQ_RES"
+                    rm -f "$ZARC"
+                ) &
+                P_ZPAQ=$!
+            fi
+            wait $P_XZ $P_ZSTD ${P_ZPAQ:+$P_ZPAQ} 2>/dev/null
+            SIL_XZ=$(awk '{print $1}' "$XZ_RES")
+            SIL_XZ_MS=$(awk '{print $2}' "$XZ_RES")
+            SIL_ZSTD=$(awk '{print $1}' "$ZSTD_RES")
+            SIL_ZSTD_MS=$(awk '{print $2}' "$ZSTD_RES")
+            SIL_ZPAQ=0; SIL_ZPAQ_MS=0
+            if [ -f "$ZPAQ_RES" ]; then
+                SIL_ZPAQ=$(awk '{print $1}' "$ZPAQ_RES")
+                SIL_ZPAQ_MS=$(awk '{print $2}' "$ZPAQ_RES")
+            fi
+            rm -f "$XZ_RES" "$ZSTD_RES" "$ZPAQ_RES"
+            if [ -n "$SIL_HASH" ] && [ "$SIL_XZ" -gt 0 ] && [ "$SIL_ZSTD" -gt 0 ]; then
+                echo "$SIL_HASH $SIL_XZ $SIL_XZ_MS $SIL_ZSTD $SIL_ZSTD_MS $SIL_ZPAQ $SIL_ZPAQ_MS" > "$SIL_CACHE"
+            fi
         fi
         echo
         printf "Results (vs sum of orig sizes %d B):\n" "$SIL_SUM"
