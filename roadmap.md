@@ -100,13 +100,43 @@ The 8-file corpus contains no containers, so M2 doesn't change these numbers vs 
 
 ---
 
-## Next session — after real-tarxz-src measurement + pack_xz tuning (2026-05-07)
+## Next session — after precomp competitor measurement (2026-05-07)
 
-The OP vocabulary is structurally complete for the gz/bz2/xz/zst container family, the encode-time hot spots in pack_zst and pack_xz are bounded, and three real-world fixtures (real_hello.deb / real_coreutils.deb / real_coreutils_src.tar.xz) cover the canonical `.tar.xz` and `.tar.zst` shapes. All three sit at the universal-codec floor (within 200 B of xz-9e). Remaining items are **measurement / quality / wider coverage**, not new container code:
+The OP vocabulary is structurally complete for the gz/bz2/xz/zst container family, encode-time hot spots in pack_zst / pack_xz are bounded, three real-world fixtures cover canonical `.tar.xz` / `.tar.zst` shapes (all at codec floor), and the first honest competitor measurement vs precomp v0.4.7 is now in the bench. The competitor data quantifies one architectural tradeoff and surfaces the next decision:
+
+- **Final-step codec choice (zstd-19 long=27 vs LZMA2)** — precomp consistently beats zxle by **−4.5% to −5.9%** on PE-binary container fixtures (ZIP/gzip/ar) because its LZMA2 final-step is denser than our zstd-19. JAR amplifies this to **−53%** on small-input shapes. zstd-19 wins **+11.9%** on DOCX (XML-heavy text); JPEG/PNG/MP3 tie within ±1% (per-stream blob already near-optimal). Two paths: (a) switch the final solid stream to xz/lzma2 — closes most of the PE gap, gives up DOCX's win, slows pack 5-10×; (b) add `--final=lzma2` flag with zstd default, document the speed/density tradeoff. Measure (b) before deciding.
+
+Remaining items are **measurement / quality / wider coverage**, not new container code:
 
 - **Multi-threaded zstd reproducibility** — confirmed 2026-05-07 on real Ubuntu coreutils.deb that the data-layer `.tar.zst` (1.4 MB) is encoded with `-T0` and falls through to OP_STORE because per-worker frame splits are non-deterministic. The 2026-05-07 multi-frame fast-fail in pack_zst now bails on those inputs in milliseconds. Headline-positive routing on multi-threaded `.tar.zst` would require a multi-frame-aware probe that recognizes worker boundaries and reproduces each frame independently. Large work, uncertain payoff — most real-world `.tar.zst .deb`s sit at the universal-codec floor anyway.
 - **Widen pack_xz reproducibility for non-preset encoders** — empirically established 2026-05-06 (Debian hello, dict=8MiB, custom mf/mode/nice/depth) and 2026-05-07 (GNU coreutils-9.11.tar.xz, dict=32MiB, ditto). The 2026-05-07 dict-driven pruning + bail correctly identifies these as unreachable in 2 probes (vs 8) but the headline still ties at floor. Real wins would require either (a) widening probe space with `mf` × `mode` × `nice` × `depth` permutations (large search, slow, uncertain payoff — likely doesn't reproduce libzstd-direct or GNU-release-script outputs anyway), or (b) reading lzma2 encoder choices from the stream itself (block-level filter parameters). Defer until validation gaps below close.
-- **Validation gaps from "Future work"** — competitor benchmarks (precomp / freearc / zpaq), size-scaling data past the 128 MiB long-window, fuzz testing of container parsers, peak-RSS reporting in bench. Of these, **competitor benches** would most directly inform whether the headline-positive container shapes (M2 ZIP, M3a preflate, M3b brunsli, M3c MP3/PNG, M3e-targz, etc.) hold up vs. precomp / zpaq on the same fixtures. **Fuzz testing** of `pack_zip` / `pack_tar` / `pack_ar` / `pack_gz` / `pack_bz2` / `pack_xz` / `pack_zst` is the highest-impact safety win before any external adoption.
+- **Validation gaps from "Future work"** — precomp now in bench; remaining: zpaq (text-heavy adversary), freearc (closer architectural peer to ZXL-E with multi-codec routing), size-scaling data past the 128 MiB long-window, fuzz testing of container parsers, peak-RSS reporting in bench. **Fuzz testing** of `pack_zip` / `pack_tar` / `pack_ar` / `pack_gz` / `pack_bz2` / `pack_xz` / `pack_zst` is the highest-impact safety win before any external adoption.
+
+### Done (kept for context): first competitor measurement — precomp v0.4.7 (shipped 2026-05-07)
+
+`third_party/precomp/precomp.exe` (gitignored under `third_party/`) auto-detected by `tests/bench.sh`; runs on 10 headline-positive fixtures with RT verification via `precomp -r` + cmp.
+
+| Fixture | zxle vs xz-9e | precomp vs xz-9e | precomp vs zxle |
+|---|---|---|---|
+| pe-deflate.zip (M2) | −15.04% | −19.37% | **−5.10%** |
+| pe-deflate-l6.zip (M3a) | −15.39% | −19.77% | **−5.17%** |
+| sample.docx | −18.64% | −8.93% | **+11.94%** |
+| sample.jar | −57.51% | −80.20% | **−53.41%** |
+| ntdll.dll.gz (M3d) | −11.45% | −15.41% | **−4.47%** |
+| mixed.tar.gz (M3e-targz) | −16.04% | −21.02% | **−5.93%** |
+| mixed.deb (M3f-ar) | −13.31% | −17.91% | **−5.30%** |
+| synth.jpg (M3b brunsli) | −27.15% | −27.65% | **−0.68%** |
+| test.png (M3c-png) | −22.06% | −22.62% | **−0.71%** |
+| synth.mp3 (M3c-mp3) | −13.05% | −12.99% | **+0.07%** |
+
+**Reading:** the +/- signs are about precomp; negative means precomp is smaller than zxle. Three buckets:
+1. **PE-binary containers (ZIP/gzip/ar):** precomp consistently denser by 4.5–5.9% — final-step codec difference (LZMA2 vs zstd-19 long=27) is the explanation. zstd-19 was chosen for speed; LZMA2 is denser on already-mixed-binary streams.
+2. **DOCX:** zxle wins by 11.94% — zstd-19 long=27 captures XML redundancy across entries better than LZMA2. The same `--long=27` window that's "wasted" on small fixtures pays off here.
+3. **Format-aware (JPEG/PNG/MP3):** ties within ±1% — both routes use brunsli / preflate / packMP3 to convert the stream to a near-optimal blob, so the final-step codec barely moves the needle.
+
+**JAR's outlier (53%):** small Java class files, each ~600 B. zstd-19 long=27 can't find redundancy across such small payloads when wrapped in our solid block (frame overhead dominates). LZMA2's tighter coupling at small block sizes wins decisively. This shape is structurally bad for our current architecture.
+
+**Implication:** the speed/density tradeoff is now empirically calibrated. Decision is whether to (a) keep zstd-19 (fast, +12% on DOCX, ~tie on format-aware, −5% on PE containers, much worse on small-input archives like JAR), or (b) add an `--lzma2` flag for the final-step alternative (slower pack, closes ~5% PE gap, gives up DOCX win). No code change yet — measure path (b) before committing.
 
 ### Done (kept for context): real GNU-release `.tar.xz` ties xz-9e + pack_xz dict-driven pruning (measured + shipped 2026-05-07)
 
