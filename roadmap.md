@@ -4,6 +4,12 @@ Single source of truth for where ZXL-E is, where it's going, and what not to ret
 
 ---
 
+## Current state (2026-05-08, M6 v1 shipped)
+
+M1 + M2 + M3a–j + ZXLE_VER 3 final-step xz-9e + M5 --slow + per-fixture min-pack tier + **M6 v1 (BCJ x86 routing)** ship end-to-end.
+
+**Headline M6 v1 result (2026-05-08):** new top-level x86 sniffer routes PE/ELF KIND_OPAQUE entries to a dedicated sub-stream finalized with `xz -9e --x86` (BCJ filter). 8-file corpus per-file ratio drops 0.3453 → **0.3383**; solid 0.3391 → **0.3326**. Now beats xz-9e baseline by **5.6%** (was 3.8%). Per-PE-DLL gains: ntdll −3.1%, kernel32 −2.2%, user32 −2.0%. ZXLE_VER bumped to 4. Manifest layout: u8 opaque_bucket per KIND_OPAQUE entry, trailing payload is multi-bucket (u8 num_buckets, per-bucket u8 codec_id + u32 csize + bytes). Container fixtures byte-identical (M6 v2 will route their inflated PE bytes too).
+
 ## Current state (2026-05-08, M5 --slow shipped)
 
 M1 + M2 + M3a–j + final-step xz-9e (ZXLE_VER 3) + **M5 --slow mode (zpaq -m5 final-step)** ship end-to-end.
@@ -150,8 +156,9 @@ Plateau reached on the existing-codec ladder: default mode beats xz-9e on every 
 
 Going *beyond* zpaq -m5 on raw text/binary (the only place we don't already win) requires either heavier codecs (paq8/cmix at 100–1000× slowdown) or new architecture. The new milestones in the Roadmap section below are framed against that:
 
-- **M6** — per-content-type codec routing within the solid stream. Concrete, +2–6% expected, no new deps. **Highest-leverage near-term work.**
-- **M7** — CPU parallelism (probe ladders + min-pack tiers in parallel; optional `--fast` for multi-threaded final codec). 2–8× pack-time speedup, zero ratio cost. Should follow M6.
+- **M6 v1** — shipped 2026-05-08. PE/ELF top-level entries route to xz+BCJ bucket. +2.0% on per-file/solid corpus, +3.1% on PE DLLs. Container fixtures unchanged (covered by v2).
+- **M6 v2** — route inflated PE/ELF bytes from ZIP/TAR/AR unwrap through the BCJ bucket. Per-OP bucket routing in recipe.c. ~3% additional gain on container fixtures with PE content. Next near-term step.
+- **M7** — CPU parallelism (probe ladders + min-pack tiers in parallel; optional `--fast` for multi-threaded final codec). 2–8× pack-time speedup, zero ratio cost.
 - **M8** — GPU / ML backend. Aspirational; only attempt after M6/M7 land.
 - **M9** — corpus-specific trained model. Deferred until a deployment target appears.
 
@@ -529,20 +536,22 @@ Pack-time: 5–10× default xz mode (Silesia 327 s vs 204 s). Unpack: similar (z
 
 ---
 
-### M6 — Per-content-type codec routing within the solid stream (planned)
+### M6 — Per-content-type codec routing within the solid stream (v1 shipped 2026-05-08)
 
-**Branch:** `feat/m6-content-route` · **Expected:** 2–6% denser on heterogeneous corpora (Silesia, mixed source / binary / image archives) at zero speed cost; potentially more if the type detector is good.
+**v1 scope shipped:** top-level KIND_OPAQUE entries are sniffed by magic-byte (PE "MZ" / ELF "7F E L F") and routed to a separate sub-stream finalized with `xz -9e --x86` (BCJ filter + LZMA2). Other content (text, mixed binary, already-compressed) goes to the main bucket with the requested codec (xz-9e or zpaq-m5 per `--slow`). Manifest gains a u8 opaque_bucket per KIND_OPAQUE entry; trailing payload is multi-bucket. ZXLE_VER bumped 3 → 4.
 
-**Motivation:** today every byte of the solid stream is fed to a single final-step codec (xz-9e or zpaq-m5). Real-world corpora are heterogeneous — Silesia has flat text (dickens, webster), database (nci), images (mr, x-ray), binaries (ooffice, sao) all in one stream. zpaq's `-method` flag accepts content-type-specific configs (`-m5` is balanced; `-mt` is tuned for text; custom configs exist for binary). xz/lzma2 has filters (BCJ/BCJ2/delta) that help PE/ELF binaries by ~5–10%. xz with delta filter is denser on audio.
+**v1 impact:**
+- ntdll.dll: 951,366 → **921,762** B (−3.1%)
+- kernel32.dll: 316,565 → **309,601** B (−2.2%)
+- user32.dll: 574,203 → **562,531** B (−2.0%)
+- 8-file corpus per-file ratio: 0.3453 → **0.3383**; solid: 0.3391 → **0.3326**
+- vs xz-9e baseline (0.3524): was −3.8% smaller → now **−5.6% smaller**
+- Container fixtures: byte-identical (their inflated bytes flow through bucket 0 by design)
 
-**Plan:**
-1. Add a small content-type sniffer over each KIND_OPAQUE entry's bytes (entropy / per-byte distribution / printable-ratio classifies into {text, binary-with-x86-code, audio-pcm, generic-binary}).
-2. Bucket the solid stream into per-type sub-streams; finalize each with a tuned codec/filter choice.
-3. Manifest gains a u8 codec-id per OPAQUE entry; decode dispatches.
-
-**Why this is our natural edge:** ZXL-E already does per-stream format-aware routing for *containers* (JPEG → brunsli, PNG → preflate, MP3 → packMP3). M6 extends the same pattern to *flat* streams. zpaq itself doesn't unwrap *or* type-route, so this stacks cleanly on top of our existing wins.
-
-**Risks:** sniffer accuracy on edge cases; per-bucket framing overhead can dominate on small inputs (gate by stream size; route buckets <X bytes through a single fallback codec).
+**v2 remaining (planned):**
+- Route inflated PE/ELF bytes from ZIP/TAR/AR unwrap through bucket 1 too. Currently inflated bytes from `pack_zip` etc. all land in bucket 0. Detecting PE/ELF magic on inflated bytes and rerouting them would let M2/M3 ZIP/TAR fixtures gain ~3% from BCJ on top of current wins. Requires per-OP bucket routing in the recipe walker, not just per-entry. Bigger refactor (~200 LoC in recipe.c + opcodes).
+- Extend sniffer beyond magic bytes: entropy + printable-ratio for text-vs-binary classification. Lets us route Silesia's `dickens`/`webster`/`samba` text to zpaq `-mt` (text-tuned config) at the same time we route ooffice/sao binaries to xz+BCJ. Modest additional gain (~1-3%) on heterogeneous flat corpora.
+- Add a third bucket: delta filter for PCM-ish data (audio, sensor logs). Niche; skip until a fixture surfaces.
 
 ### M7 — CPU parallelism / multi-threading (planned)
 
