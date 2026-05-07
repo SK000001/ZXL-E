@@ -265,39 +265,13 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
     return unwrapped_count;
 }
 
-static int do_pack(int argc, char **argv) {
-    /* Parse leading flags: --slow finalizes the solid stream with zpaq -m5
-     * (cmix-class context-mixing) instead of xz -9e. 5-10x slower on raw
-     * streams; closes the Silesia gap surfaced by the 2026-05-08 measurement. */
-    int slow = 0;
-    while (argc > 0 && argv[0][0] == '-') {
-        if (strcmp(argv[0], "--slow") == 0) { slow = 1; argc--; argv++; continue; }
-        break;
-    }
-    if (argc < 2) { fprintf(stderr, "usage: zxle pack [--slow] <out.zxle> <files...>\n"); return 1; }
-    const char *out = argv[0];
-    int n = argc - 1;
-    char **files = argv + 1;
-
-    /* min-pack: pack with container unwrap engaged, then if any entry was
-     * unwrapped, also pack as all-opaque and keep the smaller. Cures the
-     * "small tightly-deflated input inflates to bigger solid" regression
-     * (see tests/real_world.md, npm tarballs +144%/+247% before this fix).
-     *
-     * Speed optimization: skip the second pass when EVERY input was
-     * unwrapped AND the unwrap candidate is comfortably smaller than the
-     * input (osz < 0.95 * total). The skip is safe because:
-     *   (a) all-unwrapped means no mixed flat+container case where one
-     *       entry's inflation drags everything else through a denser
-     *       solid stream than necessary (the silesia.mozilla shape);
-     *   (b) osz < 0.95 * total means the unwrap pipeline genuinely
-     *       compressed its input -- no documented opaque-wins case
-     *       (npm tarballs, real_hello.deb, real_coreutils.deb) lands here.
-     * For multi-file packs where unwrapped < n (silesia's 1/12 shape, the
-     * 8-file solid mode if any container is mixed in), the second pass
-     * still runs. Cuts pack time ~50% on single-input container fixtures
-     * (every container in the per-fixture sections) without changing any
-     * size headline. */
+/* Run pack_run for a given (slow) tier with the inner min-pack opaque check.
+ * Output lands at `out`; returns the number of unwrapped entries from the
+ * primary unwrap pass (>= 0 on success). *out_osz / *out_total receive the
+ * final size and input total. The caller can then compare two tiers (slow
+ * vs default) and keep whichever produced the smaller blob. */
+static int min_pack_for_tier(const char *out, int n, char **files, int slow,
+                             long long *out_osz, uint64_t *out_total) {
     long long osz = -1; uint64_t total = 0;
     int unwrapped = pack_run(out, n, files, 0, slow, &osz, &total);
 
@@ -317,6 +291,54 @@ static int do_pack(int argc, char **argv) {
             osz = opq_osz;
         } else {
             unlink(opq);
+        }
+    }
+    if (out_osz)   *out_osz   = osz;
+    if (out_total) *out_total = total;
+    return unwrapped;
+}
+
+static int do_pack(int argc, char **argv) {
+    /* Parse leading flags: --slow finalizes the solid stream with zpaq -m5
+     * (cmix-class context-mixing) instead of xz -9e. 5-10x slower on raw
+     * streams; closes the Silesia gap surfaced by the 2026-05-08 measurement. */
+    int slow = 0;
+    while (argc > 0 && argv[0][0] == '-') {
+        if (strcmp(argv[0], "--slow") == 0) { slow = 1; argc--; argv++; continue; }
+        break;
+    }
+    if (argc < 2) { fprintf(stderr, "usage: zxle pack [--slow] <out.zxle> <files...>\n"); return 1; }
+    const char *out = argv[0];
+    int n = argc - 1;
+    char **files = argv + 1;
+
+    /* min-pack tiers:
+     *   1. Primary tier: requested slow flag (xz-9e or zpaq -m5 final).
+     *      Inside, runs unwrap + (optional) force_opaque, keeps smaller.
+     *   2. Cross-codec tier (only when --slow on small inputs): also run
+     *      default-mode and keep smaller. Closes the JAR/JPEG/MP3 +X%
+     *      --slow regression on inputs where the per-stream blob is
+     *      already at floor and zpaq's journaling-archive header overhead
+     *      dominates the per-stream context-mixing gain. Threshold 1 MB
+     *      catches all three documented cases (JAR 20 KB, JPEG 162 KB,
+     *      MP3 481 KB) without bloating large-input pack time -- on big
+     *      inputs --slow always wins so the second pack would be wasted. */
+    long long osz; uint64_t total;
+    min_pack_for_tier(out, n, files, slow, &osz, &total);
+
+    if (slow && total < (uint64_t)1024 * 1024) {
+        char def_path[1024];
+        snprintf(def_path, sizeof(def_path), "%s.def.tmp", out);
+        long long def_osz; uint64_t def_total;
+        min_pack_for_tier(def_path, n, files, 0, &def_osz, &def_total);
+        if (def_osz > 0 && def_osz < osz) {
+            fprintf(stderr, "min-pack: default %lld < slow %lld -> using default\n",
+                    def_osz, osz);
+            unlink(out);
+            if (rename(def_path, out) != 0) die("rename def->out");
+            osz = def_osz;
+        } else {
+            unlink(def_path);
         }
     }
 
