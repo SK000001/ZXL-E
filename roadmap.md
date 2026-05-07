@@ -156,7 +156,7 @@ Remaining items are **measurement / quality / wider coverage**, not new containe
 
 - **JAR small-input regression** — JAR with --slow is +6.20% vs default zxle (still −57% vs xz-9e). Caused by zpaq's journaling-archive header/dictionary overhead being a meaningful fraction of a 6 KB output. Fix would be a per-input min-pack tier: try both --slow and default, keep the smaller. Cheap if we already have both candidates from the existing min-pack double-run; just need to add a third codec axis. Defer until the JAR shape is repeated by another real-world fixture.
 
-- **Pack-time on --slow** — Silesia --slow at 327 s is 3.3× the xz baseline (101 s) and 2× zpaq alone (163 s). The 2× over zpaq alone is min-pack's double-run (unwrap + force_opaque). On non-container inputs the second pass is wasteful; gating it behind "any-entry-was-unwrapped" already does this for default mode but the cost remains for inputs where unwrap fires once. Could tighten by skipping force_opaque when the unwrap candidate is "obviously fine" (no near-zero payload after solid finalize), but the win is bounded.
+- **Pack-time on --slow** — partially closed 2026-05-08. min-pack's force_opaque pass now skips when `unwrapped == n && osz < 0.95 * total` (every input unwrapped, and unwrap shrunk meaningfully). Saves 17–53% pack time across single-input container fixtures with `--slow` (pe-deflate.zip 18.5s → 12.6s, JAR 402ms → 190ms, mixed.deb 16.6s → 12.7s, etc.). Silesia is unchanged because only 1 of 12 inputs unwraps, so the safety condition fails and both passes still run — correctly catching the mozilla-XPI inflation case. All sizes byte-identical post-tuning.
 
 ### Done (kept for context): zpaq v7.15 -m5 in bench — SOTA gap quantified (shipped 2026-05-08)
 
