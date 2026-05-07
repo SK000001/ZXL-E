@@ -118,7 +118,23 @@ Remaining items are **measurement / quality / wider coverage**, not new containe
 
 - **Multi-threaded zstd reproducibility** — confirmed 2026-05-07 on real Ubuntu coreutils.deb that the data-layer `.tar.zst` (1.4 MB) is encoded with `-T0` and falls through to OP_STORE because per-worker frame splits are non-deterministic. The 2026-05-07 multi-frame fast-fail in pack_zst now bails on those inputs in milliseconds. Headline-positive routing on multi-threaded `.tar.zst` would require a multi-frame-aware probe that recognizes worker boundaries and reproduces each frame independently. Large work, uncertain payoff — most real-world `.tar.zst .deb`s sit at the universal-codec floor anyway.
 - **Widen pack_xz reproducibility for non-preset encoders** — empirically established 2026-05-06 (Debian hello, dict=8MiB, custom mf/mode/nice/depth) and 2026-05-07 (GNU coreutils-9.11.tar.xz, dict=32MiB, ditto). The 2026-05-07 dict-driven pruning + bail correctly identifies these as unreachable in 2 probes (vs 8) but the headline still ties at floor. Real wins would require either (a) widening probe space with `mf` × `mode` × `nice` × `depth` permutations (large search, slow, uncertain payoff — likely doesn't reproduce libzstd-direct or GNU-release-script outputs anyway), or (b) reading lzma2 encoder choices from the stream itself (block-level filter parameters). Defer until validation gaps below close.
-- **Validation gaps from "Future work"** — precomp now in bench; remaining: zpaq (text-heavy adversary), freearc (closer architectural peer to ZXL-E with multi-codec routing), size-scaling data past the 128 MiB long-window, fuzz testing of container parsers, peak-RSS reporting in bench. **Fuzz testing** of `pack_zip` / `pack_tar` / `pack_ar` / `pack_gz` / `pack_bz2` / `pack_xz` / `pack_zst` is the highest-impact safety win before any external adoption.
+- **Validation gaps from "Future work"** — Silesia + precomp v0.4.7 now in bench; remaining: zpaq (text-heavy adversary, ~0.165 ratio on Silesia vs our 0.2284), freearc (closer architectural peer to ZXL-E with multi-codec routing), size-scaling data past the 128 MiB long-window, fuzz testing of container parsers, peak-RSS reporting in bench. **Fuzz testing** of `pack_zip` / `pack_tar` / `pack_ar` / `pack_gz` / `pack_bz2` / `pack_xz` / `pack_zst` is the highest-impact safety win before any external adoption. **zpaq comparison** is the most informative size-positioning signal — it would show how far we are from SOTA on text-heavy inputs (currently ~30% behind on Silesia text files).
+
+### Done (kept for context): Silesia standard corpus measurement (shipped 2026-05-07)
+
+12-file Silesia (211,938,580 B) added to bench gated behind `ZXLE_SILESIA=1`. RT-verified solid pack vs `tar | xz -9e --threads=1` and `tar | zstd -19 --long=27` baselines:
+
+| Codec | Bytes | Ratio | Pack time |
+|---|---|---|---|
+| zxle solid | 48,408,614 | **0.2284** | 215 s |
+| tar + xz-9e | 48,412,816 | 0.2284 | 102 s |
+| tar + zstd-19 | 52,598,764 | 0.2482 | 42 s |
+
+**zxle vs tar+xz-9e: −0.01%** (4 KB win on 48 MB; effective tie). vs zstd-19: **−7.97%**. Pack-time 2× xz-9e from min-pack double-run.
+
+**Reading:** on flat text/binary input (Silesia is mostly raw files), zxle lands exactly at xz-9e because the final-step codec is xz-9e and the container unwrap path doesn't trigger on raw blobs. Our headline edge comes from container unwrapping; on Silesia that edge is negligible because only `mozilla` is structurally a ZIP-like archive, and even that may lose to opaque under min-pack on a 51 MB input.
+
+**Honest positioning:** zpaq -m5's published Silesia ratio is ~0.165 (~30% smaller than xz-9e). We are not at SOTA on flat-text and will not be without a slow context-mixing or neural-residual fallback (M5 in roadmap; deferred). The "best in the world" claim does not hold on Silesia; it holds only on container-shaped artifacts where unwrap-and-recompress beats the universal-codec floor.
 
 ### Done (kept for context): first competitor measurement — precomp v0.4.7 (shipped 2026-05-07)
 
