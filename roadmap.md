@@ -4,9 +4,19 @@ Single source of truth for where ZXL-E is, where it's going, and what not to ret
 
 ---
 
-## Current state (2026-05-05, M3j store-ops shipped)
+## Current state (2026-05-07, ZXLE_VER 3 final-step xz-9e)
 
-M1 + M2 + M3a (preflate) + M3b (brunsli) + M3b-zip (JPEG-in-ZIP) + M3c-mp3 (packMP3) + M3c-png (zlib-L9 / preflate over IDAT) + M3c-png-zip (PNG-in-ZIP) + M3d-gzip (single-member gzip wrapper) + M3e-tar (ustar per-entry dispatch) + M3e-targz (gzip-wrapped tar) + M3e-tar-gz-in (gzip files inside tar) + M3f-ar (Unix archive: .a / .deb) + M3g-bz2tar (bzip2-wrapped tar) + M3h-zsttar (zstd-wrapped tar) + min-pack fallthrough + zstd frame-header probing + M3i-xztar (xz-wrapped tar) + M3j-store-ops (OP_XZ_STORE / OP_ZSTD_STORE) ship end-to-end.
+M1 + M2 + M3a (preflate) + M3b (brunsli) + M3b-zip (JPEG-in-ZIP) + M3c-mp3 (packMP3) + M3c-png (zlib-L9 / preflate over IDAT) + M3c-png-zip (PNG-in-ZIP) + M3d-gzip (single-member gzip wrapper) + M3e-tar (ustar per-entry dispatch) + M3e-targz (gzip-wrapped tar) + M3e-tar-gz-in (gzip files inside tar) + M3f-ar (Unix archive: .a / .deb) + M3g-bz2tar (bzip2-wrapped tar) + M3h-zsttar (zstd-wrapped tar) + min-pack fallthrough + zstd frame-header probing + M3i-xztar (xz-wrapped tar) + M3j-store-ops (OP_XZ_STORE / OP_ZSTD_STORE) + final-step codec swap zstd-19 → xz-9e (ZXLE_VER 3) ship end-to-end.
+
+**Headline final-step codec swap (ZXLE_VER 3, 2026-05-07):** the solid stream's compressor switched from `zstd -19 --long=27` to `xz -9e --threads=1`. Manifest layout unchanged; trailing payload is now LZMA2 instead of zstd. Triggered by the precomp v0.4.7 measurement, which showed precomp's LZMA2 final-step beating our zstd-19 by 4.5–5.9% on PE-binary container fixtures. Empirical post-swap impact on the existing corpus (no fixture changes, RT OK across all 23):
+
+- **8-file corpus**: per-file ratio 0.3673 → **0.3453**, solid 0.3608 → **0.3391**. Now beats xz-9e baseline (0.3524) directly — zxle is the *strongest* per-file/solid number on the headline corpus.
+- **Container fixtures**: every previously-positive-headline shape gained 4-7 percentage points vs xz-9e. M2 ZIP −15.04% → −20.45%; M3a preflate L6 −15.39% → −20.78%; M3b-zip JPEG-in-ZIP −15.25% → −19.85%; M3c-png-zip PNG-in-ZIP −15.73% → −22.07%; M3d gzip −11.45% → −16.69%; M3e-targz −16.04% → −21.66%; M3e gz-in-tar −9.37% → −14.68%; M3f-ar −13.31% → −18.37%; M3g-bz2tar −14.80% → −20.51%; M3h-zsttar (default-3) −15.79% → −21.44%.
+- **Previously-floor-tied fixtures now win**: mixed.tar.xz −0.00% → **−6.67%**; xz-in.tar +1.55% → **−1.41%**; zst-in.tar +0.11% → **−5.79%**. Wins because the inflated PE binaries inside compress significantly tighter under LZMA2 than zstd-19 long=27, breaking through what was previously the codec floor.
+- **vs precomp v0.4.7** (positive = zxle smaller): zxle now wins or ties on **9 of 10** competitor-bench fixtures. PE-binary containers flipped from −5% (loss) to +1% (win); test.png from −0.71% to **+14.05%** (huge); DOCX +11.94% → **+12.76%**. Only JAR (small Java classes, −51%) and JPEG (−0.7% tie) remain in precomp's column.
+- **Pack/unpack time**: comparable to slightly faster in most cases. xz-9e on ~1 MB inputs is competitive with zstd -19 --long=27, which had to set up the long-window dictionary anyway. Real-world fixtures pack faster (real_coreutils.deb 18.3 s → 14.8 s; real_coreutils_src.tar.xz 65.9 s → 46.6 s). The expected major slowdown didn't materialize.
+
+ZXLE_VER bumped 2 → 3 (manifest format unchanged; the version gate prevents v2 binaries from misreading v3 trailing payloads).
 
 **Headline M3j-store-ops result (2026-05-05):** new recipe ops `OP_XZ_STORE = 0x08` and `OP_ZSTD_STORE = 0x09` complete the in-tar/in-ar STORE family (alongside OP_GZIP_STORE 0x06 / OP_BZ2_STORE 0x07). Both wire into `pack_tar` and `pack_ar` payload-dispatch chains and decode through `unpack_recipe` calling the existing `unpack_xz` / `unpack_zst`. Detection is the same magic-byte sniff used at top level. New fixtures `xz-in.tar` (1,792,000 B, ntdll.dll.xz + kernel32.dll) and `zst-in.tar` (1,853,440 B, ntdll.dll.zst + kernel32.dll) verify wiring. Bench: xz-in.tar zxle 1,288,657 vs xz-9e 1,269,040 → +1.55%; zst-in.tar zxle 1,329,945 vs xz-9e 1,328,532 → +0.11% (effective tie). On both, min-pack correctly picks the opaque candidate over the unwrap candidate — when the inner already-compressed entry is at its codec's floor (xz-9e on a 2.5 MB PE = 951 KB; solid zstd-19 of the inflated body ≈ 1.0 MB), unwrapping pays recipe overhead without recovering the gap. Milestone value is **correctness coverage** (op vocabulary completeness), as predicted by the M3i roadmap entry. RT OK on both new fixtures and all M1–M3i fixtures preserved byte-exactly.
 
@@ -100,11 +110,9 @@ The 8-file corpus contains no containers, so M2 doesn't change these numbers vs 
 
 ---
 
-## Next session — after precomp competitor measurement (2026-05-07)
+## Next session — after final-step codec swap to xz-9e (2026-05-07)
 
-The OP vocabulary is structurally complete for the gz/bz2/xz/zst container family, encode-time hot spots in pack_zst / pack_xz are bounded, three real-world fixtures cover canonical `.tar.xz` / `.tar.zst` shapes (all at codec floor), and the first honest competitor measurement vs precomp v0.4.7 is now in the bench. The competitor data quantifies one architectural tradeoff and surfaces the next decision:
-
-- **Final-step codec choice (zstd-19 long=27 vs LZMA2)** — precomp consistently beats zxle by **−4.5% to −5.9%** on PE-binary container fixtures (ZIP/gzip/ar) because its LZMA2 final-step is denser than our zstd-19. JAR amplifies this to **−53%** on small-input shapes. zstd-19 wins **+11.9%** on DOCX (XML-heavy text); JPEG/PNG/MP3 tie within ±1% (per-stream blob already near-optimal). Two paths: (a) switch the final solid stream to xz/lzma2 — closes most of the PE gap, gives up DOCX's win, slows pack 5-10×; (b) add `--final=lzma2` flag with zstd default, document the speed/density tradeoff. Measure (b) before deciding.
+The OP vocabulary is structurally complete, encode-time hot spots are bounded, real-world `.tar.xz` / `.tar.zst` fixtures land at the universal floor, and the v3 final-step codec swap delivered a uniform +4-7 pp headline gain — zxle now beats xz-9e on the per-file corpus and wins or ties precomp on 9/10 competitor-bench fixtures. The hypothesis "switch to LZMA2" was validated empirically (no flag, no fallback); ZXLE_VER bumped to 3.
 
 Remaining items are **measurement / quality / wider coverage**, not new container code:
 
