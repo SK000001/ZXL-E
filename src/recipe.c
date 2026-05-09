@@ -9,7 +9,7 @@
 #include "xz.h"
 
 void unpack_recipe(const uint8_t *recipe, size_t rlen,
-                   const uint8_t *solid, size_t solid_len, size_t *solid_pos,
+                   Solids *s,
                    FILE *out, uint64_t expected_size,
                    const char *tmp_prefix) {
     size_t r = 0;
@@ -24,18 +24,24 @@ void unpack_recipe(const uint8_t *recipe, size_t rlen,
             r += len;
             written += len;
         } else if (op == OP_REDEFLATE) {
-            if (*solid_pos + len > solid_len) die("solid REDEFLATE overflow");
+            if (r + 1 > rlen) die("recipe REDEFLATE bucket truncated");
+            uint8_t bk = recipe[r]; r += 1;
+            if (bk >= ZXLE_NUM_BUCKETS) die("REDEFLATE bucket oob");
+            if (s->pos[bk] + len > s->len[bk]) die("solid REDEFLATE overflow");
             size_t df_len = 0;
-            uint8_t *df = raw_deflate_l9(solid + *solid_pos, len, &df_len);
+            uint8_t *df = raw_deflate_l9(s->p[bk] + s->pos[bk], len, &df_len);
             if (!df) die("raw_deflate_l9");
             if (fwrite(df, 1, df_len, out) != df_len) die("fwrite REDEFLATE");
             free(df);
-            *solid_pos += len;
+            s->pos[bk] += len;
             written += df_len;
         } else if (op == OP_STORE) {
-            if (*solid_pos + len > solid_len) die("solid STORE overflow");
-            if (fwrite(solid + *solid_pos, 1, len, out) != len) die("fwrite STORE");
-            *solid_pos += len;
+            if (r + 1 > rlen) die("recipe STORE bucket truncated");
+            uint8_t bk = recipe[r]; r += 1;
+            if (bk >= ZXLE_NUM_BUCKETS) die("STORE bucket oob");
+            if (s->pos[bk] + len > s->len[bk]) die("solid STORE overflow");
+            if (fwrite(s->p[bk] + s->pos[bk], 1, len, out) != len) die("fwrite STORE");
+            s->pos[bk] += len;
             written += len;
         } else if (op == OP_JPEG_STORE) {
             if (r + 4 > rlen) die("recipe JPEG_STORE brn_len truncated");
@@ -63,50 +69,53 @@ void unpack_recipe(const uint8_t *recipe, size_t rlen,
             if (r + 4 > rlen) die("recipe PNG_STORE recipe_len truncated");
             uint32_t prl = r32(recipe + r); r += 4;
             if (r + prl > rlen) die("recipe PNG_STORE recipe overflow");
-            unpack_png(recipe + r, prl, solid, solid_len, solid_pos, out, len);
+            unpack_png(recipe + r, prl, s, out, len);
             r += prl;
             written += len;
         } else if (op == OP_GZIP_STORE) {
             if (r + 4 > rlen) die("recipe GZIP_STORE recipe_len truncated");
             uint32_t grl = r32(recipe + r); r += 4;
             if (r + grl > rlen) die("recipe GZIP_STORE recipe overflow");
-            unpack_gz(recipe + r, grl, solid, solid_len, solid_pos, out, len, tmp_prefix);
+            unpack_gz(recipe + r, grl, s, out, len, tmp_prefix);
             r += grl;
             written += len;
         } else if (op == OP_BZ2_STORE) {
             if (r + 4 > rlen) die("recipe BZ2_STORE recipe_len truncated");
             uint32_t brl = r32(recipe + r); r += 4;
             if (r + brl > rlen) die("recipe BZ2_STORE recipe overflow");
-            unpack_bz2(recipe + r, brl, solid, solid_len, solid_pos, out, len, tmp_prefix);
+            unpack_bz2(recipe + r, brl, s, out, len, tmp_prefix);
             r += brl;
             written += len;
         } else if (op == OP_XZ_STORE) {
             if (r + 4 > rlen) die("recipe XZ_STORE recipe_len truncated");
             uint32_t xrl = r32(recipe + r); r += 4;
             if (r + xrl > rlen) die("recipe XZ_STORE recipe overflow");
-            unpack_xz(recipe + r, xrl, solid, solid_len, solid_pos, out, len, tmp_prefix);
+            unpack_xz(recipe + r, xrl, s, out, len, tmp_prefix);
             r += xrl;
             written += len;
         } else if (op == OP_ZSTD_STORE) {
             if (r + 4 > rlen) die("recipe ZSTD_STORE recipe_len truncated");
             uint32_t zrl = r32(recipe + r); r += 4;
             if (r + zrl > rlen) die("recipe ZSTD_STORE recipe overflow");
-            unpack_zst(recipe + r, zrl, solid, solid_len, solid_pos, out, len, tmp_prefix);
+            unpack_zst(recipe + r, zrl, s, out, len, tmp_prefix);
             r += zrl;
             written += len;
         } else if (op == OP_PREFLATE) {
+            if (r + 1 > rlen) die("recipe PREFLATE bucket truncated");
+            uint8_t bk = recipe[r]; r += 1;
+            if (bk >= ZXLE_NUM_BUCKETS) die("PREFLATE bucket oob");
             if (r + 4 > rlen) die("recipe PREFLATE diff_len truncated");
             uint32_t diff_len = r32(recipe + r); r += 4;
             if (r + diff_len > rlen) die("recipe PREFLATE diff overflow");
-            if (*solid_pos + len > solid_len) die("solid PREFLATE overflow");
+            if (s->pos[bk] + len > s->len[bk]) die("solid PREFLATE overflow");
             uint8_t *def = NULL; size_t def_n = 0;
-            if (!zxle_preflate_join(solid + *solid_pos, len,
+            if (!zxle_preflate_join(s->p[bk] + s->pos[bk], len,
                                     recipe + r, diff_len,
                                     &def, &def_n)) die("preflate_reencode");
             if (fwrite(def, 1, def_n, out) != def_n) die("fwrite PREFLATE");
             zxle_preflate_free(def);
             r += diff_len;
-            *solid_pos += len;
+            s->pos[bk] += len;
             written += def_n;
         } else {
             die("unknown recipe op");

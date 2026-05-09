@@ -3,9 +3,10 @@
 
 #include "util.h"
 
-int  pack_bz2  (const uint8_t *p, size_t n, const char *tmp_prefix, Buf *recipe, Buf *solid);
+int  pack_bz2  (const uint8_t *p, size_t n, const char *tmp_prefix,
+                Buf *recipe, Buf *b0, Buf *b1, uint8_t bucket);
 void unpack_bz2(const uint8_t *recipe, size_t rlen,
-                const uint8_t *solid, size_t solid_len, size_t *solid_pos,
+                Solids *s,
                 FILE *out, uint64_t expected_size, const char *tmp_prefix);
 
 #endif

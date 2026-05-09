@@ -94,6 +94,7 @@ int pack_png(const uint8_t *p, size_t n, Buf *recipe, Buf *solid) {
     buf_append(recipe, idat_sizes.p, idat_sizes.n);
     buf_u8(recipe, (uint8_t)mode);
     buf_u32(recipe, (uint32_t)raw_n);
+    buf_u8(recipe, 0);  /* PNG inflated bytes always go to bucket 0 */
     buf_u32(recipe, (uint32_t)zlib_concat.n);
     if (mode == 1) {
         buf_append(recipe, zhdr, 2);
@@ -118,7 +119,7 @@ int pack_png(const uint8_t *p, size_t n, Buf *recipe, Buf *solid) {
 }
 
 void unpack_png(const uint8_t *recipe, size_t rlen,
-                const uint8_t *solid, size_t solid_len, size_t *solid_pos,
+                Solids *s,
                 FILE *out, uint64_t expected_size) {
     size_t r = 0;
     if (r + 4 > rlen) die("png recipe truncated");
@@ -129,9 +130,11 @@ void unpack_png(const uint8_t *recipe, size_t rlen,
     uint32_t idat_count = r32(recipe + r); r += 4;
     if (idat_count == 0 || r + (size_t)idat_count * 4 > rlen) die("png idat sizes overflow");
     const uint8_t *idat_sizes = recipe + r; r += (size_t)idat_count * 4;
-    if (r + 1 + 4 + 4 > rlen) die("png header truncated");
+    if (r + 1 + 4 + 1 + 4 > rlen) die("png header truncated");
     uint8_t mode = recipe[r]; r += 1;
     uint32_t raw_len = r32(recipe + r); r += 4;
+    uint8_t bucket = recipe[r]; r += 1;
+    if (bucket >= ZXLE_NUM_BUCKETS) die("png bucket oob");
     uint32_t zlib_total = r32(recipe + r); r += 4;
     uint8_t zhdr[2] = {0,0}, adler[4] = {0,0,0,0};
     const uint8_t *diff = NULL; uint32_t diff_len = 0;
@@ -149,8 +152,8 @@ void unpack_png(const uint8_t *recipe, size_t rlen,
     const uint8_t *post = recipe + r; r += post_len;
     if (r != rlen) die("png recipe trailing bytes");
 
-    if (*solid_pos + raw_len > solid_len) die("png solid overflow");
-    const uint8_t *raw = solid + *solid_pos;
+    if (s->pos[bucket] + raw_len > s->len[bucket]) die("png solid overflow");
+    const uint8_t *raw = s->p[bucket] + s->pos[bucket];
 
     uint8_t *zlib_buf = NULL;
     size_t zlib_n = 0;
@@ -194,7 +197,7 @@ void unpack_png(const uint8_t *recipe, size_t rlen,
     if (post_len > 0 && fwrite(post, 1, post_len, out) != post_len) die("fwrite png post");
 
     free(zlib_buf);
-    *solid_pos += raw_len;
+    s->pos[bucket] += raw_len;
     uint64_t written = (uint64_t)pre_len + (uint64_t)idat_count * 12 + zlib_n + post_len;
     if (written != expected_size) die("png size mismatch");
 }

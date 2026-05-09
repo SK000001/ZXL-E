@@ -20,6 +20,7 @@ int zip_parse(const uint8_t *p, size_t n,
               size_t *out_cd_off, size_t *out_cd_len,
               size_t *out_eocd_off, size_t *out_eocd_len);
 
-int pack_zip(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *recipe, Buf *solid);
+int pack_zip(const uint8_t *p, size_t n, const char *tmp_prefix,
+             Buf *recipe, Buf *b0, Buf *b1);
 
 #endif

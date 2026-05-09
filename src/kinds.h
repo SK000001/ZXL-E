@@ -19,8 +19,17 @@
  * kinds. Each of KIND_ZIP/TAR/AR/GZIP/BZIP2/ZSTD/XZ entries now stores a
  * u8 unwrap_bucket after the kind byte (and BEFORE the recipe length),
  * so a PE-heavy ZIP/TAR/AR/wrapped stream routes its inflated bytes
- * through bucket 1 (xz+BCJ). v3/v4/v5 cannot interoperate. */
-#define ZXLE_VER 5
+ * through bucket 1 (xz+BCJ).
+ * v6 (2026-05-09): M6 v3 per-OP bucket routing. Manifest u8 unwrap_bucket
+ * dropped (now redundant -- recipes carry per-OP buckets). Each recipe op
+ * that consumes solid bytes carries a u8 bucket field after its existing
+ * length field: OP_STORE/OP_REDEFLATE/OP_PREFLATE all gain (u8 bucket) at
+ * the position immediately following (u32 raw_size). PNG/GZIP/BZIP2/XZ/
+ * ZSTD recipes gain a u8 bucket field that selects which bucket the
+ * inflated body bytes come from when inner_kind==0; ignored when
+ * inner_kind==1 (the inner recipe's per-OP buckets handle routing).
+ * v3/v4/v5/v6 cannot interoperate. */
+#define ZXLE_VER 6
 
 /* Top-level container kind tag (one byte per manifest entry). */
 #define KIND_OPAQUE 0
@@ -40,13 +49,14 @@
  * also use this vocabulary when inner_kind=1).
  *
  *   0x00 STRUCT     -- (u32 len)(len bytes verbatim) headers / EOCD / pad
- *   0x01 REDEFLATE  -- (u32 raw_size) consume raw_size bytes from solid,
- *                      raw-deflate L9 default-strategy, emit deflate stream.
- *   0x02 STORE      -- (u32 raw_size) consume raw_size bytes from solid,
- *                      emit verbatim.
- *   0x03 PREFLATE   -- (u32 raw_size)(u32 diff_len)(diff_bytes); consume
- *                      raw_size bytes from solid, preflate-rejoin to
- *                      reproduce the original deflate stream byte-identically.
+ *   0x01 REDEFLATE  -- (u32 raw_size)(u8 bucket); consume raw_size bytes from
+ *                      solid bucket, raw-deflate L9 default-strategy, emit.
+ *   0x02 STORE      -- (u32 raw_size)(u8 bucket); consume raw_size bytes from
+ *                      solid bucket, emit verbatim.
+ *   0x03 PREFLATE   -- (u32 raw_size)(u8 bucket)(u32 diff_len)(diff_bytes);
+ *                      consume raw_size bytes from solid bucket, preflate-
+ *                      rejoin to reproduce the original deflate stream
+ *                      byte-identically.
  *   0x04 JPEG_STORE -- (u32 brn_len)(brn_bytes); brunsli-decode brn to `len`
  *                      JPEG bytes, write to output. Solid not consumed.
  *   0x05 PNG_STORE  -- (u32 png_recipe_len)(png_recipe_bytes); call unpack_png
@@ -78,6 +88,7 @@
  *   u32 idat_data_size[idat_count]
  *   u8  zlib_mode                  -- 0 = zlib L9 redeflate matches; 1 = preflate
  *   u32 raw_len                    -- inflated IDAT size (consumed from solid)
+ *   u8  bucket                     -- v6: which solid bucket the raw bytes are in
  *   u32 zlib_total                 -- total length of original zlib stream
  *   [if zlib_mode==1] u8 zhdr[2] u8 adler[4] u32 diff_len diff_bytes
  *   u32 post_len  post_bytes       -- chunks after the last IDAT (incl. IEND)
@@ -90,25 +101,32 @@
  *   [if mode==1] u32 diff_len  diff_bytes
  *   u8  trailer[8]                -- CRC32 LE + ISIZE LE, verbatim
  *   u8  inner_kind                -- 0 = inflated bytes consumed verbatim; 1 = nested ustar tar
+ *   u8  bucket                    -- v6: which solid bucket; only used when inner_kind==0
  *   [if inner_kind==1] u32 tar_recipe_len  tar_recipe_bytes
  *
  * KIND_BZIP2 (8):
  *   u8  block_size                -- '1'..'9'
  *   u32 raw_len   u32 orig_len
- *   u8  inner_kind  [if 1: u32 tar_recipe_len  tar_recipe_bytes]
+ *   u8  inner_kind
+ *   u8  bucket                    -- v6: only used when inner_kind==0
+ *   [if 1: u32 tar_recipe_len  tar_recipe_bytes]
  *
  * KIND_ZSTD (9):
  *   u8  level                     -- 1..22
  *   u8  long_window               -- 0 = no --long; else window log
  *   u8  flags                     -- 0x01 use_stdin (FCS suppressed); 0x02 no_check
  *   u32 raw_len   u32 orig_len
- *   u8  inner_kind  [if 1: u32 tar_recipe_len  tar_recipe_bytes]
+ *   u8  inner_kind
+ *   u8  bucket                    -- v6: only used when inner_kind==0
+ *   [if 1: u32 tar_recipe_len  tar_recipe_bytes]
  *
  * KIND_XZ (10):
  *   u8  level                     -- 0..9
  *   u8  flags                     -- 0x01 = --extreme (xz -<level>e)
  *   u32 raw_len   u32 orig_len
- *   u8  inner_kind  [if 1: u32 tar_recipe_len  tar_recipe_bytes]
+ *   u8  inner_kind
+ *   u8  bucket                    -- v6: only used when inner_kind==0
+ *   [if 1: u32 tar_recipe_len  tar_recipe_bytes]
  */
 
 #endif

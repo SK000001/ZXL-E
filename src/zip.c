@@ -99,7 +99,8 @@ int zip_parse(const uint8_t *p, size_t n,
     return 0;
 }
 
-int pack_zip(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *recipe, Buf *solid) {
+int pack_zip(const uint8_t *p, size_t n, const char *tmp_prefix,
+             Buf *recipe, Buf *b0, Buf *b1) {
     ZipEntry *ents = NULL;
     uint32_t count = 0;
     size_t cd_off = 0, cd_len = 0, eocd_off = 0, eocd_len = 0;
@@ -126,7 +127,7 @@ int pack_zip(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *recipe, Bu
             if (!handled && e->raw_size >= 8 &&
                 memcmp(p + e->payload_off, PNG_SIG, 8) == 0) {
                 Buf png_recipe; buf_init(&png_recipe);
-                if (pack_png(p + e->payload_off, e->raw_size, &png_recipe, solid) == 0) {
+                if (pack_png(p + e->payload_off, e->raw_size, &png_recipe, b0) == 0) {
                     buf_u8(recipe, OP_PNG_STORE);
                     buf_u32(recipe, e->raw_size);
                     buf_u32(recipe, (uint32_t)png_recipe.n);
@@ -154,9 +155,11 @@ int pack_zip(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *recipe, Bu
                 buf_free(&brn);
             }
             if (!handled) {
+                uint8_t bk = bucket_for_bytes(p + e->payload_off, e->raw_size);
                 buf_u8(recipe, OP_STORE);
                 buf_u32(recipe, e->raw_size);
-                buf_append(solid, p + e->payload_off, e->raw_size);
+                buf_u8(recipe, bk);
+                buf_append(bk == 1 ? b1 : b0, p + e->payload_off, e->raw_size);
                 stored_method++;
             }
         } else {
@@ -167,12 +170,14 @@ int pack_zip(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *recipe, Bu
                 buf_append(recipe, p + e->payload_off, e->comp_size);
                 store_orig++;
             } else {
+                uint8_t bk = bucket_for_bytes(raw, e->raw_size);
                 size_t redef_len = 0;
                 uint8_t *redef = raw_deflate_l9(raw, e->raw_size, &redef_len);
                 if (redef && redef_len == e->comp_size && memcmp(redef, p + e->payload_off, e->comp_size) == 0) {
                     buf_u8(recipe, OP_REDEFLATE);
                     buf_u32(recipe, e->raw_size);
-                    buf_append(solid, raw, e->raw_size);
+                    buf_u8(recipe, bk);
+                    buf_append(bk == 1 ? b1 : b0, raw, e->raw_size);
                     redeflated++;
                     free(redef);
                     free(raw);
@@ -190,9 +195,10 @@ int pack_zip(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *recipe, Bu
                             memcmp(rejoin, p + e->payload_off, e->comp_size) == 0) {
                             buf_u8(recipe, OP_PREFLATE);
                             buf_u32(recipe, e->raw_size);
+                            buf_u8(recipe, bk);
                             buf_u32(recipe, (uint32_t)diff_n);
                             buf_append(recipe, diff, diff_n);
-                            buf_append(solid, unp, e->raw_size);
+                            buf_append(bk == 1 ? b1 : b0, unp, e->raw_size);
                             preflated++;
                             pf_ok = 1;
                         }

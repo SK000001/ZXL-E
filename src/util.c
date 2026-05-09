@@ -54,6 +54,14 @@ void buf_u32(Buf *b, uint32_t v) {
     buf_append(b, t, 4);
 }
 
+uint8_t bucket_for_bytes(const uint8_t *p, size_t n) {
+    if (n < 4) return 0;
+    if (p[0] == 0x4D && p[1] == 0x5A) return 1;                  /* PE: "MZ" */
+    if (p[0] == 0x7F && p[1] == 0x45 && p[2] == 0x4C && p[3] == 0x46)
+        return 1;                                                /* ELF */
+    return 0;
+}
+
 uint8_t *read_whole_file(const char *path, size_t *out_len) {
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "fopen %s\n", path); die("fopen"); }

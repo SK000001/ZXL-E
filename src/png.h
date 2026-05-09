@@ -5,9 +5,10 @@
 
 extern const uint8_t PNG_SIG[8];
 
+/* PNG inflated pixel bytes always go to bucket 0 (raw image data, not x86). */
 int  pack_png  (const uint8_t *p, size_t n, Buf *recipe, Buf *solid);
 void unpack_png(const uint8_t *recipe, size_t rlen,
-                const uint8_t *solid, size_t solid_len, size_t *solid_pos,
+                Solids *s,
                 FILE *out, uint64_t expected_size);
 
 #endif

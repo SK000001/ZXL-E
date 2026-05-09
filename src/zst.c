@@ -1,8 +1,10 @@
 #include "zst.h"
+#include "kinds.h"
 #include "tar.h"
 #include "recipe.h"
 
-int pack_zst(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *recipe, Buf *solid) {
+int pack_zst(const uint8_t *p, size_t n, const char *tmp_prefix,
+             Buf *recipe, Buf *b0, Buf *b1, uint8_t bucket) {
     if (n < 8) return -1;
     if (p[0] != 0x28 || p[1] != 0xB5 || p[2] != 0x2F || p[3] != 0xFD) return -1;
     if (n > 0xFFFFFFFFu) return -1;
@@ -116,18 +118,23 @@ int pack_zst(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *recipe, Bu
     if (!has_fcs)      flags |= 0x01;
     if (!has_checksum) flags |= 0x02;
 
+    bucket = bucket_for_bytes(raw, raw_n);
+    Buf *body_buf = (bucket == 1) ? b1 : b0;
+
     int inner_kind = 0;
     Buf tar_recipe; buf_init(&tar_recipe);
-    Buf tar_solid;  buf_init(&tar_solid);
+    Buf tar_b0; buf_init(&tar_b0);
+    Buf tar_b1; buf_init(&tar_b1);
     if (raw_n >= 1024 && raw_n % 512 == 0 &&
         memcmp(raw + 257, "ustar", 5) == 0) {
         char tp[1024];
         snprintf(tp, sizeof(tp), "%s.zsttar", tmp_prefix);
-        if (pack_tar(raw, raw_n, tp, &tar_recipe, &tar_solid) == 0) {
+        if (pack_tar(raw, raw_n, tp, &tar_recipe, &tar_b0, &tar_b1) == 0) {
             inner_kind = 1;
         } else {
             buf_free(&tar_recipe); buf_init(&tar_recipe);
-            buf_free(&tar_solid);  buf_init(&tar_solid);
+            buf_free(&tar_b0); buf_init(&tar_b0);
+            buf_free(&tar_b1); buf_init(&tar_b1);
         }
     }
 
@@ -137,38 +144,44 @@ int pack_zst(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *recipe, Bu
     buf_u32(recipe, (uint32_t)raw_n);
     buf_u32(recipe, (uint32_t)n);
     buf_u8(recipe, (uint8_t)inner_kind);
+    buf_u8(recipe, bucket);
     if (inner_kind == 1) {
         buf_u32(recipe, (uint32_t)tar_recipe.n);
         buf_append(recipe, tar_recipe.p, tar_recipe.n);
-        buf_append(solid, tar_solid.p, tar_solid.n);
+        buf_append(b0, tar_b0.p, tar_b0.n);
+        buf_append(b1, tar_b1.p, tar_b1.n);
     } else {
-        buf_append(solid, raw, raw_n);
+        buf_append(body_buf, raw, raw_n);
     }
 
-    fprintf(stderr, "    zst: orig=%zu raw=%zu level=%u long=%u io=%s check=%s%s\n",
+    fprintf(stderr, "    zst: orig=%zu raw=%zu level=%u long=%u io=%s check=%s%s b=%u\n",
             n, raw_n, level, window,
             (flags & 0x01) ? "stdin" : "file",
             (flags & 0x02) ? "off" : "on",
-            inner_kind == 1 ? " inner=tar" : "");
+            inner_kind == 1 ? " inner=tar" : "",
+            (unsigned)bucket);
 
     free(raw);
     unlink(raw_path);
     buf_free(&tar_recipe);
-    buf_free(&tar_solid);
+    buf_free(&tar_b0);
+    buf_free(&tar_b1);
     return 0;
 }
 
 void unpack_zst(const uint8_t *recipe, size_t rlen,
-                const uint8_t *solid, size_t solid_len, size_t *solid_pos,
+                Solids *s,
                 FILE *out, uint64_t expected_size, const char *tmp_prefix) {
     size_t r = 0;
-    if (r + 1 + 1 + 1 + 4 + 4 + 1 > rlen) die("zst recipe truncated");
+    if (r + 1 + 1 + 1 + 4 + 4 + 1 + 1 > rlen) die("zst recipe truncated");
     uint8_t level      = recipe[r]; r += 1;
     uint8_t window     = recipe[r]; r += 1;
     uint8_t flags      = recipe[r]; r += 1;
     uint32_t raw_len   = r32(recipe + r); r += 4;
     uint32_t orig_len  = r32(recipe + r); r += 4;
     uint8_t inner_kind = recipe[r]; r += 1;
+    uint8_t bucket     = recipe[r]; r += 1;
+    if (bucket >= ZXLE_NUM_BUCKETS) die("zst bucket oob");
     if (level < 1 || level > 22) die("zst level out of range");
     const uint8_t *tar_recipe = NULL; uint32_t tar_recipe_len = 0;
     if (inner_kind == 1) {
@@ -186,15 +199,13 @@ void unpack_zst(const uint8_t *recipe, size_t rlen,
     FILE *rf = fopen(raw_path, "wb");
     if (!rf) die("fopen zst raw tmp");
     if (inner_kind == 0) {
-        if (*solid_pos + raw_len > solid_len) die("zst solid overflow");
-        if (raw_len > 0 && fwrite(solid + *solid_pos, 1, raw_len, rf) != raw_len)
+        if (s->pos[bucket] + raw_len > s->len[bucket]) die("zst solid overflow");
+        if (raw_len > 0 && fwrite(s->p[bucket] + s->pos[bucket], 1, raw_len, rf) != raw_len)
             die("fwrite zst raw");
-        *solid_pos += raw_len;
+        s->pos[bucket] += raw_len;
         fclose(rf);
     } else {
-        unpack_recipe(tar_recipe, tar_recipe_len,
-                      solid, solid_len, solid_pos,
-                      rf, raw_len, raw_path);
+        unpack_recipe(tar_recipe, tar_recipe_len, s, rf, raw_len, raw_path);
         fclose(rf);
     }
 

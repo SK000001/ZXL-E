@@ -48,4 +48,21 @@ void buf_append(Buf *b, const void *d, size_t n);
 void buf_u8(Buf *b, uint8_t v);
 void buf_u32(Buf *b, uint32_t v);
 
+/* M6 v3: solid stream is split across N buckets (currently 2: bucket 0 main,
+ * bucket 1 x86/BCJ). On decode side, Solids carries the decompressed bytes
+ * and a per-bucket cursor; recipe ops carry a u8 bucket byte that selects
+ * which one to consume from. */
+#define ZXLE_NUM_BUCKETS 2
+typedef struct {
+    const uint8_t *p[ZXLE_NUM_BUCKETS];
+    size_t         len[ZXLE_NUM_BUCKETS];
+    size_t         pos[ZXLE_NUM_BUCKETS];
+} Solids;
+
+/* M6 v3: classify a payload into a solid bucket by its first few magic bytes.
+ *   0 = main bucket  (text, mixed binary, already-compressed, etc.)
+ *   1 = x86 bucket   (PE / ELF -- benefits from xz BCJ filter)
+ * False positives still round-trip (BCJ is reversible) but lose a small ratio. */
+uint8_t bucket_for_bytes(const uint8_t *p, size_t n);
+
 #endif

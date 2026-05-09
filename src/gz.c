@@ -1,11 +1,13 @@
 #include "gz.h"
+#include "kinds.h"
 #include "deflate.h"
 #include "preflate_shim.h"
 #include "tar.h"
 #include "recipe.h"
 #include <zlib.h>
 
-int pack_gz(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *recipe, Buf *solid) {
+int pack_gz(const uint8_t *p, size_t n, const char *tmp_prefix,
+            Buf *recipe, Buf *b0, Buf *b1, uint8_t bucket) {
     if (n < 18) return -1;
     if (p[0] != 0x1F || p[1] != 0x8B || p[2] != 0x08) return -1;
     uint8_t flg = p[3];
@@ -80,18 +82,25 @@ int pack_gz(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *recipe, Buf
         free(raw); buf_free(&preflate_diff); return -1;
     }
 
+    /* Sniff the inflated body for PE/ELF magic to pick a bucket. Caller's
+     * `bucket` arg is a hint, but our sniff on `raw` is authoritative. */
+    bucket = bucket_for_bytes(raw, raw_n);
+    Buf *body_buf = (bucket == 1) ? b1 : b0;
+
     int inner_kind = 0;
     Buf tar_recipe; buf_init(&tar_recipe);
-    Buf tar_solid;  buf_init(&tar_solid);
+    Buf tar_b0; buf_init(&tar_b0);
+    Buf tar_b1; buf_init(&tar_b1);
     if (raw_n >= 1024 && raw_n % 512 == 0 &&
         memcmp(raw + 257, "ustar", 5) == 0) {
         char tp[1024];
         snprintf(tp, sizeof(tp), "%s.gztar", tmp_prefix);
-        if (pack_tar(raw, raw_n, tp, &tar_recipe, &tar_solid) == 0) {
+        if (pack_tar(raw, raw_n, tp, &tar_recipe, &tar_b0, &tar_b1) == 0) {
             inner_kind = 1;
         } else {
             buf_free(&tar_recipe); buf_init(&tar_recipe);
-            buf_free(&tar_solid);  buf_init(&tar_solid);
+            buf_free(&tar_b0); buf_init(&tar_b0);
+            buf_free(&tar_b1); buf_init(&tar_b1);
         }
     }
 
@@ -106,28 +115,32 @@ int pack_gz(const uint8_t *p, size_t n, const char *tmp_prefix, Buf *recipe, Buf
     }
     buf_append(recipe, trailer, 8);
     buf_u8(recipe, (uint8_t)inner_kind);
+    buf_u8(recipe, bucket);
     if (inner_kind == 1) {
         buf_u32(recipe, (uint32_t)tar_recipe.n);
         buf_append(recipe, tar_recipe.p, tar_recipe.n);
-        buf_append(solid, tar_solid.p, tar_solid.n);
+        buf_append(b0, tar_b0.p, tar_b0.n);
+        buf_append(b1, tar_b1.p, tar_b1.n);
     } else {
-        buf_append(solid, raw, raw_n);
+        buf_append(body_buf, raw, raw_n);
     }
 
-    fprintf(stderr, "    gz: hdr=%zu def=%zu raw=%zu mode=%d%s%s\n",
+    fprintf(stderr, "    gz: hdr=%zu def=%zu raw=%zu mode=%d%s%s b=%u\n",
             hdr, def_n, raw_n, mode,
             mode == 1 ? " (preflate)" : " (l9)",
-            inner_kind == 1 ? " inner=tar" : "");
+            inner_kind == 1 ? " inner=tar" : "",
+            (unsigned)bucket);
 
     free(raw);
     buf_free(&preflate_diff);
     buf_free(&tar_recipe);
-    buf_free(&tar_solid);
+    buf_free(&tar_b0);
+    buf_free(&tar_b1);
     return 0;
 }
 
 void unpack_gz(const uint8_t *recipe, size_t rlen,
-               const uint8_t *solid, size_t solid_len, size_t *solid_pos,
+               Solids *s,
                FILE *out, uint64_t expected_size, const char *tmp_prefix) {
     size_t r = 0;
     if (r + 4 > rlen) die("gz recipe truncated");
@@ -147,8 +160,10 @@ void unpack_gz(const uint8_t *recipe, size_t rlen,
     }
     if (r + 8 > rlen) die("gz trailer truncated");
     const uint8_t *trailer = recipe + r; r += 8;
-    if (r + 1 > rlen) die("gz inner_kind truncated");
+    if (r + 1 + 1 > rlen) die("gz inner_kind/bucket truncated");
     uint8_t inner_kind = recipe[r]; r += 1;
+    uint8_t bucket = recipe[r]; r += 1;
+    if (bucket >= ZXLE_NUM_BUCKETS) die("gz bucket oob");
     const uint8_t *tar_recipe = NULL; uint32_t tar_recipe_len = 0;
     if (inner_kind == 1) {
         if (r + 4 > rlen) die("gz tar recipe len truncated");
@@ -161,17 +176,15 @@ void unpack_gz(const uint8_t *recipe, size_t rlen,
     uint8_t *raw_buf = NULL;
     const uint8_t *raw = NULL;
     if (inner_kind == 0) {
-        if (*solid_pos + raw_len > solid_len) die("gz solid overflow");
-        raw = solid + *solid_pos;
-        *solid_pos += raw_len;
+        if (s->pos[bucket] + raw_len > s->len[bucket]) die("gz solid overflow");
+        raw = s->p[bucket] + s->pos[bucket];
+        s->pos[bucket] += raw_len;
     } else {
         char tp[2048];
         snprintf(tp, sizeof(tp), "%s.gztar.tmp", tmp_prefix);
         FILE *tf = fopen(tp, "wb");
         if (!tf) die("fopen gz tar tmp");
-        unpack_recipe(tar_recipe, tar_recipe_len,
-                      solid, solid_len, solid_pos,
-                      tf, raw_len, tp);
+        unpack_recipe(tar_recipe, tar_recipe_len, s, tf, raw_len, tp);
         fclose(tf);
         size_t got_n = 0;
         raw_buf = read_whole_file(tp, &got_n);
