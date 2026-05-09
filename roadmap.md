@@ -181,7 +181,7 @@ The 8-file corpus contains no containers, so M2 doesn't change these numbers vs 
 
 ---
 
-## Next session — push past zpaq-m5 efficient frontier (planned 2026-05-08)
+## Next session — push past zpaq-m5 efficient frontier (planned 2026-05-08, partially executed through 2026-05-09)
 
 Plateau reached on the existing-codec ladder: default mode beats xz-9e on every container fixture and ties it on flat input; `--slow` mode matches zpaq -m5 on Silesia and stacks the unwrap-path gain on top. `--slow` is now strict pareto over default (per-fixture min-pack tier shipped 2026-05-08). Three documented small-input regressions closed.
 
@@ -406,7 +406,7 @@ Most of these are not novel research problems — they're engineering items that
 - **Fuzz coverage is shallow.** `tests/fuzz.sh` (shipped 2026-05-09) does ~50 random mutations × 7 kinds; found 1 bug (`raw_inflate_dyn` truncated-stream hang). A structured AFL/libFuzzer pass on each `pack_*` with format-aware corpora would surface deeper issues.
 - **No corruption-tolerance story.** zstd-19 solid + format-aware recipes mean a single corrupted byte in the payload likely loses everything. Document the failure mode; consider whether per-entry framing is worth adding (probably not — it costs ratio).
 - **No streaming pack/unpack.** Whole-file `read_whole_file` everywhere. Fine for ≤1 GB; falls over above. Defer until a real workload demands it.
-- **Manifest format frozen at v2 since M2.** No version-skew testing; no migration story. Document the format more thoroughly in `roadmap.md` if external tools ever consume `.zxle`.
+- **Manifest format unstable.** ZXLE_VER bumped 2 → 3 (M5/codec swap) → 4 (M6 v1) → 5 (M6 v2) → 6 (M6 v3) in three days. No version-skew testing; no migration path. Cross-version interop will only matter if external tools consume `.zxle`; the current source-of-truth doc is the `kinds.h` header comment.
 
 ### Architecture-level open questions
 
@@ -418,12 +418,13 @@ Most of these are not novel research problems — they're engineering items that
 
 ## Architecture
 
-Four-stage pipeline, each stage known in isolation; integrated product is the novel contribution.
+Five-stage pipeline as actually shipped (the original M4 content-defined ordering and M5 neural-residual fallback are parked; M5 was repurposed for the `--slow` zpaq-m5 final step).
 
-1. **Recursive container unwrap** — peel ZIP/tar/7z/MSI/PE/MP4/etc. to raw streams + byte-identical-rebuild recipe.
-2. **Per-stream format-aware recompression** — route each stream to its strongest known recompressor.
-3. **Cross-stream solid mode with content-defined ordering** — cluster similar streams adjacent.
-4. **Neural-residual fallback** — small autoregressive predictor on whatever's left.
+1. **Recursive container unwrap** — peel ZIP / tar / ar / .deb / gzip / bzip2 / zstd / xz down to raw streams plus a byte-identical-rebuild recipe (M2 / M3a–j).
+2. **Per-stream format-aware recompression** — DEFLATE → preflate (or zlib-L9 redeflate fast path), JPEG → brunsli, PNG IDAT → preflate over inflated pixels, MP3 → packMP3.
+3. **Per-OP content-aware bucket routing** (M6 v3) — each recipe op carries a u8 bucket; PE/ELF bytes route to the BCJ sub-stream, everything else to the main bucket. Mixed-content containers split per-entry.
+4. **Cross-stream solid mode** — main bucket finalized with `xz -9e` (default) or `zpaq -m5` (`--slow`); BCJ bucket always finalized with `xz -9e --x86`.
+5. **min-pack fallthrough** — every pack runs both the unwrap path and an all-opaque path; the smaller wins. With `--slow` on small inputs, also runs the default-tier candidate and keeps the smaller, so `--slow` is strict pareto over default.
 
 ---
 
@@ -591,7 +592,7 @@ Pack-time: 5–10× default xz mode (Silesia 327 s vs 204 s). Unpack: similar (z
 
 ---
 
-### M6 — Per-content-type codec routing within the solid stream (v1 shipped 2026-05-08)
+### M6 — Per-content-type codec routing within the solid stream (v1+v2 shipped 2026-05-08, v3 shipped 2026-05-09)
 
 **v1 scope shipped:** top-level KIND_OPAQUE entries are sniffed by magic-byte (PE "MZ" / ELF "7F E L F") and routed to a separate sub-stream finalized with `xz -9e --x86` (BCJ filter + LZMA2). Other content (text, mixed binary, already-compressed) goes to the main bucket with the requested codec (xz-9e or zpaq-m5 per `--slow`). Manifest gains a u8 opaque_bucket per KIND_OPAQUE entry; trailing payload is multi-bucket. ZXLE_VER bumped 3 → 4.
 
@@ -625,11 +626,25 @@ Headline impact (default mode):
 
 Mixed-content tarballs (mixed.tar.gz, mixed.deb, mixed.tar.bz2 etc.) unchanged — wrapper sniff routes them to bucket 1 (PE majority by bytes), but BCJ's gain on the PE half is offset by small overhead on the JPEG/PNG portions that share the bucket. Per-OP bucket routing (M6 v3, see below) would close that.
 
-**v3 remaining (planned):**
-- Per-OP bucket routing in the recipe walker. Each OP_STORE/OP_REDEFLATE/OP_PREFLATE op gains a bucket-id byte; pack_xxx routes individual entries (not whole containers) to the right bucket. Lets a mixed.tar.gz route DLL bytes to BCJ and JPEG/PNG bytes to LZMA2 simultaneously. ~200 LoC change in recipe.c + bumps every op encoder/decoder.
-- Extend sniffer beyond magic bytes: entropy + printable-ratio for text-vs-binary classification. Lets us route Silesia's `dickens`/`webster`/`samba` text to zpaq `-mt` (text-tuned config) at the same time we route ooffice/sao binaries to xz+BCJ. Modest additional gain (~1-3%) on heterogeneous flat corpora.
-- Deeper AR member sniff (peek inside data.tar.gz/xz/zst). Currently ar_is_pe_heavy looks only at member names so .deb's data layer goes undetected. Would close the ~3% gap currently sitting on mixed.deb / real .deb fixtures (where the codec floor is ALSO at play).
-- Add a third bucket: delta filter for PCM-ish data (audio, sensor logs). Niche; skip until a fixture surfaces.
+**v3 shipped 2026-05-09:** per-OP bucket routing in the recipe walker. The v5 manifest u8 unwrap_bucket field is gone; each OP_STORE/OP_REDEFLATE/OP_PREFLATE op gains a u8 bucket after its u32 raw_size, and KIND_PNG/GZIP/BZIP2/XZ/ZSTD recipes gain a u8 bucket field used when inner_kind==0. Lets a mixed.tar.gz route DLL bytes to BCJ and JPEG/PNG bytes to LZMA2 simultaneously. The v2 container-level sniffers (zip_is_pe_heavy / wrapped_is_pe_heavy / etc.) are replaced by one `bucket_for_bytes()` helper that runs on already-inflated bytes inside each pack_*. Net code -124 lines. ZXLE_VER bumped 5 → 6.
+
+Headline impact (default mode, M6 v2 → v3):
+| Fixture | M6 v2 | **M6 v3** | Δ |
+|---|---|---|---|
+| mixed.tar (PNG+JPEG+2 DLLs) | 1,188,859 | **1,091,252** B | −8.2% |
+| mixed.deb (ar→gz→tar→DLLs+text) | 1,258,334 | **1,222,430** B | −2.85% |
+| mixed.tar.gz | −21.66% | **−22.92%** | −1.26 pp |
+| mixed.tar.bz2 | −20.51% | **−21.79%** | −1.28 pp |
+| mixed.tar.zst3 (default-3) | −21.44% | **−22.70%** | −1.26 pp |
+| mixed.tar.zst (level-19) | −6.68% | **−8.18%** | −1.50 pp |
+| zip-with-png.zip | −23.26% | **−23.49%** | −0.23 pp |
+
+Pure-PE fixtures unchanged (M6 v2 already routed everything to bucket 1). Pure-text fixtures unchanged. JAR pays 31 bytes from per-OP bucket overhead (32 entries × 1 byte) — still −59.33% vs xz-9e. RT OK on all 23 fixtures + 8-file corpus; fuzz harness 210/210 clean.
+
+**Possible v4 directions (no concrete plan, listed for honesty):**
+- Extend sniffer beyond PE/ELF magic: entropy + printable-ratio for text-vs-binary classification. Lets us route Silesia's `dickens`/`webster`/`samba` text to a text-tuned zpaq config simultaneously with PE → xz+BCJ. Modest gain (~1–3%) on heterogeneous flat corpora.
+- Deeper AR member sniff (peek inside data.tar.gz/xz/zst). Currently the gz-inside-ar wrapper sniffs its own inflated body, so this is mostly already done by M6 v3 — verify on real .deb fixtures.
+- Third bucket: delta filter for PCM-ish data (audio, sensor logs). Niche; skip until a fixture surfaces.
 
 ### M7 — CPU parallelism / multi-threading (planned)
 
