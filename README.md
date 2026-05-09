@@ -4,7 +4,7 @@ Recursive format-aware transform pipeline for general-purpose compression.
 
 Goal: be the smallest archive across **every** file type, not just one. Sister project to [ZXL](../Zxl) (which targets PE binaries specifically). ZXL-E uses ZXL as one of its backends when it detects PE streams.
 
-## Status (2026-05-09, parser fuzz harness shipped)
+## Status (2026-05-09, M6 v3 shipped)
 
 Default mode (xz-9e final-step + BCJ-x86 sub-stream for PE/ELF content) ties or beats xz-9e on the standard Silesia corpus and beats it by 6–60% on container-shaped artifacts. Optional `--slow` mode (zpaq -m5 final-step) matches the SOTA general-purpose codec on Silesia (ratio 0.1891) and stacks the gain on top of container unwrap (−29% to −47% vs xz-9e baseline on container fixtures).
 
@@ -35,6 +35,7 @@ Default mode (xz-9e final-step + BCJ-x86 sub-stream for PE/ELF content) ties or 
 | **M6 v1 BCJ x86 routing for KIND_OPAQUE** | **shipped** — PE DLLs gain ~3% on per-file pack (ZXLE_VER 3 → 4) |
 | **M6 v2 container-aware BCJ routing** | **shipped** — +2.0–2.8 pp on pure-PE containers (ZIP/TAR/AR/GZIP/BZIP2/ZSTD/XZ); ZXLE_VER 4 → 5 |
 | **Parser fuzz harness (`tests/fuzz.sh`)** | **shipped** — 700 mutations × 7 kinds clean; uncovered + fixed `raw_inflate_dyn` truncated-stream infinite-realloc hang |
+| **M6 v3 per-OP bucket routing** | **shipped** — recipes carry per-OP bucket bytes; mixed-content fixtures gain 1.3–8.2 pp; ZXLE_VER 5 → 6 |
 
 ## Headline numbers (2026-05-08)
 

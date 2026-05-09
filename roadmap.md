@@ -4,6 +4,25 @@ Single source of truth for where ZXL-E is, where it's going, and what not to ret
 
 ---
 
+## Current state (2026-05-09, M6 v3 shipped)
+
+M1 + M2 + M3a–j + ZXLE_VER 3 final-step xz-9e + M5 --slow + per-fixture min-pack tier + M6 v1 + M6 v2 + parser fuzz harness + **M6 v3 (per-OP bucket routing)** ship end-to-end.
+
+**Headline M6 v3 result (2026-05-09):** dropped the v5 manifest u8 unwrap_bucket field; recipes now carry per-OP bucket bytes. OP_STORE / OP_REDEFLATE / OP_PREFLATE each gain a u8 after their u32 raw_size; KIND_PNG/GZIP/BZIP2/XZ/ZSTD recipes gain a u8 bucket field used when inner_kind==0. Each pack_<kind> calls a small bucket_for_bytes() helper on raw payload (PE/ELF magic at offset 0 → bucket 1, else bucket 0); container-level pre-sniffers (zip_is_pe_heavy, wrapped_is_pe_heavy, etc.) and the 2 KiB shell-out probe in M6 v2 are all gone. ZXLE_VER bumped to 6.
+
+Mixed-content container fixtures gained 1.26–8.2 pp (PE bytes route to bucket 1 even when sharing a container with PNG/JPEG/text):
+
+| Fixture | M6 v2 | M6 v3 | gain |
+|---|---|---|---|
+| mixed.tar (PNG + JPEG + 2 DLLs) | 1,188,859 | **1,091,252** | **-8.2%** |
+| mixed.deb (ar → gz → tar → 2 DLLs + text) | 1,258,334 | **1,222,430** | -2.85% |
+| mixed.tar.gz | -21.66% vs xz-9e | **-22.92%** | -1.26 pp |
+| mixed.tar.bz2 | -20.51% | **-21.79%** | -1.28 pp |
+| mixed.tar.zst3 | -21.44% | **-22.70%** | -1.26 pp |
+| mixed.tar.zst (level 19) | -6.68% | **-8.18%** | -1.50 pp |
+
+Pure-PE container fixtures unchanged (M6 v2 already routed everything to bucket 1). Pure-text/pure-image fixtures unchanged. 8-file corpus per-file 0.3383, solid 0.3326 — flat (per-file fixtures have no containers, only +1 byte per PNG recipe). JAR pays 31 bytes (32 entries × 1 byte OP_REDEFLATE bucket field) — still −59.33% vs xz-9e. All RT OK across 23 bench fixtures + 8-file corpus. Fuzz harness 210/210 clean.
+
 ## Current state (2026-05-09, parser fuzz harness shipped)
 
 M1 + M2 + M3a–j + ZXLE_VER 3 final-step xz-9e + M5 --slow + per-fixture min-pack tier + M6 v1 + M6 v2 + **`tests/fuzz.sh` (container-parser fuzz harness)** ship end-to-end.
@@ -170,7 +189,7 @@ Going *beyond* zpaq -m5 on raw text/binary (the only place we don't already win)
 
 - **M6 v1** — shipped 2026-05-08. PE/ELF top-level entries route to xz+BCJ bucket. +2.0% on per-file/solid corpus, +3.1% on PE DLLs.
 - **M6 v2** — shipped 2026-05-08. Container-aware bucket routing for ZIP/TAR/AR/GZIP/BZIP2/ZSTD/XZ. +2.0–2.8 pp on pure-PE container fixtures. Mixed-content fixtures unchanged (per-container choice not granular enough; M6 v3 would close).
-- **M6 v3** — per-OP bucket routing inside the recipe walker. Mixed-content fixtures (mixed.tar.gz, mixed.deb, etc.) where DLL+image content shares a container would gain ~3-5%. Bigger refactor: each OP gets a bucket-id byte, recipe.c walker dispatches per op, every pack_*.c traces which bytes go where. Defer until fuzz/quality work surfaces other priorities.
+- **M6 v3** — shipped 2026-05-09. Per-OP bucket routing inside the recipe walker. Mixed-content fixtures (mixed.tar, mixed.deb, mixed.tar.{gz,bz2,zst}) gained 1.26–8.2 pp. Pure-PE and pure-text fixtures unchanged. Replaced four container-level sniffers with one `bucket_for_bytes()` helper that runs on already-inflated bytes; net code is 124 lines shorter.
 - **M7** — CPU parallelism (probe ladders + min-pack tiers in parallel; optional `--fast` for multi-threaded final codec). 2–8× pack-time speedup, zero ratio cost.
 - **M8** — GPU / ML backend. Aspirational; only attempt after M6/M7 land.
 - **M9** — corpus-specific trained model. Deferred until a deployment target appears.
