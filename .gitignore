@@ -9,6 +9,7 @@ tests/corpus/
 tests/unpacked/
 tests/baseline/
 tests/scratch/
+tests/fuzz_crashes/
 logs/
 third_party/
 .claude/

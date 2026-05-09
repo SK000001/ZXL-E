@@ -55,9 +55,10 @@ uint8_t *raw_inflate_dyn(const uint8_t *src, size_t src_n, size_t *out_n) {
         int rc = inflate(&z, Z_FINISH);
         if (rc == Z_STREAM_END) break;
         if (rc == Z_BUF_ERROR || rc == Z_OK) {
+            if (z.avail_in == 0) { inflateEnd(&z); free(out); return NULL; }
             size_t newcap = cap * 2;
             uint8_t *no = realloc(out, newcap);
-            if (!no) { inflateEnd(&z); free(out); die("realloc raw_inflate_dyn"); }
+            if (!no) { inflateEnd(&z); free(out); return NULL; }
             out = no;
             z.next_out = out + z.total_out;
             z.avail_out = (uInt)(newcap - z.total_out);
@@ -85,9 +86,10 @@ uint8_t *zlib_inflate_dyn(const uint8_t *src, size_t src_n, size_t *out_n) {
         int rc = inflate(&z, Z_FINISH);
         if (rc == Z_STREAM_END) break;
         if (rc == Z_BUF_ERROR || rc == Z_OK) {
+            if (z.avail_in == 0) { inflateEnd(&z); free(out); return NULL; }
             size_t newcap = cap * 2;
             uint8_t *no = realloc(out, newcap);
-            if (!no) { inflateEnd(&z); free(out); die("realloc inflate"); }
+            if (!no) { inflateEnd(&z); free(out); return NULL; }
             out = no;
             z.next_out = out + z.total_out;
             z.avail_out = (uInt)(newcap - z.total_out);
