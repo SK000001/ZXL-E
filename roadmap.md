@@ -4,6 +4,12 @@ Single source of truth for where ZXL-E is, where it's going, and what not to ret
 
 ---
 
+## Current state (2026-05-09, parser fuzz harness shipped)
+
+M1 + M2 + M3a–j + ZXLE_VER 3 final-step xz-9e + M5 --slow + per-fixture min-pack tier + M6 v1 + M6 v2 + **`tests/fuzz.sh` (container-parser fuzz harness)** ship end-to-end.
+
+**Headline fuzz result (2026-05-09):** new `tests/fuzz.sh` mutates per-kind seed fixtures (ZIP/TAR/AR/GZIP/BZIP2/XZ/ZSTD) with bit-flips, byte-flips, truncations, and header zeroing/randomization, then asserts `zxle pack <ANY_BYTES>` exits 0 in bounded time. First run found one 45-second hang on a truncated gzip — `raw_inflate_dyn` doubled its output buffer forever because zlib's `Z_BUF_ERROR` is overloaded ("output room exhausted" *and* "input exhausted mid-stream under Z_FINISH"). Fix: bail when `avail_in == 0` on `Z_BUF_ERROR`/`Z_OK`. Also replaced two `die()` calls in realloc-failure paths with NULL returns so the parser opaque-routes cleanly under allocation pressure. After fix: 700 mutations across two seeds (50 × 7 × 2) all clean — 0 fail / 0 crash / 0 hang. Bench unchanged: 8-file per-file 0.3383, solid 0.3326, all 43 RT OK.
+
 ## Current state (2026-05-08, M6 v2 shipped)
 
 M1 + M2 + M3a–j + ZXLE_VER 3 final-step xz-9e + M5 --slow + per-fixture min-pack tier + M6 v1 (top-level OPAQUE BCJ routing) + **M6 v2 (container-aware BCJ routing)** ship end-to-end.
@@ -181,7 +187,9 @@ Remaining items are **measurement / quality / wider coverage**, not new containe
 
 - **Multi-threaded zstd reproducibility** — confirmed 2026-05-07 on real Ubuntu coreutils.deb that the data-layer `.tar.zst` (1.4 MB) is encoded with `-T0` and falls through to OP_STORE because per-worker frame splits are non-deterministic. The 2026-05-07 multi-frame fast-fail in pack_zst now bails on those inputs in milliseconds. Headline-positive routing on multi-threaded `.tar.zst` would require a multi-frame-aware probe that recognizes worker boundaries and reproduces each frame independently. Large work, uncertain payoff — most real-world `.tar.zst .deb`s sit at the universal-codec floor anyway.
 - **Widen pack_xz reproducibility for non-preset encoders** — empirically established 2026-05-06 (Debian hello, dict=8MiB, custom mf/mode/nice/depth) and 2026-05-07 (GNU coreutils-9.11.tar.xz, dict=32MiB, ditto). The 2026-05-07 dict-driven pruning + bail correctly identifies these as unreachable in 2 probes (vs 8) but the headline still ties at floor. Real wins would require either (a) widening probe space with `mf` × `mode` × `nice` × `depth` permutations (large search, slow, uncertain payoff — likely doesn't reproduce libzstd-direct or GNU-release-script outputs anyway), or (b) reading lzma2 encoder choices from the stream itself (block-level filter parameters). Defer until validation gaps below close.
-- **Validation gaps** — Silesia + precomp v0.4.7 + zpaq v7.15 + M5 --slow all now in bench. Remaining: freearc (closer architectural peer to ZXL-E with multi-codec routing), size-scaling data past 128 MiB, **fuzz testing** of container parsers, peak-RSS reporting in bench. Fuzz testing of `pack_zip` / `pack_tar` / `pack_ar` / `pack_gz` / `pack_bz2` / `pack_xz` / `pack_zst` is the highest-impact safety win before any external adoption.
+- **Validation gaps** — Silesia + precomp v0.4.7 + zpaq v7.15 + M5 --slow + parser fuzz harness all now in tests/. Remaining: freearc (closer architectural peer to ZXL-E with multi-codec routing), size-scaling data past 128 MiB, peak-RSS reporting in bench.
+
+- **Parser fuzz** — closed 2026-05-09. `tests/fuzz.sh` runs ~50 mutations × 7 kinds with a per-iteration timeout; first run uncovered the `raw_inflate_dyn` truncated-stream infinite-realloc hang (described in the current-state header above). 700 mutations clean post-fix. Future expansion: AFL/libfuzzer harness against per-parser entry points if the bash harness stops finding bugs.
 
 - **JAR small-input regression** — closed 2026-05-08. Per-fixture min-pack tier: when --slow is set on inputs < 1 MB, also run the default-mode pack and keep the smaller. Fixes JAR (+6.20% → +0.00%), JPEG (+0.87% → +0.00%), MP3 (+0.26% → +0.00%) — all three regression shapes — at the cost of a few hundred ms extra pack on small fixtures. Big-input fixtures (>= 1 MB) unchanged. **--slow is now a strict pareto improvement over default**: never larger, often much smaller (DOCX -34.89%, pe-deflate.zip -15.44%, etc.).
 
