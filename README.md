@@ -37,7 +37,7 @@ Default mode (xz-9e final-step + BCJ-x86 sub-stream for PE/ELF content) ties or 
 | **Parser fuzz harness (`tests/fuzz.sh`)** | **shipped** — 700 mutations × 7 kinds clean; uncovered + fixed `raw_inflate_dyn` truncated-stream infinite-realloc hang |
 | **M6 v3 per-OP bucket routing** | **shipped** — recipes carry per-OP bucket bytes; mixed-content fixtures gain 1.3–8.2 pp; ZXLE_VER 5 → 6 |
 
-## Headline numbers (2026-05-08)
+## Headline numbers (2026-05-09)
 
 | Fixture | xz-9e | zxle (default) | zxle --slow |
 |---|---|---|---|
@@ -48,15 +48,18 @@ Default mode (xz-9e final-step + BCJ-x86 sub-stream for PE/ELF content) ties or 
 | pe-deflate-l6.zip | — | **−22.76%** | **−33.00%** vs xz-9e |
 | sample.docx | — | −19.23% | **−47.41%** vs xz-9e |
 | ntdll.dll.gz | — | **−19.23%** | **−29.43%** vs xz-9e |
-| mixed.tar.gz | — | −21.66% | **−30.65%** vs xz-9e |
-| mixed.deb | — | −18.37% | **−31.16%** vs xz-9e |
+| mixed.tar.gz | — | **−22.92%** | **−30.65%** vs xz-9e |
+| mixed.tar.bz2 | — | **−21.79%** | — |
+| mixed.tar.zst3 (default-3) | — | **−22.70%** | — |
+| mixed.tar.zst (level-19) | — | **−12.95%** | — |
+| mixed.deb | — | **−20.70%** | **−31.16%** vs xz-9e |
 | zip-with-jpeg.zip | — | **−21.95%** | — |
-| zip-with-png.zip | — | **−23.26%** | — |
-| gz-in.tar | — | **−17.10%** | — |
+| zip-with-png.zip | — | **−23.49%** | — |
+| gz-in.tar | — | **−17.09%** | — |
 | bz2-in.tar | — | **−14.09%** | — |
 | xz-in.tar | — | **−4.22%** | — |
 | zst-in.tar | — | **−8.47%** | — |
-| sample.jar | — | −59.58% | −59.58% (--slow tier picks default) |
+| sample.jar | — | −59.33% | −59.33% (--slow tier picks default) |
 
 ## Architecture
 
@@ -64,7 +67,7 @@ Five-stage pipeline:
 
 1. **Recursive container unwrap** — peel ZIP / tar / ar / .deb / gzip / bzip2 / zstd / xz down to raw streams plus a recipe to rebuild byte-identical originals.
 2. **Per-stream format-aware recompression** — DEFLATE → preflate (or zlib-L9 redeflate fast path), JPEG → brunsli, PNG IDAT → preflate over inflated pixels, MP3 → packMP3.
-3. **Per-content-type bucket routing (M6)** — KIND_OPAQUE entries and unwrap kinds (ZIP/TAR/AR/GZIP/BZIP2/ZSTD/XZ) detected as PE/ELF route to a dedicated sub-stream finalized with `xz -9e --x86` (BCJ filter); everything else stays in the main bucket.
+3. **Per-OP bucket routing (M6 v3)** — every recipe op carries a u8 bucket byte; PE/ELF bytes (sniffed on inflated payload) route to a dedicated sub-stream finalized with `xz -9e --x86` (BCJ filter); PNG pixel data, text, and already-compressed bytes stay in the main bucket. Mixed-content containers (DLL+image inside one tar/deb) split across both buckets per-entry.
 4. **Cross-stream solid mode** — main bucket finalized with xz -9e (default) or zpaq -m5 (`--slow`); BCJ bucket always finalized with xz -9e --x86.
 5. **min-pack fallthrough** — every pack runs both the unwrap path and an all-opaque path; the smaller wins. Saves us from regressions on tightly-deflated tiny inputs. With `--slow`, also tiers default-mode candidate on small inputs and keeps the smaller — guaranteeing pareto optimality.
 
