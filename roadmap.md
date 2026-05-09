@@ -356,6 +356,27 @@ Predicted shape held: mixed-content `.tar.xz` ties xz-9e (xz already crushes mix
 
 Roughly ordered by real-world impact-to-effort ratio. The ones near the top should be funded first.
 
+### What we haven't done that others have
+
+Honest list of capabilities present in shipping codecs (zstd, xz, zpaq, 7z, freearc) but absent here. Not all of these are wins worth pursuing — listed so the gap is visible, not implicitly endorsed as a priority.
+
+- **Multi-threaded pack** — single-threaded throughout (probe ladders, min-pack passes, final-step encode). zstd / xz / zpaq all parallelize trivially. Highest-impact engineering item; no ratio cost. Tracked as M7.
+- **Pack-time competitive with the codec floor** — currently 5–10× the comparable xz/zstd run even in default mode (probe ladders + double-pack via min-pack). Real-world adoption gate.
+- **Stable wire format** — bumped v3 → v4 → v5 → v6 in 3 days. No version-skew testing; no migration path. Other shipping codecs hold their format for years.
+- **Streaming pack/unpack** — `read_whole_file` everywhere; whole input materialized to RAM. zstd / xz are streaming. Falls over above ~1 GB.
+- **Random-access / block-mode output** — solid-only. Other formats (`.7z` block mode, zstd seekable, `.zip` per-entry) allow extracting a subset without inflating the whole archive.
+- **Corruption tolerance** — single byte corrupted in solid payload loses everything. zstd content-checksum + xz block CRC give finer-grained failure boundaries.
+- **Encryption** — zstd / 7z / xz support encrypted archives. We don't.
+- **Cross-stream dedup** — zstd long-window covers ~256 MiB; we inherit its window inside one bucket but don't dedup *across* the PE/non-PE bucket boundary or across recipe-stored bytes (recipe payloads outside solid).
+- **Self-extracting / portable decode** — current decode requires the `zxle` binary plus xz/zstd/bzip2/preflate/brunsli/packMP3 on PATH. zstd / xz produce self-contained streams.
+- **Large-corpus measurement** — bench corpus tops out at Silesia (211 MB). Behavior at GB scale (memory, time, ratio) unmeasured.
+- **Fuzz beyond random byte mutation** — `tests/fuzz.sh` (shipped 2026-05-09) does ~700 random mutations and found 1 bug. AFL/libfuzzer with structured corpora would do much better; haven't done that.
+- **Real-world deployment signal** — no users, no archives in production, no bug reports beyond what fuzz surfaced. Other codecs have years of millions-of-archives feedback.
+- **Cross-platform build polish** — built and tested on Windows 11 / MinGW + Git-Bash. Linux/Mac builds are likely fine but unverified.
+- **GPU / SIMD acceleration** — zstd has SIMD entropy decoders; we have none. Tracked as aspirational M8.
+
+Most of these are not novel research problems — they're engineering items that take weeks each. The items genuinely worth doing soon are M7 (multi-threading, free ratio gain), large-corpus measurement (validates everything), and structured fuzzing (safety before any external use).
+
 ### Coverage gaps the synthetic corpus doesn't surface
 
 - **Real `.deb` re-fixture** — replace `mixed.deb` (synthetic, uses inner `.tar.gz`) with a real Debian package whose data layer is `.tar.xz` or `.tar.zst`. Confirms M3f-ar headline holds on the actually-shipped layout.
@@ -382,7 +403,7 @@ Roughly ordered by real-world impact-to-effort ratio. The ones near the top shou
 - **No competitor benchmark.** We compare against xz-9e (the universal target). For honest positioning we should also bench against precomp, freearc, zpaq, kanzi on the same fixtures. Likely outcome: zxle wins on container-heavy artifacts, loses on long-text where zpaq is king.
 - **No size-scaling data.** Corpus is ~7 MB; real archives can be GB. Does solid mode still help past the 128 MiB long-window? When does memory or time become the bottleneck? Bench on a larger constructed corpus (e.g., 200 MB+) to find the cliff.
 - **No memory numbers reported anywhere.** Pack/unpack wall time now ships in `tests/bench.sh` (per-file `pk_ms`/`un_ms` columns plus a `perf:` line per container case, via bash 5 `EPOCHREALTIME`). Peak RSS still pending — needs a platform-specific wrapper (`/usr/bin/time -v` on Linux; PowerShell `Get-Process` or `wmic` on MSYS2 — neither uniform). First wall-time signals surfaced (2026-05-07): M3h-zsttar level-3 ladder pack ~19.9 s on a 1.4 MB input — the 7-entry `(level, --long)` probe ladder is the dominant pack-time hot spot; M3e-targz / M3f-ar at ~7 s on similar-size inputs.
-- **No fuzz testing.** Container parsers (zip / tar / ar / gzip / bz2 / zst) all walk untrusted-shaped input. A 1-day AFL/libFuzzer pass on each `pack_*` would surface issues before real-world adoption.
+- **Fuzz coverage is shallow.** `tests/fuzz.sh` (shipped 2026-05-09) does ~50 random mutations × 7 kinds; found 1 bug (`raw_inflate_dyn` truncated-stream hang). A structured AFL/libFuzzer pass on each `pack_*` with format-aware corpora would surface deeper issues.
 - **No corruption-tolerance story.** zstd-19 solid + format-aware recipes mean a single corrupted byte in the payload likely loses everything. Document the failure mode; consider whether per-entry framing is worth adding (probably not — it costs ratio).
 - **No streaming pack/unpack.** Whole-file `read_whole_file` everywhere. Fine for ≤1 GB; falls over above. Defer until a real workload demands it.
 - **Manifest format frozen at v2 since M2.** No version-skew testing; no migration story. Document the format more thoroughly in `roadmap.md` if external tools ever consume `.zxle`.
