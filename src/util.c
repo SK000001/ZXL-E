@@ -1,4 +1,5 @@
 #include "util.h"
+#include <pthread.h>
 
 void die(const char *msg) {
     fprintf(stderr, "zxle: %s", msg);
@@ -20,6 +21,38 @@ void run(const char *cmd) {
 }
 
 int try_run(const char *cmd) { return system(cmd); }
+
+typedef struct {
+    const char *cmd;
+    int rc;
+} ProbeJob;
+
+static void *probe_worker(void *arg) {
+    ProbeJob *j = (ProbeJob *)arg;
+    j->rc = system(j->cmd);
+    return NULL;
+}
+
+int try_run_parallel(const char **cmds, int n_cmds, int *rcs_out) {
+    if (n_cmds <= 0) return 0;
+    if (n_cmds == 1) { rcs_out[0] = system(cmds[0]); return 0; }
+    pthread_t *th = malloc(sizeof(pthread_t) * (size_t)n_cmds);
+    ProbeJob  *jobs = malloc(sizeof(ProbeJob) * (size_t)n_cmds);
+    if (!th || !jobs) { free(th); free(jobs); return -1; }
+    int spawned = 0;
+    for (int i = 0; i < n_cmds; i++) {
+        jobs[i].cmd = cmds[i];
+        jobs[i].rc  = -1;
+        if (pthread_create(&th[i], NULL, probe_worker, &jobs[i]) != 0) break;
+        spawned++;
+    }
+    for (int i = 0; i < spawned; i++) pthread_join(th[i], NULL);
+    /* Any probes we failed to spawn run serially after the joined batch. */
+    for (int i = spawned; i < n_cmds; i++) jobs[i].rc = system(cmds[i]);
+    for (int i = 0; i < n_cmds; i++) rcs_out[i] = jobs[i].rc;
+    free(th); free(jobs);
+    return 0;
+}
 
 long long fsize(const char *path) {
     struct stat st;

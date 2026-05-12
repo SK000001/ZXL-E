@@ -2,7 +2,7 @@ CC      = gcc
 CXX     = g++
 CFLAGS  ?= -O3 -march=native -Wall -Wextra -Wno-unused-parameter -std=c11
 CXXFLAGS ?= -O3 -march=native -Wall -Wextra -std=c++14
-LDFLAGS ?= -lz -lstdc++
+LDFLAGS ?= -lz -lstdc++ -lpthread
 
 PREFLATE_DIR = third_party/preflate
 PREFLATE_LIB = $(PREFLATE_DIR)/build/libpreflate.a

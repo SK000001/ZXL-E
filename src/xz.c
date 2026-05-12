@@ -90,10 +90,9 @@ int pack_xz(const uint8_t *p, size_t n, const char *tmp_prefix,
     int n_dict_levels = dict_ok ? xz_dict_byte_to_levels(dict_byte, dict_levels) : 0;
     if (dict_ok && n_dict_levels == 0) return -1; /* custom dict, unreachable */
 
-    char in_xz[1024], raw_path[1024], rt_xz[1024], cmd[4096];
+    char in_xz[1024], raw_path[1024], cmd[4096];
     snprintf(in_xz,    sizeof(in_xz),    "%s.in.xz",   tmp_prefix);
     snprintf(raw_path, sizeof(raw_path), "%s.raw.bin", tmp_prefix);
-    snprintf(rt_xz,    sizeof(rt_xz),    "%s.rt.xz",   tmp_prefix);
 
     FILE *xf = fopen(in_xz, "wb");
     if (!xf) return -1;
@@ -127,21 +126,40 @@ int pack_xz(const uint8_t *p, size_t n, const char *tmp_prefix,
         memcpy(ladder, fallback, sizeof(fallback));
         n_ladder = (int)(sizeof(fallback)/sizeof(fallback[0]));
     }
-    int matched = -1;
+    /* M7 step 1: run all probe candidates concurrently (each into a unique
+     * rt path); after join, pick the lowest-ladder-index match. Worst case
+     * (no match) drops from sum-of-probe-times to max-of-probe-times; best
+     * case (match at probe 0) does extra work but doesn't extend wall time. */
+    char (*rt_paths)[1024] = malloc(sizeof(char[1024]) * (size_t)n_ladder);
+    char (*cmd_bufs)[4096] = malloc(sizeof(char[4096]) * (size_t)n_ladder);
+    const char **cmd_ptrs  = malloc(sizeof(char *) * (size_t)n_ladder);
+    int *rcs               = malloc(sizeof(int) * (size_t)n_ladder);
+    if (!rt_paths || !cmd_bufs || !cmd_ptrs || !rcs) {
+        free(rt_paths); free(cmd_bufs); free(cmd_ptrs); free(rcs);
+        free(raw); unlink(in_xz); unlink(raw_path); return -1;
+    }
     for (int i = 0; i < n_ladder; i++) {
-        snprintf(cmd, sizeof(cmd),
+        snprintf(rt_paths[i], 1024, "%s.rt.%d.xz", tmp_prefix, i);
+        snprintf(cmd_bufs[i], 4096,
                  "xz -%u%s -c --threads=1 \"%s\" > \"%s\" 2>%s",
                  (unsigned)ladder[i].level,
                  ladder[i].extreme ? "e" : "",
-                 raw_path, rt_xz, ZXLE_DEVNULL);
-        if (try_run(cmd) != 0) { unlink(rt_xz); continue; }
+                 raw_path, rt_paths[i], ZXLE_DEVNULL);
+        cmd_ptrs[i] = cmd_bufs[i];
+    }
+    try_run_parallel(cmd_ptrs, n_ladder, rcs);
+    int matched = -1;
+    for (int i = 0; i < n_ladder; i++) {
+        if (rcs[i] != 0) { unlink(rt_paths[i]); continue; }
+        if (matched >= 0) { unlink(rt_paths[i]); continue; }
         size_t rt_n = 0;
-        uint8_t *rt = read_whole_file(rt_xz, &rt_n);
+        uint8_t *rt = read_whole_file(rt_paths[i], &rt_n);
         int ok = (rt && rt_n == n && memcmp(rt, p, n) == 0);
         free(rt);
-        unlink(rt_xz);
-        if (ok) { matched = (int)i; break; }
+        unlink(rt_paths[i]);
+        if (ok) matched = i;
     }
+    free(rt_paths); free(cmd_bufs); free(cmd_ptrs); free(rcs);
     unlink(in_xz);
     if (matched < 0) { free(raw); unlink(raw_path); return -1; }
     uint8_t level   = ladder[matched].level;

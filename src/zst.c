@@ -35,10 +35,9 @@ int pack_zst(const uint8_t *p, size_t n, const char *tmp_prefix,
             return -1;
     }
 
-    char in_zst[1024], raw_path[1024], rt_zst[1024], cmd[4096];
+    char in_zst[1024], raw_path[1024], cmd[4096];
     snprintf(in_zst,   sizeof(in_zst),   "%s.in.zst",  tmp_prefix);
     snprintf(raw_path, sizeof(raw_path), "%s.raw.bin", tmp_prefix);
-    snprintf(rt_zst,   sizeof(rt_zst),   "%s.rt.zst",  tmp_prefix);
 
     FILE *zf = fopen(in_zst, "wb");
     if (!zf) return -1;
@@ -69,47 +68,60 @@ int pack_zst(const uint8_t *p, size_t n, const char *tmp_prefix,
 
     const char *check_arg = has_checksum ? "--check" : "--no-check";
 
+    /* M7 step 1: enumerate up to 8 (level, long) candidates, then run them
+     * concurrently and pick the lowest-index match. Same 8-probe cap and
+     * priority ordering as the prior serial loop. */
+    const int PROBE_CAP = 8;
+    uint8_t probe_level[8];
+    uint8_t probe_long[8];
+    int n_probes = 0;
+    for (size_t li = 0; li < sizeof(levels) && n_probes < PROBE_CAP; li++) {
+        for (int lj = 0; lj < n_long && n_probes < PROBE_CAP; lj++) {
+            probe_level[n_probes] = levels[li];
+            probe_long[n_probes]  = long_tries[lj];
+            n_probes++;
+        }
+    }
+    char (*rt_paths)[1024] = malloc(sizeof(char[1024]) * (size_t)n_probes);
+    char (*cmd_bufs)[4096] = malloc(sizeof(char[4096]) * (size_t)n_probes);
+    const char **cmd_ptrs  = malloc(sizeof(char *) * (size_t)n_probes);
+    int *rcs               = malloc(sizeof(int) * (size_t)n_probes);
+    if (!rt_paths || !cmd_bufs || !cmd_ptrs || !rcs) {
+        free(rt_paths); free(cmd_bufs); free(cmd_ptrs); free(rcs);
+        free(raw); unlink(in_zst); unlink(raw_path); return -1;
+    }
+    for (int i = 0; i < n_probes; i++) {
+        snprintf(rt_paths[i], 1024, "%s.rt.%d.zst", tmp_prefix, i);
+        char long_part[32];
+        if (probe_long[i] == 0) long_part[0] = 0;
+        else snprintf(long_part, sizeof(long_part), " --long=%u", probe_long[i]);
+        if (has_fcs) {
+            snprintf(cmd_bufs[i], 4096,
+                     "zstd -%u%s %s -q -f -o \"%s\" \"%s\" >%s 2>&1",
+                     probe_level[i], long_part, check_arg,
+                     rt_paths[i], raw_path, ZXLE_DEVNULL);
+        } else {
+            snprintf(cmd_bufs[i], 4096,
+                     "zstd -%u%s %s -q < \"%s\" > \"%s\" 2>%s",
+                     probe_level[i], long_part, check_arg,
+                     raw_path, rt_paths[i], ZXLE_DEVNULL);
+        }
+        cmd_ptrs[i] = cmd_bufs[i];
+    }
+    try_run_parallel(cmd_ptrs, n_probes, rcs);
     int matched_level = -1;
     uint8_t matched_long = 0;
-    /* Cap probes at 8 to bound encode time on inputs the CLI can't reproduce
-     * (e.g., dpkg-deb's libzstd-direct uses non-CLI-reachable encoder params).
-     * With the {3, 19, 22, ...} reorder above, every current matching fixture
-     * lands by probe 5 (mixed.tar.zst3 at probe 3, mixed.tar.zst at 3-4,
-     * which.pkg.tar.zst at 5). On no-match inputs this turns ~30 probes
-     * (~50 s on a 1.4 MB stream) into 8 probes (~12 s). */
-    int probes = 0;
-    for (size_t li = 0; li < sizeof(levels); li++) {
-        if (probes >= 8) break;
-        uint8_t level = levels[li];
-        for (int lj = 0; lj < n_long; lj++) {
-            if (probes >= 8) break;
-            probes++;
-            uint8_t lw = long_tries[lj];
-            char long_part[32];
-            if (lw == 0) long_part[0] = 0;
-            else snprintf(long_part, sizeof(long_part), " --long=%u", lw);
-
-            if (has_fcs) {
-                snprintf(cmd, sizeof(cmd),
-                         "zstd -%u%s %s -q -f -o \"%s\" \"%s\" >%s 2>&1",
-                         level, long_part, check_arg, rt_zst, raw_path,
-                         ZXLE_DEVNULL);
-            } else {
-                snprintf(cmd, sizeof(cmd),
-                         "zstd -%u%s %s -q < \"%s\" > \"%s\" 2>%s",
-                         level, long_part, check_arg, raw_path, rt_zst,
-                         ZXLE_DEVNULL);
-            }
-            if (try_run(cmd) != 0) { unlink(rt_zst); continue; }
-            size_t rt_n = 0;
-            uint8_t *rt = read_whole_file(rt_zst, &rt_n);
-            int ok = (rt && rt_n == n && memcmp(rt, p, n) == 0);
-            free(rt);
-            unlink(rt_zst);
-            if (ok) { matched_level = level; matched_long = lw; break; }
-        }
-        if (matched_level >= 0) break;
+    for (int i = 0; i < n_probes; i++) {
+        if (rcs[i] != 0) { unlink(rt_paths[i]); continue; }
+        if (matched_level >= 0) { unlink(rt_paths[i]); continue; }
+        size_t rt_n = 0;
+        uint8_t *rt = read_whole_file(rt_paths[i], &rt_n);
+        int ok = (rt && rt_n == n && memcmp(rt, p, n) == 0);
+        free(rt);
+        unlink(rt_paths[i]);
+        if (ok) { matched_level = probe_level[i]; matched_long = probe_long[i]; }
     }
+    free(rt_paths); free(cmd_bufs); free(cmd_ptrs); free(rcs);
     unlink(in_zst);
     if (matched_level < 0) { free(raw); unlink(raw_path); return -1; }
     uint8_t level  = (uint8_t)matched_level;

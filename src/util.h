@@ -30,6 +30,13 @@ uint32_t r32(const uint8_t *p);
 void run(const char *cmd);
 int  try_run(const char *cmd);
 
+/* Run N shell commands concurrently via system() in worker threads. Stores
+ * each command's return code into rcs_out[i]. Returns 0 on success; -1 only
+ * if no work was done (malloc failure for the worker arrays). On per-thread
+ * failures the affected commands fall back to a serial system() call so the
+ * rcs_out[] array is always fully populated. */
+int try_run_parallel(const char **cmds, int n_cmds, int *rcs_out);
+
 long long fsize(const char *path);
 const char *basename_of(const char *p);
 
