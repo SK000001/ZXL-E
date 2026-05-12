@@ -44,7 +44,7 @@ typedef struct {
  * anything other than KIND_OPAQUE) on success. *out_size receives the
  * produced file size. */
 static int pack_run(const char *out, int n, char **files, int force_opaque,
-                    int slow, long long *out_size, uint64_t *out_total) {
+                    int slow, int fast, long long *out_size, uint64_t *out_total) {
     PackEntry *ents = calloc((size_t)n, sizeof(PackEntry));
     if (!ents) die("calloc ents");
     /* M6: two solid buckets. solid (bucket 0) holds main-codec bytes (xz or
@@ -210,14 +210,23 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
                      tmp_payload, tmp_concat, ZXLE_DEVNULL);
             break;
         case CODEC_XZ_9E_X86:
+            /* M7 step 4: --fast switches the final-step xz encoder to
+             * --threads=0 with an 8 MiB block size. Without an explicit
+             * block size, preset 9e's 64 MiB dict yields a 192 MiB default
+             * block -- inputs below that fit in one block and don't
+             * parallelize. 8 MiB blocks cost ~2.8% ratio on a 51 MB silesia
+             * fixture for ~5.7x pack-time speedup. xz -d handles multi-block
+             * streams transparently so the manifest format is unchanged. */
             snprintf(cmd, sizeof(cmd),
-                     "xz -9e --x86 --lzma2=preset=9e -c --threads=1 \"%s\" > \"%s\" 2>%s",
+                     "xz -9e --x86 --lzma2=preset=9e -c %s \"%s\" > \"%s\" 2>%s",
+                     fast ? "--threads=0 --block-size=8388608" : "--threads=1",
                      tmp_concat, tmp_payload, ZXLE_DEVNULL);
             break;
         case CODEC_XZ_9E:
         default:
             snprintf(cmd, sizeof(cmd),
-                     "xz -9e -c --threads=1 \"%s\" > \"%s\" 2>%s",
+                     "xz -9e -c %s \"%s\" > \"%s\" 2>%s",
+                     fast ? "--threads=0 --block-size=8388608" : "--threads=1",
                      tmp_concat, tmp_payload, ZXLE_DEVNULL);
             break;
         }
@@ -322,9 +331,9 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
  * final size and input total. The caller can then compare two tiers (slow
  * vs default) and keep whichever produced the smaller blob. */
 static int min_pack_for_tier(const char *out, int n, char **files, int slow,
-                             long long *out_osz, uint64_t *out_total) {
+                             int fast, long long *out_osz, uint64_t *out_total) {
     long long osz = -1; uint64_t total = 0;
-    int unwrapped = pack_run(out, n, files, 0, slow, &osz, &total);
+    int unwrapped = pack_run(out, n, files, 0, slow, fast, &osz, &total);
 
     int run_opaque_pass =
         (unwrapped > 0 &&
@@ -333,7 +342,7 @@ static int min_pack_for_tier(const char *out, int n, char **files, int slow,
         char opq[1024];
         snprintf(opq, sizeof(opq), "%s.opq.tmp", out);
         long long opq_osz = -1; uint64_t opq_total = 0;
-        pack_run(opq, n, files, 1, slow, &opq_osz, &opq_total);
+        pack_run(opq, n, files, 1, slow, fast, &opq_osz, &opq_total);
         if (opq_osz > 0 && opq_osz < osz) {
             fprintf(stderr, "min-pack: opaque %lld < unwrap %lld -> using opaque\n",
                     opq_osz, osz);
@@ -358,13 +367,14 @@ typedef struct {
     int          n;
     char       **files;
     int          slow;
+    int          fast;
     long long    osz;
     uint64_t     total;
 } TierJob;
 
 static void *tier_worker(void *arg) {
     TierJob *j = (TierJob *)arg;
-    min_pack_for_tier(j->out, j->n, j->files, j->slow, &j->osz, &j->total);
+    min_pack_for_tier(j->out, j->n, j->files, j->slow, j->fast, &j->osz, &j->total);
     return NULL;
 }
 
@@ -372,12 +382,13 @@ static int do_pack(int argc, char **argv) {
     /* Parse leading flags: --slow finalizes the solid stream with zpaq -m5
      * (cmix-class context-mixing) instead of xz -9e. 5-10x slower on raw
      * streams; closes the Silesia gap surfaced by the 2026-05-08 measurement. */
-    int slow = 0;
+    int slow = 0, fast = 0;
     while (argc > 0 && argv[0][0] == '-') {
         if (strcmp(argv[0], "--slow") == 0) { slow = 1; argc--; argv++; continue; }
+        if (strcmp(argv[0], "--fast") == 0) { fast = 1; argc--; argv++; continue; }
         break;
     }
-    if (argc < 2) { fprintf(stderr, "usage: zxle pack [--slow] <out.zxle> <files...>\n"); return 1; }
+    if (argc < 2) { fprintf(stderr, "usage: zxle pack [--slow] [--fast] <out.zxle> <files...>\n"); return 1; }
     const char *out = argv[0];
     int n = argc - 1;
     char **files = argv + 1;
@@ -410,8 +421,8 @@ static int do_pack(int argc, char **argv) {
     if (slow && total_in < (uint64_t)1024 * 1024) {
         char def_path[1024];
         snprintf(def_path, sizeof(def_path), "%s.def.tmp", out);
-        TierJob slow_job = { out,      n, files, 1, -1, 0 };
-        TierJob def_job  = { def_path, n, files, 0, -1, 0 };
+        TierJob slow_job = { out,      n, files, 1, fast, -1, 0 };
+        TierJob def_job  = { def_path, n, files, 0, fast, -1, 0 };
         pthread_t th_slow, th_def;
         int spawn_slow = pthread_create(&th_slow, NULL, tier_worker, &slow_job);
         int spawn_def  = pthread_create(&th_def,  NULL, tier_worker, &def_job);
@@ -431,7 +442,7 @@ static int do_pack(int argc, char **argv) {
             unlink(def_path);
         }
     } else {
-        min_pack_for_tier(out, n, files, slow, &osz, &total);
+        min_pack_for_tier(out, n, files, slow, fast, &osz, &total);
     }
 
     fprintf(stderr, "packed %d file(s), orig=%llu zxle=%lld ratio=%.4f\n",
