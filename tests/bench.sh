@@ -410,6 +410,27 @@ if [ "${ZXLE_SILESIA:-0}" = "1" ] && [ -d tests/corpus/silesia ]; then
             b=$(basename "$f")
             cmp -s "$f" "tests/unpacked/silesia.d/$b" || SIL_RT=FAIL
         done
+        # --fast variant on the same input. Validates M7 step 4 at silesia
+        # scale: --threads=0 --block-size=8MiB on the final-step xz encode.
+        # Output is no longer byte-identical across runs (multi-block xz) but
+        # round-trip is preserved because xz -d handles multi-block streams.
+        echo
+        echo "Mode: solid zxle pack --fast (xz -T0 --block-size=8MiB final)"
+        t0=$EPOCHREALTIME
+        "$BIN" pack --fast tests/baseline/silesia.fast.zxle $SIL_FILES >/dev/null 2>&1
+        SIL_FAST_PACK_MS=$(elapsed_ms "$t0")
+        SIL_ZX_FAST=$(stat -c%s tests/baseline/silesia.fast.zxle)
+        rm -rf tests/unpacked/silesia.fast.d && mkdir -p tests/unpacked/silesia.fast.d
+        t0=$EPOCHREALTIME
+        "$BIN" unpack tests/baseline/silesia.fast.zxle tests/unpacked/silesia.fast.d >/dev/null 2>&1
+        SIL_FAST_UNP_MS=$(elapsed_ms "$t0")
+        SIL_FAST_RT=OK
+        for f in $SIL_FILES; do
+            b=$(basename "$f")
+            cmp -s "$f" "tests/unpacked/silesia.fast.d/$b" || SIL_FAST_RT=FAIL
+        done
+        rm -rf tests/baseline/silesia.fast.zxle tests/unpacked/silesia.fast.d
+
         # --slow variant on the same input (gated; very slow on 211 MB).
         SIL_ZX_SLOW=0; SIL_SLOW_PACK_MS=0; SIL_SLOW_UNP_MS=0; SIL_SLOW_RT=skip
         if [ "${ZXLE_SLOW:-0}" = "1" ] && [ -n "$ZPAQ" ]; then
@@ -508,6 +529,8 @@ if [ "${ZXLE_SILESIA:-0}" = "1" ] && [ -d tests/corpus/silesia ]; then
         printf "Results (vs sum of orig sizes %d B):\n" "$SIL_SUM"
         printf "  zxle solid       %12d  ratio=%s  rt=%s  pack=%dms unpack=%dms\n" \
             "$SIL_ZX" "$(ratio "$SIL_ZX" "$SIL_SUM")" "$SIL_RT" "$SIL_PACK_MS" "$SIL_UNP_MS"
+        printf "  zxle --fast      %12d  ratio=%s  rt=%s  pack=%dms unpack=%dms\n" \
+            "$SIL_ZX_FAST" "$(ratio "$SIL_ZX_FAST" "$SIL_SUM")" "$SIL_FAST_RT" "$SIL_FAST_PACK_MS" "$SIL_FAST_UNP_MS"
         if [ "$SIL_ZX_SLOW" -gt 0 ]; then
             printf "  zxle --slow      %12d  ratio=%s  rt=%s  pack=%dms unpack=%dms\n" \
                 "$SIL_ZX_SLOW" "$(ratio "$SIL_ZX_SLOW" "$SIL_SUM")" "$SIL_SLOW_RT" "$SIL_SLOW_PACK_MS" "$SIL_SLOW_UNP_MS"
@@ -533,5 +556,93 @@ if [ "${ZXLE_SILESIA:-0}" = "1" ] && [ -d tests/corpus/silesia ]; then
             fi
         fi
         rm -f "$SIL_TAR"
+    fi
+fi
+
+# Constructed GB-scale corpus: silesia.tar concatenated 5x for a ~1.06 GB
+# fixture. Gated by ZXLE_GIANT=1 because pack time on 1 GB is multi-minute
+# (default) and the fixture itself consumes 1 GB on disk. The goal is to
+# measure whether the M7 wins, solid-mode ratio, and headline-vs-xz-9e
+# delta scale past the 128 MiB long-window. Only default + --fast are
+# benched here; --slow on 1 GB through zpaq -m5 is impractical.
+if [ "${ZXLE_GIANT:-0}" = "1" ] && [ -d tests/corpus/silesia ]; then
+    echo
+    echo "=== GB-scale benchmark (silesia.tar x5, ~1.06 GB) ==="
+    GIANT_DIR=tests/corpus/silesia
+    GIANT_FILES="$GIANT_DIR/dickens $GIANT_DIR/mozilla $GIANT_DIR/mr $GIANT_DIR/nci $GIANT_DIR/ooffice $GIANT_DIR/osdb $GIANT_DIR/reymont $GIANT_DIR/samba $GIANT_DIR/sao $GIANT_DIR/webster $GIANT_DIR/x-ray $GIANT_DIR/xml"
+    GIANT_OK=1
+    for f in $GIANT_FILES; do
+        [ -f "$f" ] || { echo "  missing: $f"; GIANT_OK=0; break; }
+    done
+    if [ "$GIANT_OK" = "1" ]; then
+        GIANT_TAR=tests/baseline/giant.bin
+        if [ ! -f "$GIANT_TAR" ]; then
+            echo "building giant.bin (1 byte + silesia.tar x5)..."
+            SIL_ONE=tests/baseline/silesia.giant.tar
+            tar cf "$SIL_ONE" -C "$GIANT_DIR" \
+                dickens mozilla mr nci ooffice osdb reymont samba sao webster x-ray xml
+            # Prepend 1 junk byte then 5 copies of silesia.tar. The leading
+            # byte shifts the ustar magic off the +257 offset that pack_tar's
+            # top-level sniffer checks, so the file is treated as KIND_OPAQUE
+            # and the full 1 GB lands in bucket 0 for an honest final-step
+            # codec measurement. (A clean concat of 5 silesia.tar copies hits
+            # pack_tar, which only consumes the first 211 MB and the rest
+            # takes a pathological route -- the result was a meaningless
+            # +270% vs xz-9e.)
+            printf 'Z' > "$GIANT_TAR"
+            cat "$SIL_ONE" "$SIL_ONE" "$SIL_ONE" "$SIL_ONE" "$SIL_ONE" >> "$GIANT_TAR"
+            rm -f "$SIL_ONE"
+        fi
+        GIANT_SZ=$(stat -c%s "$GIANT_TAR")
+        echo "fixture size:       $GIANT_SZ B"
+
+        echo
+        echo "Mode: solid zxle pack (single 1 GB file)"
+        t0=$EPOCHREALTIME
+        "$BIN" pack tests/baseline/giant.zxle "$GIANT_TAR" >/dev/null 2>&1
+        G_PACK_MS=$(elapsed_ms "$t0")
+        G_ZX=$(stat -c%s tests/baseline/giant.zxle)
+        rm -rf tests/unpacked/giant.d && mkdir -p tests/unpacked/giant.d
+        t0=$EPOCHREALTIME
+        "$BIN" unpack tests/baseline/giant.zxle tests/unpacked/giant.d >/dev/null 2>&1
+        G_UNP_MS=$(elapsed_ms "$t0")
+        G_RT=OK
+        cmp -s "$GIANT_TAR" "tests/unpacked/giant.d/$(basename "$GIANT_TAR")" || G_RT=FAIL
+        rm -rf tests/baseline/giant.zxle tests/unpacked/giant.d
+
+        echo
+        echo "Mode: solid zxle pack --fast"
+        t0=$EPOCHREALTIME
+        "$BIN" pack --fast tests/baseline/giant.fast.zxle "$GIANT_TAR" >/dev/null 2>&1
+        G_FAST_PACK_MS=$(elapsed_ms "$t0")
+        G_ZX_FAST=$(stat -c%s tests/baseline/giant.fast.zxle)
+        rm -rf tests/unpacked/giant.fast.d && mkdir -p tests/unpacked/giant.fast.d
+        t0=$EPOCHREALTIME
+        "$BIN" unpack tests/baseline/giant.fast.zxle tests/unpacked/giant.fast.d >/dev/null 2>&1
+        G_FAST_UNP_MS=$(elapsed_ms "$t0")
+        G_FAST_RT=OK
+        cmp -s "$GIANT_TAR" "tests/unpacked/giant.fast.d/$(basename "$GIANT_TAR")" || G_FAST_RT=FAIL
+        rm -rf tests/baseline/giant.fast.zxle tests/unpacked/giant.fast.d
+
+        echo
+        echo "Baseline: tar + xz-9e (single-threaded)"
+        t0=$EPOCHREALTIME
+        G_XZ=$(xz -9e --threads=1 -c "$GIANT_TAR" 2>/dev/null | wc -c)
+        G_XZ_MS=$(awk -v s="$t0" -v e="$EPOCHREALTIME" 'BEGIN{printf "%d", (e-s)*1000}')
+
+        echo
+        printf "Results (vs giant.tar %d B):\n" "$GIANT_SZ"
+        printf "  zxle solid       %12d  ratio=%s  rt=%s  pack=%dms unpack=%dms\n" \
+            "$G_ZX" "$(ratio "$G_ZX" "$GIANT_SZ")" "$G_RT" "$G_PACK_MS" "$G_UNP_MS"
+        printf "  zxle --fast      %12d  ratio=%s  rt=%s  pack=%dms unpack=%dms\n" \
+            "$G_ZX_FAST" "$(ratio "$G_ZX_FAST" "$GIANT_SZ")" "$G_FAST_RT" "$G_FAST_PACK_MS" "$G_FAST_UNP_MS"
+        printf "  tar + xz-9e      %12d  ratio=%s  pack=%dms\n" \
+            "$G_XZ" "$(ratio "$G_XZ" "$GIANT_SZ")" "$G_XZ_MS"
+        printf "  zxle vs tar+xz-9e:    %s\n" \
+            "$(awk -v a="$G_ZX" -v b="$G_XZ" 'BEGIN{printf "%+.2f%%", (a-b)*100/b}')"
+        printf "  --fast vs default size cost: %s\n" \
+            "$(awk -v a="$G_ZX_FAST" -v b="$G_ZX" 'BEGIN{printf "%+.2f%%", (a-b)*100/b}')"
+        printf "  --fast vs default speed:     %s\n" \
+            "$(awk -v a="$G_FAST_PACK_MS" -v b="$G_PACK_MS" 'BEGIN{printf "%+.2f%% (%.2fx)", (a-b)*100/b, b/a}')"
     fi
 fi
