@@ -6,6 +6,21 @@ Historical record of shipped milestones, completed bench measurements, current-s
 
 ## Current-state log (most recent first)
 
+## Current state (2026-05-13, M7 step 2 shipped)
+
+M1 + M2 + M3a–j + ZXLE_VER 3 final-step xz-9e + M5 --slow + per-fixture min-pack tier + M6 v1 + M6 v2 + M6 v3 + parser fuzz harness + M7 step 1 + **M7 step 2 (parallel --slow + default cross-codec tier)** ship end-to-end.
+
+**Headline M7 step 2 result (2026-05-13):** when `--slow` runs on a small input (total < 1 MB), `do_pack` invoked the slow tier (zpaq -m5 final) and the default tier (xz -9e final) sequentially and kept the smaller. Both tiers are independent — now each runs on its own thread (pthread + `min_pack_for_tier`) and we join + pick the winner. Pre-flight total-size summation moved out of `pack_run`'s side effects into an upfront stat loop so the gate decision happens before either thread launches.
+
+| Fixture (--slow path) | Master | M7 step 2 | Δ |
+|---|---:|---:|---:|
+| DOCX (real ZIP/L6) | 13,503 ms | **9,371 ms** | **−31%** |
+| JAR (real ZIP/L6) | 293 ms | **206 ms** | **−30%** |
+| JPEG (brunsli) | 204 ms | **122 ms** | **−40%** |
+| MP3 (packMP3) | 856 ms | **423 ms** | **−51%** |
+
+Non-eligible (≥1 MB) --slow fixtures unchanged. All --slow output sizes byte-identical. Round-trip OK across the full default bench (43 fixtures) and the 9 ZXLE_SLOW=1 fixtures. Ratios unchanged: 8-file per-file 0.3383, solid 0.3326.
+
 ## Current state (2026-05-13, M7 step 1 shipped)
 
 M1 + M2 + M3a–j + ZXLE_VER 3 final-step xz-9e + M5 --slow + per-fixture min-pack tier + M6 v1 + M6 v2 + M6 v3 + parser fuzz harness + **M7 step 1 (parallel probe ladders in pack_xz / pack_zst)** ship end-to-end.
@@ -353,6 +368,13 @@ Predicted shape held: mixed-content `.tar.xz` ties xz-9e (xz already crushes mix
 ---
 
 ## Shipped milestone details
+
+### M7 step 2 — Parallel --slow + default cross-codec tier (shipped 2026-05-13)
+- `do_pack` now spawns the slow tier (zpaq -m5 final) and the default tier (xz -9e final) on two pthreads when `--slow` is set on a total < 1 MB input. Each tier writes through `min_pack_for_tier` to its own out-path (`out` for slow, `out.def.tmp` for default), so their internal temp files don't collide. After both threads join, the smaller blob wins and we rename it to `out`.
+- Pre-flight: the input total-size summation that previously came out of `pack_run` as a side effect now happens upfront via a stat loop, so the cross-codec gate (`total_in < 1 MB`) is decided before either thread launches.
+- New `TierJob` struct + `tier_worker` thread entry in `src/zxle.c`; `#include <pthread.h>` added. Non-eligible cases fall through to a single sequential `min_pack_for_tier` (unchanged behavior).
+- Measured (`ZXLE_SLOW=1 bash tests/bench.sh`): DOCX 13.5 s → 9.4 s (−31%), JAR 293 → 206 ms (−30%), JPEG 204 → 122 ms (−40%), MP3 856 → 423 ms (−51%). Non-eligible (≥1 MB) --slow fixtures unchanged. All --slow output sizes byte-identical to master.
+- Round-trip OK across the full default bench (43 fixtures) and the 9 `ZXLE_SLOW=1` fixtures. Ratios byte-identical: 8-file per-file 0.3383, solid 0.3326. M7 steps 3–4 (unwrap+force_opaque parallelism, `--fast` flag) still pending.
 
 ### M7 step 1 — Parallel probe ladders in pack_xz / pack_zst (shipped 2026-05-13)
 - New helper `try_run_parallel(cmds[], n, rcs[])` in `src/util.c` spawns one pthread per command, each calling `system()`, joins all, and returns the per-command exit codes. Falls back to serial `system()` for any thread `pthread_create` declines to spawn, so rcs[] is always fully populated.
