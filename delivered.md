@@ -6,6 +6,24 @@ Historical record of shipped milestones, completed bench measurements, current-s
 
 ## Current-state log (most recent first)
 
+## Current state (2026-05-13, large-corpus measurement shipped)
+
+Same delivered milestones as the prior entry (M1+M2+M3a–j+ZXLE_VER 3+M5--slow+M6 v1/v2/v3+fuzz harness+M7 steps 1/2/4); new **large-corpus measurement** lands in `tests/bench.sh` (silesia --fast variant + `ZXLE_GIANT=1` 1.06 GB section).
+
+**Headline 1 GB result (2026-05-13):** zxle's solid-mode pipeline matches `tar + xz-9e` byte-for-byte at 1 GB scale, confirming the architecture has no cliff past the 128 MiB long-window. --fast scales better with input size (9.07× at 1 GB vs 5.9× at 51 MB) because the 8 MiB block fan-out gets more concurrent work per input.
+
+| Scale | Mode | Size | Ratio | Pack | --fast speedup |
+|---|---|---:|---:|---:|---:|
+| 51 MB (silesia mozilla, single) | default | 13.4 MB | — | 23.4 s | — |
+| 51 MB | --fast | 13.7 MB | — | 4.0 s | 5.9× |
+| 211 MB (silesia tar) | default | 48.1 MB | 0.2269 | 247 s | — |
+| 211 MB | --fast | 49.6 MB | 0.2338 | 42 s | 5.9× |
+| 1.06 GB (silesia × 5 opaque) | default | 241.9 MB | 0.2283 | 617 s | — |
+| 1.06 GB | --fast | 249.7 MB | 0.2356 | 68 s | **9.07×** |
+| 1.06 GB | tar+xz-9e | 241.9 MB | 0.2283 | 606 s | — |
+
+Round-trip OK across all three scales. Memory: zxle held ~1 GB RSS mid-encode on the 1 GB run — single-pass `read_whole_file` model still works at this scale, will break above the ~3-4 GB single-allocation ceiling on 64-bit Windows. Default bench unchanged: 8-file per-file 0.3383, solid 0.3326, 43/43 RT OK.
+
 ## Current state (2026-05-13, M7 step 4 shipped)
 
 M1 + M2 + M3a–j + ZXLE_VER 3 final-step xz-9e + M5 --slow + per-fixture min-pack tier + M6 v1 + M6 v2 + M6 v3 + parser fuzz harness + M7 step 1 + M7 step 2 + **M7 step 4 (--fast flag for parallel final-step xz encode)** ship end-to-end.
@@ -380,6 +398,14 @@ Predicted shape held: mixed-content `.tar.xz` ties xz-9e (xz already crushes mix
 ---
 
 ## Shipped milestone details
+
+### Large-corpus measurement — silesia --fast + 1 GB GIANT bench (shipped 2026-05-13)
+- `tests/bench.sh` ZXLE_SILESIA section gains a `--fast` mode alongside default and `--slow`. Same fixture (12 silesia files, 211 MB), three pack runs, all round-trip-checked.
+- New `ZXLE_GIANT=1` gated section builds `tests/baseline/giant.bin` as `'Z' + (silesia.tar concatenated 5x)` for a 1,059,788,801 B fixture. The single leading byte shifts the ustar magic off `pack_tar`'s +257 offset check, so the file lands in `KIND_OPAQUE` and the whole 1 GB flows into bucket 0 — what we want for an honest final-step codec measurement. (An initial attempt without the byte hit a `pack_tar` multi-tar edge case that produced a meaningless +270% vs xz-9e; documented inline as a warning.)
+- Measured at 1 GB: zxle solid 0.2283 / 617 s; zxle --fast 0.2356 / 68 s (9.07× speedup, +3.22% size); tar+xz-9e 0.2283 / 606 s. zxle vs tar+xz-9e = **+0.00%** at GB scale (matches byte-level baseline; expected, since opaque routing degenerates to xz-9e of the raw bucket). Round-trip OK on both modes.
+- Scaling observation: --fast speedup grows with input — 5.9× at 51 MB single-file and 211 MB silesia, **9.07× at 1 GB**. The 8 MiB block fan-out has more concurrent work to give the CPU as the input grows past N × block_size × cores.
+- Memory observation: zxle process held ~1 GB RSS mid-encode on the 1 GB run. The single-pass `read_whole_file` model still works at this scale and will break above the ~3-4 GB single-allocation ceiling on 64-bit Windows. Real streaming pack/unpack remains pending (roadmap "Validation / quality gaps").
+- No code changes; bench-only. Default bench unchanged (43/43 RT OK).
 
 ### M7 step 4 — --fast flag for parallel final-step xz encode (shipped 2026-05-13)
 - New `--fast` pack flag parsed in `do_pack` (peer of `--slow`) and threaded through `min_pack_for_tier` / `pack_run` / `TierJob`. When set, the two final-step xz commands (CODEC_XZ_9E and CODEC_XZ_9E_X86) swap `--threads=1` for `--threads=0 --block-size=8388608`. Manifest layout unchanged; `xz -d` consumes single- and multi-block streams identically, so no decoder work needed.
