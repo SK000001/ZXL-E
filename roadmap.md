@@ -4,13 +4,13 @@ Forward-looking plan: what's still ahead, what we haven't done that others have,
 
 ---
 
-## Current state (2026-05-09, M6 v3 shipped)
+## Current state (2026-05-13, M7 step 1 shipped)
 
-M1 + M2 + M3a–j + ZXLE_VER 3 final-step xz-9e + M5 --slow + per-fixture min-pack tier + M6 v1 + M6 v2 + parser fuzz harness + **M6 v3 (per-OP bucket routing)** ship end-to-end.
+M1 + M2 + M3a–j + ZXLE_VER 3 final-step xz-9e + M5 --slow + per-fixture min-pack tier + M6 v1 + M6 v2 + M6 v3 + parser fuzz harness + **M7 step 1 (parallel probe ladders in pack_xz / pack_zst)** ship end-to-end.
 
 Headline numbers and the milestone-by-milestone history are in [delivered.md](delivered.md). Latest reproducible bench numbers live in [README.md](README.md) "Headline numbers" table.
 
-The honest gap inventory ("what others have, we don't") is the next section. M7/M8/M9 are the only unstarted milestones in the roadmap.
+The honest gap inventory ("what others have, we don't") is the next section. M7 steps 2–4 (min-pack tier parallelism, unwrap+force_opaque parallelism, `--fast` flag) plus M8/M9 are the remaining unstarted items in the roadmap.
 
 ---
 
@@ -94,7 +94,7 @@ Five-stage pipeline as actually shipped (the original M4 content-defined orderin
 
 Shipped milestones live in [delivered.md](delivered.md).
 
-### M7 — CPU parallelism / multi-threading (planned)
+### M7 — CPU parallelism / multi-threading (partially shipped)
 
 **Branch:** `feat/m7-mt` · **Expected:** 2–8× pack-time speedup on multi-core machines (typical: 4–8 cores) with **zero ratio change** by default and an optional `--fast` flag that trades determinism for additional speed.
 
@@ -102,7 +102,7 @@ Shipped milestones live in [delivered.md](delivered.md).
 
 **Plan:**
 
-1. **Parallelize probe ladders in `pack_xz` / `pack_zst`** — each (level, --long-or-extreme) candidate runs as an independent subprocess; first cmp-match wins. Up to 4× on big inputs where the ladder dominates pack time (e.g., real_coreutils_src.tar.xz at 46 s currently).
+1. ~~**Parallelize probe ladders in `pack_xz` / `pack_zst`**~~ — **shipped 2026-05-13 (M7 step 1).** All `(level, --extreme)` / `(level, --long)` candidates run concurrently via `try_run_parallel` (pthreads + `system()`); lowest-ladder-index byte-identical match wins. Measured: real_coreutils.deb 15.4 s → 6.4 s (−58%), real_coreutils_src.tar.xz 53.2 s → 33.1 s (−38%). Details in delivered.md.
 2. **Parallelize the per-fixture min-pack tier** (slow vs default) when both are needed. Concurrent fork/spawn; wait on both; pick smaller. Halves pack time on small `--slow` fixtures.
 3. **Parallelize the unwrap+force_opaque pair** when both are needed (silesia.mozilla shape). Same pattern as #2.
 4. **`--fast` flag**: opt into multi-threaded final-step codec (`xz -T0` or `zstd -T0`). Output isn't byte-identical across runs, but unpack is unaffected (decoder is single-threaded-deterministic). Gate behind the flag because some users want bit-exact reproducibility.

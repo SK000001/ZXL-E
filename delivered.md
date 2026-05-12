@@ -6,6 +6,22 @@ Historical record of shipped milestones, completed bench measurements, current-s
 
 ## Current-state log (most recent first)
 
+## Current state (2026-05-13, M7 step 1 shipped)
+
+M1 + M2 + M3a–j + ZXLE_VER 3 final-step xz-9e + M5 --slow + per-fixture min-pack tier + M6 v1 + M6 v2 + M6 v3 + parser fuzz harness + **M7 step 1 (parallel probe ladders in pack_xz / pack_zst)** ship end-to-end.
+
+**Headline M7 step 1 result (2026-05-13):** pack_xz and pack_zst now run their probe candidates concurrently via a new `try_run_parallel` helper (pthreads + `system()`, each candidate into a unique rt file). After join, the lowest-ladder-index byte-identical match wins. Output recipes are unchanged — parallelism only affects encode wall time, not which candidate is selected.
+
+| Case | Master | M7 step 1 | Δ |
+|---|---:|---:|---:|
+| real_coreutils.deb (zst path) | 15,423 ms | **6,430 ms** | **−58%** |
+| real_coreutils_src.tar.xz | 53,205 ms | **33,123 ms** | **−38%** |
+| mixed.tar.zst | 4,054 ms | 4,467 ms | +10% |
+| mixed.tar.zst3 (level-3 ladder) | 3,275 ms | 4,402 ms | +34% |
+| mixed.tar.xz | 4,022 ms | 4,431 ms | +10% |
+
+Small-fixture cases regress 5–34% (subprocess fan-out overhead when the serial loop would have terminated at probe 1–3); absolute regression <1.2 s per fixture, dwarfed by the multi-second wins on the cases where probes don't match quickly. Ratios byte-identical: 8-file per-file 0.3383, solid 0.3326. All 23 bench fixtures + 8-file corpus + competitor sections round-trip OK. Makefile gains `-lpthread`.
+
 ## Current state (2026-05-09, M6 v3 shipped)
 
 M1 + M2 + M3a–j + ZXLE_VER 3 final-step xz-9e + M5 --slow + per-fixture min-pack tier + M6 v1 + M6 v2 + parser fuzz harness + **M6 v3 (per-OP bucket routing)** ship end-to-end.
@@ -337,6 +353,13 @@ Predicted shape held: mixed-content `.tar.xz` ties xz-9e (xz already crushes mix
 ---
 
 ## Shipped milestone details
+
+### M7 step 1 — Parallel probe ladders in pack_xz / pack_zst (shipped 2026-05-13)
+- New helper `try_run_parallel(cmds[], n, rcs[])` in `src/util.c` spawns one pthread per command, each calling `system()`, joins all, and returns the per-command exit codes. Falls back to serial `system()` for any thread `pthread_create` declines to spawn, so rcs[] is always fully populated.
+- `pack_xz` and `pack_zst` build their full candidate list up front (ladder entries for xz, the 8-probe `(level, --long)` Cartesian product for zst), give each candidate its own `rt.<i>.xz` / `rt.<i>.zst` temp path, fire them all in parallel, then walk results in ladder priority order to pick the first match. Identical to the prior serial behavior in terms of which candidate wins and what bytes land in the recipe.
+- Makefile: `LDFLAGS` gains `-lpthread` (resolves to MinGW winpthreads on Windows; built fine on the project's MinGW toolchain).
+- Pack-time wins on the cases where probes don't match early: real_coreutils.deb 15.4 s → 6.4 s (−58%); real_coreutils_src.tar.xz 53.2 s → 33.1 s (−38%). Small-fixture overhead of 5–34% on inputs where the serial loop would have matched at probe 1–3 — absolute <1.2 s, accepted as a net win.
+- Round-trip OK on all 23 bench fixtures + 8-file corpus. Ratios byte-identical (per-file 0.3383, solid 0.3326). M7 steps 2–4 (min-pack tier parallelism, unwrap+force_opaque parallelism, `--fast` flag) still pending.
 
 ### M1 — Walking skeleton (shipped 2026-04-29)
 - `zxle pack` / `zxle unpack` working, manifest + solid zstd-19 payload.
