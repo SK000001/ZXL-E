@@ -6,6 +6,18 @@ Historical record of shipped milestones, completed bench measurements, current-s
 
 ## Current-state log (most recent first)
 
+## Current state (2026-05-13, M7 step 4 shipped)
+
+M1 + M2 + M3a–j + ZXLE_VER 3 final-step xz-9e + M5 --slow + per-fixture min-pack tier + M6 v1 + M6 v2 + M6 v3 + parser fuzz harness + M7 step 1 + M7 step 2 + **M7 step 4 (--fast flag for parallel final-step xz encode)** ship end-to-end.
+
+**Headline M7 step 4 result (2026-05-13):** new `--fast` pack flag switches both final-step xz invocations (`CODEC_XZ_9E`, `CODEC_XZ_9E_X86`) from `--threads=1` to `--threads=0 --block-size=8388608`. The explicit 8 MiB block size is required because preset 9e's 64 MiB LZMA2 dict drives a 192 MiB default block under `-T0` — inputs below that fit in one block and don't parallelize. Manifest layout unchanged (xz -d handles multi-block streams transparently). CODEC_ZPAQ_M5 unchanged (zpaq is single-threaded; `--fast` is a no-op when combined with `--slow`).
+
+| Fixture | Default pack | --fast pack | size cost |
+|---|---:|---:|---:|
+| silesia mozilla (51 MB single file) | 23.4 s | **4.0 s (−83%, 5.9×)** | +2.77% |
+
+Default bench unchanged (no `--fast` → byte-identical to master). 8-file per-file 0.3383, solid 0.3326. 43/43 default-bench fixtures + 9/9 ZXLE_SLOW=1 fixtures round-trip OK. M7 step 3 (unwrap+force_opaque parallelism) deferred — speculative parallelism would regress default-bench cases where opaque is currently skipped.
+
 ## Current state (2026-05-13, M7 step 2 shipped)
 
 M1 + M2 + M3a–j + ZXLE_VER 3 final-step xz-9e + M5 --slow + per-fixture min-pack tier + M6 v1 + M6 v2 + M6 v3 + parser fuzz harness + M7 step 1 + **M7 step 2 (parallel --slow + default cross-codec tier)** ship end-to-end.
@@ -368,6 +380,13 @@ Predicted shape held: mixed-content `.tar.xz` ties xz-9e (xz already crushes mix
 ---
 
 ## Shipped milestone details
+
+### M7 step 4 — --fast flag for parallel final-step xz encode (shipped 2026-05-13)
+- New `--fast` pack flag parsed in `do_pack` (peer of `--slow`) and threaded through `min_pack_for_tier` / `pack_run` / `TierJob`. When set, the two final-step xz commands (CODEC_XZ_9E and CODEC_XZ_9E_X86) swap `--threads=1` for `--threads=0 --block-size=8388608`. Manifest layout unchanged; `xz -d` consumes single- and multi-block streams identically, so no decoder work needed.
+- Block-size choice: preset 9e's 64 MiB LZMA2 dict drives a 192 MiB default block under `-T0`. Without an explicit block size, inputs below 192 MiB fit in one block and `-T0` doesn't actually parallelize — naive `--threads=0` gave only a ~2% improvement on silesia mozilla. 8 MiB blocks force per-CPU parallelism on every multi-MiB final-step encode at a measured +2.77% size cost. Sweep on mozilla 51 MB: T1 24.1 s → T0 8 MiB 4.3 s (5.6×, +2.77%) vs T0 16 MiB 7.6 s (3.2×, +1.61%). Picked 8 MiB because `--fast` is opt-in for the aggressive trade.
+- CODEC_ZPAQ_M5 unchanged: zpaq is single-threaded in the 7.15 binary we ship, and `--fast` is documented as a no-op when combined with `--slow`.
+- Measured wall time (silesia mozilla, single 51 MB file → bucket 0 only): default 23.4 s, --fast 4.0 s (−83%). Default bench unchanged (no `--fast` flag → byte-identical to master). All 43 default-bench fixtures + 9 `ZXLE_SLOW=1` fixtures round-trip OK. Ratios byte-identical: per-file 0.3383, solid 0.3326.
+- M7 step 3 (unwrap + force_opaque parallelism) deferred: the existing min-pack opaque-pass skip condition is the common path on the default bench, so speculative parallelism would add opaque-pass work to most fixtures and regress wall time. Would need an upfront heuristic predicting when both passes will run; not pursued in this milestone.
 
 ### M7 step 2 — Parallel --slow + default cross-codec tier (shipped 2026-05-13)
 - `do_pack` now spawns the slow tier (zpaq -m5 final) and the default tier (xz -9e final) on two pthreads when `--slow` is set on a total < 1 MB input. Each tier writes through `min_pack_for_tier` to its own out-path (`out` for slow, `out.def.tmp` for default), so their internal temp files don't collide. After both threads join, the smaller blob wins and we rename it to `out`.

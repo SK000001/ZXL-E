@@ -4,13 +4,13 @@ Forward-looking plan: what's still ahead, what we haven't done that others have,
 
 ---
 
-## Current state (2026-05-13, M7 step 2 shipped)
+## Current state (2026-05-13, M7 step 4 shipped)
 
-M1 + M2 + M3a–j + ZXLE_VER 3 final-step xz-9e + M5 --slow + per-fixture min-pack tier + M6 v1 + M6 v2 + M6 v3 + parser fuzz harness + M7 step 1 + **M7 step 2 (parallel --slow + default cross-codec tier)** ship end-to-end.
+M1 + M2 + M3a–j + ZXLE_VER 3 final-step xz-9e + M5 --slow + per-fixture min-pack tier + M6 v1 + M6 v2 + M6 v3 + parser fuzz harness + M7 step 1 + M7 step 2 + **M7 step 4 (--fast flag for parallel final-step xz encode)** ship end-to-end.
 
 Headline numbers and the milestone-by-milestone history are in [delivered.md](delivered.md). Latest reproducible bench numbers live in [README.md](README.md) "Headline numbers" table.
 
-The honest gap inventory ("what others have, we don't") is the next section. M7 steps 3–4 (unwrap+force_opaque parallelism, `--fast` flag) plus M8/M9 are the remaining unstarted items in the roadmap.
+The honest gap inventory ("what others have, we don't") is the next section. M7 step 3 (unwrap+force_opaque parallelism — deferred), M8 (GPU/ML), and M9 (specialized model training) are the remaining unstarted items in the roadmap.
 
 ---
 
@@ -104,8 +104,8 @@ Shipped milestones live in [delivered.md](delivered.md).
 
 1. ~~**Parallelize probe ladders in `pack_xz` / `pack_zst`**~~ — **shipped 2026-05-13 (M7 step 1).** All `(level, --extreme)` / `(level, --long)` candidates run concurrently via `try_run_parallel` (pthreads + `system()`); lowest-ladder-index byte-identical match wins. Measured: real_coreutils.deb 15.4 s → 6.4 s (−58%), real_coreutils_src.tar.xz 53.2 s → 33.1 s (−38%). Details in delivered.md.
 2. ~~**Parallelize the per-fixture min-pack tier** (slow vs default) when both are needed.~~ — **shipped 2026-05-13 (M7 step 2).** When `--slow` runs the cross-codec tier (total < 1 MB), both tiers now run on their own pthread and the smaller blob wins. Measured: DOCX 13.5 s → 9.4 s (−31%), JAR 293 → 206 ms (−30%), JPEG 204 → 122 ms (−40%), MP3 856 → 423 ms (−51%). Details in delivered.md.
-3. **Parallelize the unwrap+force_opaque pair** when both are needed (silesia.mozilla shape). Same pattern as #2.
-4. **`--fast` flag**: opt into multi-threaded final-step codec (`xz -T0` or `zstd -T0`). Output isn't byte-identical across runs, but unpack is unaffected (decoder is single-threaded-deterministic). Gate behind the flag because some users want bit-exact reproducibility.
+3. **Parallelize the unwrap+force_opaque pair** when both are needed (silesia.mozilla shape) — **deferred.** The existing min-pack opaque-pass skip condition fires on most default-bench fixtures (unwrap is a clean win), so speculatively running opaque in parallel would add work to most fixtures and regress wall time. Would need an upfront heuristic that predicts when both passes will actually run. Not pursued; revisit when there's a corpus where opaque-pass-runs is the common case.
+4. ~~**`--fast` flag**~~ — **shipped 2026-05-13 (M7 step 4).** Both final-step xz invocations switch from `--threads=1` to `--threads=0 --block-size=8388608` when `--fast` is set. Manifest unchanged (`xz -d` handles multi-block streams). Measured on silesia mozilla (51 MB): 23.4 s → 4.0 s (−83%, 5.9×) at +2.77% size. Details in delivered.md.
 5. **Multi-threaded sniffer** (M6 prerequisite — already shipped) — content-type sniffing can run per-entry in parallel during the unwrap walker.
 
 **Risks:** subprocess fan-out on Windows is heavier than POSIX `fork`; need to use `posix_spawn` consistently. Determinism gate (`--fast` flag) needs careful manifest-flag plumbing (similar to `--slow`).
