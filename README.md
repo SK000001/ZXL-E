@@ -4,9 +4,9 @@ Recursive format-aware transform pipeline for general-purpose compression.
 
 Goal: be the smallest archive across **every** file type, not just one. Sister project to [ZXL](../Zxl) (which targets PE binaries specifically). ZXL-E uses ZXL as one of its backends when it detects PE streams.
 
-## Status (2026-05-09, M6 v3 shipped)
+## Status (2026-05-13, M7 steps 1/2/4 + large-corpus measurement shipped)
 
-Default mode (xz-9e final-step + BCJ-x86 sub-stream for PE/ELF content) ties or beats xz-9e on the standard Silesia corpus and beats it by 6–60% on container-shaped artifacts. Optional `--slow` mode (zpaq -m5 final-step) matches the SOTA general-purpose codec on Silesia (ratio 0.1891) and stacks the gain on top of container unwrap (−29% to −47% vs xz-9e baseline on container fixtures).
+Default mode (xz-9e final-step + BCJ-x86 sub-stream for PE/ELF content) ties or beats xz-9e on the standard Silesia corpus and beats it by 6–60% on container-shaped artifacts. Optional `--slow` mode (zpaq -m5 final-step) matches the SOTA general-purpose codec on Silesia (ratio 0.1891) and stacks the gain on top of container unwrap (−29% to −47% vs xz-9e baseline on container fixtures). Optional `--fast` mode (xz -T0 --block-size=8MiB final-step) gives **5.9–9.07× pack speedup** at +3% size cost; speedup grows with input — 9.07× at 1 GB. Measured up to 1 GB (`ZXLE_GIANT=1`); no solid-mode cliff past the 128 MiB long-window.
 
 | Stage | Status |
 |---|---|
@@ -36,14 +36,19 @@ Default mode (xz-9e final-step + BCJ-x86 sub-stream for PE/ELF content) ties or 
 | **M6 v2 container-aware BCJ routing** | **shipped** — +2.0–2.8 pp on pure-PE containers (ZIP/TAR/AR/GZIP/BZIP2/ZSTD/XZ); ZXLE_VER 4 → 5 |
 | **Parser fuzz harness (`tests/fuzz.sh`)** | **shipped** — 700 mutations × 7 kinds clean; uncovered + fixed `raw_inflate_dyn` truncated-stream infinite-realloc hang |
 | **M6 v3 per-OP bucket routing** | **shipped** — recipes carry per-OP bucket bytes; mixed-content fixtures gain 1.3–8.2 pp; ZXLE_VER 5 → 6 |
+| **M7 step 1 parallel probe ladders** | **shipped** — pack_xz / pack_zst run candidates concurrently; real_coreutils.deb −58%, real_coreutils_src.tar.xz −38% pack time |
+| **M7 step 2 parallel --slow + default tier** | **shipped** — cross-codec tier runs both tiers on threads; DOCX −31%, MP3 −51% pack time on --slow path |
+| **M7 step 4 --fast flag** | **shipped** — `xz -T0 --block-size=8MiB` final-step; 5.9× at 51 MB, 9.07× at 1 GB; +3% size cost |
+| **Large-corpus measurement (1 GB)** | **shipped** — `ZXLE_GIANT=1` validates no solid-mode cliff at 1 GB; zxle matches tar+xz-9e +0.00% |
 
-## Headline numbers (2026-05-09)
+## Headline numbers (2026-05-13)
 
 | Fixture | xz-9e | zxle (default) | zxle --slow |
 |---|---|---|---|
 | 8-file corpus (per-file ratio) | 0.3524 | **0.3383** | (not measured per-file) |
 | 8-file corpus (solid ratio) | — | **0.3326** | — |
-| Silesia 211 MB (ratio) | 0.2284 | 0.2284 | **0.1891** (matches zpaq -m5) |
+| Silesia 211 MB (ratio) | 0.2284 | 0.2269 | **0.1891** (matches zpaq -m5) |
+| GIANT 1.06 GB (ratio) | 0.2283 | **0.2283** (+0.00% vs xz-9e) | — (impractical) |
 | pe-deflate.zip | — | **−22.44%** | **−32.73%** vs xz-9e |
 | pe-deflate-l6.zip | — | **−22.76%** | **−33.00%** vs xz-9e |
 | sample.docx | — | −19.23% | **−47.41%** vs xz-9e |
@@ -60,6 +65,14 @@ Default mode (xz-9e final-step + BCJ-x86 sub-stream for PE/ELF content) ties or 
 | xz-in.tar | — | **−4.22%** | — |
 | zst-in.tar | — | **−8.47%** | — |
 | sample.jar | — | −59.33% | −59.33% (--slow tier picks default) |
+
+`--fast` pack-time speedup (size cost +2.8–3.2%, ratio unchanged in the manifest format):
+
+| Fixture | default pack | --fast pack | speedup |
+|---|---:|---:|---:|
+| silesia mozilla (51 MB single) | 23.4 s | 4.0 s | **5.9×** |
+| Silesia 211 MB | 247 s | 42 s | **5.9×** |
+| GIANT 1.06 GB | 617 s | 68 s | **9.07×** |
 
 ## Architecture
 
@@ -114,14 +127,14 @@ brunsli's `cbrunsli`/`dbrunsli`, packMP3, and zpaq must be on `PATH` at runtime 
 ## Use
 
 ```
-zxle pack [--slow] out.zxle file1 file2 ...
+zxle pack [--slow] [--fast] out.zxle file1 file2 ...
 zxle unpack out.zxle outdir/
 ```
 
-Default mode finalizes the solid stream with `xz -9e --threads=1`. `--slow` finalizes with `zpaq -m5` (cmix-class context mixing); 5–10× slower pack but dense enough to match zpaq -m5 on the standard Silesia corpus while still capturing the container-unwrap wins. The format flag rides in the manifest header, so `unpack` auto-detects which final-step codec was used.
+Default mode finalizes the solid stream with `xz -9e --threads=1`. `--slow` finalizes with `zpaq -m5` (cmix-class context mixing); 5–10× slower pack but dense enough to match zpaq -m5 on the standard Silesia corpus while still capturing the container-unwrap wins. `--fast` finalizes with `xz -9e --threads=0 --block-size=8MiB` (one worker per logical CPU, 8 MiB blocks); ~6–9× faster pack at +3% size cost, scales better with input size. `--slow` codec choice rides in the manifest header so `unpack` auto-detects; `--fast` only changes the encoder side and `xz -d` consumes the multi-block stream transparently.
 
 ## See also
 
 - [roadmap.md](roadmap.md) — current state, what's shipped, what's next, tried-and-reverted graveyard.
 - [graph.md](graph.md) — local-only source-tree index (gitignored).
-- [tests/bench.sh](tests/bench.sh) — bench script. Set `ZXLE_SILESIA=1` to run the 211 MB Silesia corpus; `ZXLE_SLOW=1` to run `--slow` against headline fixtures.
+- [tests/bench.sh](tests/bench.sh) — bench script. Set `ZXLE_SILESIA=1` for the 211 MB Silesia corpus (default + --fast + optional --slow), `ZXLE_SLOW=1` to add `--slow` against headline fixtures, `ZXLE_GIANT=1` for the 1.06 GB constructed bench.
