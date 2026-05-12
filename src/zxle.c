@@ -17,6 +17,7 @@
 #include "jpeg.h"
 #include "mp3.h"
 #include "recipe.h"
+#include <pthread.h>
 
 typedef struct {
     const char *path;
@@ -348,6 +349,25 @@ static int min_pack_for_tier(const char *out, int n, char **files, int slow,
     return unwrapped;
 }
 
+/* M7 step 2: when --slow runs both the slow and default tiers (small-input
+ * cross-codec min-pack), they don't depend on each other -- run them in
+ * parallel and keep the smaller. Both tiers use disjoint out-path prefixes
+ * so their internal temp files don't collide. */
+typedef struct {
+    const char *out;
+    int          n;
+    char       **files;
+    int          slow;
+    long long    osz;
+    uint64_t     total;
+} TierJob;
+
+static void *tier_worker(void *arg) {
+    TierJob *j = (TierJob *)arg;
+    min_pack_for_tier(j->out, j->n, j->files, j->slow, &j->osz, &j->total);
+    return NULL;
+}
+
 static int do_pack(int argc, char **argv) {
     /* Parse leading flags: --slow finalizes the solid stream with zpaq -m5
      * (cmix-class context-mixing) instead of xz -9e. 5-10x slower on raw
@@ -374,22 +394,44 @@ static int do_pack(int argc, char **argv) {
      *      MP3 481 KB) without bloating large-input pack time -- on big
      *      inputs --slow always wins so the second pack would be wasted. */
     long long osz; uint64_t total;
-    min_pack_for_tier(out, n, files, slow, &osz, &total);
 
-    if (slow && total < (uint64_t)1024 * 1024) {
+    /* M7 step 2: decide cross-codec eligibility upfront (sum input sizes via
+     * stat) so we can spawn the slow + default tiers concurrently rather than
+     * serially. Non-eligible runs (no --slow, or total >= 1 MB) fall through
+     * to a single sequential tier as before. */
+    uint64_t total_in = 0;
+    if (slow) {
+        for (int i = 0; i < n; i++) {
+            struct stat st;
+            if (stat(files[i], &st) == 0) total_in += (uint64_t)st.st_size;
+        }
+    }
+
+    if (slow && total_in < (uint64_t)1024 * 1024) {
         char def_path[1024];
         snprintf(def_path, sizeof(def_path), "%s.def.tmp", out);
-        long long def_osz; uint64_t def_total;
-        min_pack_for_tier(def_path, n, files, 0, &def_osz, &def_total);
-        if (def_osz > 0 && def_osz < osz) {
+        TierJob slow_job = { out,      n, files, 1, -1, 0 };
+        TierJob def_job  = { def_path, n, files, 0, -1, 0 };
+        pthread_t th_slow, th_def;
+        int spawn_slow = pthread_create(&th_slow, NULL, tier_worker, &slow_job);
+        int spawn_def  = pthread_create(&th_def,  NULL, tier_worker, &def_job);
+        if (spawn_slow != 0) tier_worker(&slow_job);
+        if (spawn_def  != 0) tier_worker(&def_job);
+        if (spawn_slow == 0) pthread_join(th_slow, NULL);
+        if (spawn_def  == 0) pthread_join(th_def,  NULL);
+        osz   = slow_job.osz;
+        total = slow_job.total;
+        if (def_job.osz > 0 && def_job.osz < slow_job.osz) {
             fprintf(stderr, "min-pack: default %lld < slow %lld -> using default\n",
-                    def_osz, osz);
+                    def_job.osz, slow_job.osz);
             unlink(out);
             if (rename(def_path, out) != 0) die("rename def->out");
-            osz = def_osz;
+            osz = def_job.osz;
         } else {
             unlink(def_path);
         }
+    } else {
+        min_pack_for_tier(out, n, files, slow, &osz, &total);
     }
 
     fprintf(stderr, "packed %d file(s), orig=%llu zxle=%lld ratio=%.4f\n",
