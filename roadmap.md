@@ -41,7 +41,7 @@ Most of these are not novel research problems — they're engineering items that
 
 ### Coverage gaps the synthetic corpus doesn't surface
 
-- **Real `.deb` re-fixture** — replace `mixed.deb` (synthetic, uses inner `.tar.gz`) with a real Debian package whose data layer is `.tar.xz` or `.tar.zst`. Confirms M3f-ar headline holds on the actually-shipped layout.
+- ~~**Real `.deb` re-fixture**~~ — **closed 2026-05-14.** `tests/corpus/real_hello.deb` (data layer `.tar.xz`, hello_2.10-3) and `tests/corpus/real_coreutils.deb` (data layer `.tar.zst`, coreutils 9.5) are wired into `tests/bench.sh` (lines 186-187). M3f-ar headline holds on both shipped layouts.
 - **Multi-member gzip / bzip2** — small extension; rare in practice; add only if the real-world bench shows a hit.
 - **GNU tar widening** — base-256 size encoding, pax extended headers, sparse files, long-name records. Currently rejected → KIND_OPAQUE on real GNU-formatted tars. Real-world coverage, no headline.
 - **ZIP variants** — ZIP64 (large archives), encrypted (legacy ZipCrypto + AES), DEFLATE64, BZIP2-in-ZIP, LZMA-in-ZIP, prefix bytes (self-extractors). All currently fall through to KIND_OPAQUE; common in real Windows-world ZIPs.
@@ -62,7 +62,7 @@ Most of these are not novel research problems — they're engineering items that
 
 ### Validation / quality gaps
 
-- **No competitor benchmark.** We compare against xz-9e (the universal target). For honest positioning we should also bench against precomp, freearc, zpaq, kanzi on the same fixtures. Likely outcome: zxle wins on container-heavy artifacts, loses on long-text where zpaq is king.
+- **Competitor benchmark — precomp + zpaq closed; freearc + kanzi pending.** `tests/bench.sh` runs precomp v0.4.7 and zpaq v7.15 `-m5` against zxle on the headline-positive fixtures (lines 221-329) plus zpaq -m5 in the silesia baselines (lines 480-557). freearc and kanzi remain unbenched — neither is bundled or on Windows MinGW PATH; would need a setup ship before measurement. Likely outcome on the unmeasured pair: zxle wins on container-heavy artifacts, loses to zpaq-class on long-text (already visible in the silesia zpaq baseline).
 - ~~**No size-scaling data.**~~ — **closed 2026-05-13.** Measured at 51 MB / 211 MB / 1.06 GB via `ZXLE_SILESIA=1` and `ZXLE_GIANT=1`. No solid-mode cliff at 1 GB; zxle matches tar+xz-9e byte-for-byte on opaque routing. Memory bottleneck is `read_whole_file` at ~3-4 GB on 64-bit Windows. See delivered.md "Large-corpus measurement".
 - **No memory numbers reported anywhere.** Pack/unpack wall time now ships in `tests/bench.sh` (per-file `pk_ms`/`un_ms` columns plus a `perf:` line per container case, via bash 5 `EPOCHREALTIME`). Peak RSS still pending — needs a platform-specific wrapper (`/usr/bin/time -v` on Linux; PowerShell `Get-Process` or `wmic` on MSYS2 — neither uniform). First wall-time signals surfaced (2026-05-07): M3h-zsttar level-3 ladder pack ~19.9 s on a 1.4 MB input — the 7-entry `(level, --long)` probe ladder is the dominant pack-time hot spot; M3e-targz / M3f-ar at ~7 s on similar-size inputs.
 - **Fuzz coverage is shallow.** `tests/fuzz.sh` (shipped 2026-05-09) does ~50 random mutations × 7 kinds; found 1 bug (`raw_inflate_dyn` truncated-stream hang). A structured AFL/libFuzzer pass on each `pack_*` with format-aware corpora would surface deeper issues.
