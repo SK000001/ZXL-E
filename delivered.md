@@ -6,6 +6,18 @@ Historical record of shipped milestones, completed bench measurements, current-s
 
 ## Current-state log (most recent first)
 
+## Current state (2026-05-14, M8 scout-work measured + reframed)
+
+No headline-numbers change. Scout work for the GPU-match-finder milestone landed in `tools/m8/` (5 probes, all on master after FF-merge of `feat/m8-gpu-matchfind`). Key measurements:
+
+- **GPU SA throughput green (`tools/m8/sa_probe.cu`):** libcubwt BWT+SA on 100 MB silesia mix = 333 ms = **315 MB/s**, **178× xz -9e -T1** (1.77 MB/s) on the same input. VRAM ~2.0 GiB (20.5× input); ceiling ~300 MB/pass on this 6 GiB GPU.
+- **`ZSTD_compressSequences` validated (`tools/m8/seq_producer_probe.c`, `tools/m8/compress_seq_smoke.c`):** externally-supplied LZ77 sequence array roundtrips byte-identically through the standard zstd decoder.
+- **Ratio bottleneck is the parser, not the SA (`tools/m8/cpu_lz_probe.c`, `cpu_lz_optimal.c`):** SA-based greedy parse loses to `zstd -19` by +2 to +22%; optimal-DP over the longest match per position closes that to +1.55 to +14.05%. At 1 MB on this corpus, `zstd -19` already matches `xz -9e` (−0.2%), so the bar to clear is `zstd -19` and the gap is 1.5%. Full M8 details in [roadmap.md](roadmap.md#m8--gpu-match-finder-scout-done-2026-05-14-reframed-into-m8am8bm8c).
+
+**Reframe:** M8 splits into **M8a** (CPU optimal-parse competitive with `zstd -19`; 1–2 weeks, ratio gate), **M8b** (GPU SA integrated into the M8a pipeline; only after the gate passes), and **M8c** (chunked / >VRAM, deferred). If M8a cannot converge within +1% of `zstd -19` after multi-length candidates + repcodes + accurate cost model + two-pass refinement, M8 goes into "Tried and reverted" with M8a's numbers as the structural reason.
+
+Toolchain set up in this session (local-only, not committed): CUDA Toolkit 13.2.1 (`nvcc 13.2.78`), NVIDIA driver 596.36, MSVC 14.43 host compiler, libcubwt 1.6.3 + libsais 2.x under `third_party/` (gitignored).
+
 ## Current state (2026-05-14, XLSX + PPTX bench shipped)
 
 Same delivered milestones as the prior entry; new measurement closes the roadmap "OOXML beyond DOCX" coverage gap. `tests/make_fixtures.sh` now generates `sample.xlsx` (118 KB, workbook + sharedStrings + worksheet) and `sample.pptx` (223 KB, 40-slide deck) as minimal OOXML-shaped ZIP-of-XML at deflate L6, mirroring `sample.docx`. Both are wired into `tests/bench.sh` next to the DOCX line.

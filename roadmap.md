@@ -4,13 +4,13 @@ Forward-looking plan: what's still ahead, what we haven't done that others have,
 
 ---
 
-## Current state (2026-05-14, XLSX + PPTX bench shipped)
+## Current state (2026-05-14, XLSX + PPTX bench shipped; M8 scout-work measured + reframed)
 
 M1 + M2 + M3a–j + ZXLE_VER 3 final-step xz-9e + M5 --slow + per-fixture min-pack tier + M6 v1 + M6 v2 + M6 v3 + parser fuzz harness + M7 steps 1/2/4 + large-corpus measurement + **XLSX/PPTX bench (M2 ZIP path validated on OOXML beyond DOCX: −19.35% / −22.68% vs xz-9e)** ship end-to-end.
 
 Headline numbers and the milestone-by-milestone history are in [delivered.md](delivered.md). Latest reproducible bench numbers live in [README.md](README.md) "Headline numbers" table.
 
-The honest gap inventory ("what others have, we don't") is the next section. **Next milestone is M8 (GPU match-finder)** — solid-mode xz-9e ratio at 10–30× faster pack via GPU suffix-array + match-finder, with a CPU entropy-code stage; output bit-identical to standard xz. M7 step 3 (unwrap+force_opaque parallelism — deferred), M8b (neural/pretrained-model backend — parked research), and M9 (specialized model training — deferred) are the other unstarted items.
+**M8 scout (2026-05-14):** five probes in `tools/m8/` measured the GPU-match-finder hypothesis end-to-end on CPU before any production GPU plumbing. GPU SA throughput is fine (libcubwt: **315 MB/s** on 100 MB silesia, **178× xz-9e** match-finder); the `zstd_compressSequences` API accepts an externally-supplied LZ77 parse and roundtrips byte-identically. But the **ratio bottleneck is the parser, not the SA build**: greedy SA parse loses to zstd-19 by +2 to +22% across input sizes; optimal-DP over the longest match per position closes that to +1.55 to +14.05%. At 1 MB on this corpus, zstd-19 already matches xz-9e (−0.2%), so the bar to clear is zstd-19's internal parser — and closing the last 1.5% requires multi-length match candidates + repcodes + accurate Huffman/FSE cost model + two-pass refinement. None are research, all are 1–2 weeks of focused work. **M8 is split into M8a (CPU optimal-parse gate) + M8b (GPU SA integration) + M8c (chunked, deferred) below.** M7 step 3 (deferred), M8b-neural (parked research, renamed M8d), and M9 (deferred) are the other unstarted items.
 
 ---
 
@@ -110,51 +110,60 @@ Shipped milestones live in [delivered.md](delivered.md).
 
 **Risks:** subprocess fan-out on Windows is heavier than POSIX `fork`; need to use `posix_spawn` consistently. Determinism gate (`--fast` flag) needs careful manifest-flag plumbing (similar to `--slow`).
 
-### M8 — GPU match-finder (next milestone; planned 2026-05-14)
+### M8 — GPU match-finder (scout done 2026-05-14; reframed into M8a/M8b/M8c)
 
-**Branch:** `feat/m8-gpu-matchfind` · **Expected:** xz-9e ratio (= solid mode, ~0.2284 on Silesia) at **10–30× faster pack** on a GPU-equipped machine. Output is **bit-identical to standard xz/zstd** (no archive format change, decoder unchanged). Shipped as a `--gpu` flag, peer of `--fast` and `--slow`.
+**Branch history:** `feat/m8-gpu-matchfind` (5 commits, FF-merged to master 2026-05-14). All scout probes live under `tools/m8/` on master.
 
-**Core insight:** the bottleneck in high-ratio LZ codecs (xz-9e, zstd-19) is match-finding — for every input position, finding the longest repeated byte sequence in the long-window. This work is **embarrassingly parallel across positions** but requires seeing all prior bytes (solid dependency). GPU is the right tool: massively parallel reads with the whole input resident in VRAM. The slow sequential step (entropy coding) stays on CPU where it runs ~500 MB/s anyway.
+**Original spec:** xz-9e ratio at 10–30× faster pack via GPU SA + CPU entropy coder, output byte-identical to standard xz/zstd. Plan was a 2-week sprint.
 
-This is engineering, not research — algorithm is known (parallel suffix array + per-position match search), output is calculable, success criterion is concrete (same archive bytes, faster pack).
+**What the scout actually measured:** the scout work answered three questions that the original spec assumed-OK without measuring. Two passed; the third failed and reframes the milestone.
 
-**Architecture (key design rule):** the GPU match-finder emits a **clean intermediate `match-stream`** (sequence of (offset, length, literal_bytes) per input position). Downstream consumers compose:
+| question | answer | evidence |
+|---|---|---|
+| 1. Can GPU build a suffix array fast enough? | **Yes — 315 MB/s on RTX 3060 Laptop, 178× xz-9e match-finder.** Gating concern (memory-bandwidth bound) doesn't materialize. | `tools/m8/sa_probe.cu` via libcubwt v1.6.3 on 100 MB silesia mix. VRAM ~2.0 GiB (20.5× input). Ceiling ~300 MB per pass on 6 GiB VRAM. |
+| 2. Can zstd consume an externally-supplied LZ77 parse? | **Yes — `ZSTD_compressSequences` accepts whole-input sequence arrays and roundtrips byte-identically through standard decoders.** | `tools/m8/seq_producer_probe.c` (block-level API), `tools/m8/compress_seq_smoke.c` (whole-input API). |
+| 3. Does a globally-aware SA-based parse beat zstd-19? | **No. Greedy is +2 to +22% worse; optimal-DP over the longest match per position is +1.55 to +14.05% worse.** At 1 MB on this corpus, zstd-19 already matches xz-9e (−0.2%) so the bar to clear is zstd-19, not xz-9e separately. | `tools/m8/cpu_lz_probe.c` (greedy), `tools/m8/cpu_lz_optimal.c` (optimal-DP). Same silesia mix; measured at 102 400 / 130 000 / 200 000 / 1 000 000 byte prefixes. |
 
-```
-Input ──► GPU global match-finder ──► match-stream ──► [consumer]
-                                                          │
-                                                          ├── CPU optimal-parse + entropy-code  ──► standard xz/zstd archive   [M8 step 2]
-                                                          └── chunk-split + bridge side-stream  ──► ZXL-E chunked format       [M8 step 3, parked]
-```
+**Structural finding:** the ratio bottleneck is the parser, not the SA build. zstd-19's internal optimal parser already extracts most of the available LZ structure on this corpus. Closing the last ~1.5% gap requires implementing:
 
-This keeps step 3 (chunked output with cross-chunk "bridge" matches for parallel decode) as a *small increment* on top of the shared match-finder, not a separate milestone. We do not build step 3 today.
+- multi-length match candidates per position (we only emit the longest);
+- repcode tracking (cheaper-to-encode repeated offsets);
+- accurate Huffman/FSE cost model (we approximate literals at 8 bits; real text Huffman is 4–6);
+- two-pass cost-model refinement (first parse estimates entropy, second parse uses empirical cost).
+
+None are research. All are documented in zstd-19's source. Together they're 1–2 weeks of focused work. **GPU porting before that work happens only buys SA-build speed on output that is already larger than what plain `zstd -19` produces.**
+
+#### M8a — CPU optimal-parse competitive with zstd-19 (ratio gate)
+
+**Branch:** `feat/m8a-optimal-parse` · **Expected:** SA-based optimal parser whose `ZSTD_compressSequences` output lands within +1% of `zstd -19` on the silesia mix at 100 KB / 1 MB / 10 MB / 100 MB sizes.
 
 **Plan:**
+1. Extend `tools/m8/cpu_lz_optimal.c` to enumerate multi-length candidates per position (not just the longest). Practical approach: at each rank in SA, walk neighbors collecting (length, offset) pairs at length-tiers 4/8/16/32/64/128/longest, taking the smallest offset for each tier.
+2. Repcode tracking. Maintain a sliding window of the last 3 offsets used. When a candidate match's offset matches one of them, encode it with `rep` field set; expect ~25% sequence-overhead savings per zstd docs (`ZSTD_c_repcodeResolution`).
+3. Two-pass cost model. First pass uses static 8-bit literal cost. Second pass estimates literal Huffman cost from the first parse's literal distribution.
+4. Re-measure ratio at 100 KB / 1 MB / 10 MB / 100 MB silesia vs `zstd -19` and `xz -9e`.
 
-1. **GPU suffix array + match-finder prototype** — standalone tool that reads input bytes, emits a match-stream byte-identical to what `xz -9e`'s internal match-finder would produce on the same input. Validate against CPU output on a 100 MB sample. Measure throughput vs CPU. **Gating step:** if GPU suffix array doesn't hit projected throughput (memory-bandwidth bound on consumer GPUs is the real risk), the whole milestone deflates and we revisit.
-   - Starting point: published parallel SA-IS / DC3 suffix-array algorithms; per-position longest-match query is a parallel suffix-array walk.
-   - Risk: xz's match-finders use deep pointer-chasing (hash chains). The GPU version has to be batched-suffix-array-driven, structurally different. Equivalence verified against CPU output, not by reusing CPU code.
+**Ratio gate:** if M8a converges within +1% of `zstd -19` on silesia, proceed to M8b. **If after the four steps above M8a is still >+2% worse than `zstd -19`, M8 deflates into "Tried and reverted" with M8a's numbers as the structural reason** — the work to close the gap would amount to reimplementing zstd-19's optimal parser, at which point the codec lift is no longer in our court.
 
-2. **Wire match-stream → CPU entropy coder; ship `--gpu` flag.** Plumb the flag through `do_pack` / `min_pack_for_tier` / `pack_run` like `--fast` / `--slow`. Falls back to CPU `--fast` when no GPU is present (no-op error path). Final-step `CODEC_XZ_9E` invocation gets a `--gpu` variant; everything upstream (recipe, unwrap, per-stream recompression) is unchanged.
-   - Success criterion: pack output size within +1% of default xz-9e on Silesia, pack wall time at least 5× faster than `--fast`.
-   - Decode unchanged. Any xz/zstd decoder consumes the output.
+**Multi-week.** Realistic timeline 1–2 weeks of focused work. This must be flagged as such per workflow.
 
-3. **Chunked output mode with bridges (PARKED, do not build today)** — adds a `--gpu-chunked` mode that partitions the match-stream into N chunks, routes cross-chunk matches to a bridge side-stream, emits new ZXL-E chunked format. Enables partial parallel decode and supports inputs larger than GPU VRAM. Requires ZXLE_VER 6 → 7 + decoder support + fuzz coverage. **Decision gate:** only ship when there is a named workload that demands either parallel decode or >VRAM input (today: silesia 211 MB, GIANT 1 GB both fit in 4 GB VRAM; decode is already 35× faster than pack so parallel-decode is the wrong target).
+#### M8b — GPU SA integration into the M8a pipeline (after M8a passes the gate)
 
-**What this milestone does NOT do:**
-- Does not add a neural / pretrained-model backend. That's still aspirational research; parked separately under M8b (below) and reconsidered only after step 2 ships.
-- Does not change the archive format. Step 2's output is byte-identical to standard xz output (run `xz -d` on it).
-- Does not target GPU decode acceleration. Decode is already fast; this is a pack-side optimization.
+**Branch:** `feat/m8b-gpu-sa` · **Expected:** swap libsais (CPU SA, 31 MB/s) for libcubwt (GPU SA, 315 MB/s) inside the M8a pipeline. End-to-end pack wall time gain: roughly the SA-build fraction of M8a's CPU time (probably 30–50%), assuming the optimal-parse step doesn't dominate.
 
-**Risks and known limits:**
-- **GPU memory ceiling.** Input must fit in VRAM for the global suffix array. Consumer GPUs: 4–24 GB; covers all current workloads. Above VRAM, fall back to CPU `--fast` (or step 3 chunked mode when shipped).
-- **CUDA dep.** Adds a build dependency. Box has NVIDIA hardware (RTX-class per PATH signals). Build gates on CUDA toolkit available; absence → flag is a no-op fallback.
-- **Optimal-parse DP serial on CPU.** Caps theoretical speedup. Realistic ceiling: ~20× pack on a single GPU, not 100×. Anyone expecting >100× should read this section.
-- **Determinism.** Match-finding is integer arithmetic on bytes; no float reproducibility issue. Different from the neural-model case where float determinism is hard.
+**Plan:**
+1. Patch libcubwt to expose its internal SA (currently only BWT). Either add `int64_t libcubwt_sa(storage, T, SA, n)` or accept GPU→CPU copy of SA after the existing internal sort and skip the BWT permutation.
+2. Wire SA buffer into M8a's pipeline; libsais call becomes optional fallback for non-CUDA builds.
+3. Build a CUDA PLCP+LCP kernel (libcubwt doesn't ship one). The Kasai algorithm linearizes on CPU but a GPU version exists per Deo/Keely 2013 ("Parallel suffix array and least common prefix for the GPU").
+4. Measure end-to-end pack speed vs M8a CPU and vs `zstd -19` and `xz -9e`. Decode unchanged.
 
-### M8b — Neural / pretrained-model backend (parked; research; reconsider after M8 ships)
+#### M8c — Chunked output / inputs > VRAM (deferred)
 
-Originally bundled into M8. Pulled out because the engineering and research timescales differ by an order of magnitude.
+Unchanged from original spec. Adds `--gpu-chunked` mode for inputs above the SA ~300 MB VRAM ceiling, partitions match-stream into N chunks with a cross-chunk bridge side-stream. Only ship when there's a named workload that demands it (today: silesia 211 MB and GIANT 1 GB both fit in 6 GiB VRAM at the per-pass ceiling, decode is already 35× faster than pack so parallel-decode is the wrong target).
+
+#### M8d — Neural / pretrained-model backend (parked; research; was M8b)
+
+Originally bundled into M8, then split into M8b. Renamed M8d here so the milestone codes align with the new ratio-gated structure.
 
 **Direction:** bundle a small distilled byte-level model (10–50 MB), use it as the per-byte predictor in a GPU arithmetic coder. Could land at cmix-class ratio (~0.13 on text) at zpaq-class throughput.
 
