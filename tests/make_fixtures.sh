@@ -39,6 +39,82 @@ with zipfile.ZipFile('sample.docx', 'w', zipfile.ZIP_DEFLATED, compresslevel=6) 
 PY
 fi
 
+# sample.xlsx — minimal Excel-style XLSX (ZIP of XML, default deflate L6).
+# Same OOXML shape as sample.docx but with workbook + worksheet + sharedStrings;
+# tests M2 fast-path + M3a preflate on XLSX-flavored ZIP content.
+if want sample.xlsx; then
+    python - <<'PY'
+import zipfile, random
+ct = b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/></Types>'
+rels = b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>'
+wb = b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="S1" sheetId="1" r:id="rId1"/></sheets></workbook>'
+wbrels = b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/></Relationships>'
+random.seed(42)
+words = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua".split()
+strings = []
+for i in range(4000):
+    n = 6 + (i * 5) % 20
+    strings.append(' '.join(random.choice(words) for _ in range(n)))
+ss_parts = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="' + str(len(strings)) + '" uniqueCount="' + str(len(strings)) + '">']
+for s in strings:
+    ss_parts.append('<si><t xml:space="preserve">' + s + '</t></si>')
+ss_parts.append('</sst>')
+ss = ''.join(ss_parts).encode()
+sh_rows = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>']
+for i in range(len(strings)):
+    sh_rows.append('<row r="' + str(i+1) + '"><c r="A' + str(i+1) + '" t="s"><v>' + str(i) + '</v></c><c r="B' + str(i+1) + '"><v>' + str(i * 137 % 9973) + '</v></c></row>')
+sh_rows.append('</sheetData></worksheet>')
+sh = ''.join(sh_rows).encode()
+with zipfile.ZipFile('sample.xlsx', 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+    z.writestr('[Content_Types].xml', ct)
+    z.writestr('_rels/.rels', rels)
+    z.writestr('xl/workbook.xml', wb)
+    z.writestr('xl/_rels/workbook.xml.rels', wbrels)
+    z.writestr('xl/worksheets/sheet1.xml', sh)
+    z.writestr('xl/sharedStrings.xml', ss)
+PY
+fi
+
+# sample.pptx — minimal PowerPoint-style PPTX (ZIP of XML, default deflate L6).
+# Same OOXML shape: presentation.xml + per-slide parts; tests M2 + M3a path on
+# PPTX-flavored ZIP content.
+if want sample.pptx; then
+    python - <<'PY'
+import zipfile, random
+N_SLIDES = 40
+ct_parts = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>']
+for i in range(1, N_SLIDES+1):
+    ct_parts.append('<Override PartName="/ppt/slides/slide' + str(i) + '.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>')
+ct_parts.append('</Types>')
+ct = ''.join(ct_parts).encode()
+rels = b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/></Relationships>'
+pres_rels_parts = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">']
+for i in range(1, N_SLIDES+1):
+    pres_rels_parts.append('<Relationship Id="rId' + str(i) + '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide' + str(i) + '.xml"/>')
+pres_rels_parts.append('</Relationships>')
+pres_rels = ''.join(pres_rels_parts).encode()
+pres_parts = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst>']
+for i in range(1, N_SLIDES+1):
+    pres_parts.append('<p:sldId id="' + str(255+i) + '" r:id="rId' + str(i) + '"/>')
+pres_parts.append('</p:sldIdLst></p:presentation>')
+pres = ''.join(pres_parts).encode()
+random.seed(42)
+words = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua".split()
+with zipfile.ZipFile('sample.pptx', 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+    z.writestr('[Content_Types].xml', ct)
+    z.writestr('_rels/.rels', rels)
+    z.writestr('ppt/presentation.xml', pres)
+    z.writestr('ppt/_rels/presentation.xml.rels', pres_rels)
+    for i in range(1, N_SLIDES+1):
+        body_runs = []
+        for j in range(200):
+            n = 8 + (j * 5) % 24
+            body_runs.append('<a:p><a:r><a:t xml:space="preserve">Slide ' + str(i) + ' line ' + str(j) + ': ' + ' '.join(random.choice(words) for _ in range(n)) + '.</a:t></a:r></a:p>')
+        slide = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cSld><p:spTree><p:sp><p:txBody>' + ''.join(body_runs) + '</p:txBody></p:sp></p:spTree></p:cSld></p:sld>').encode()
+        z.writestr('ppt/slides/slide' + str(i) + '.xml', slide)
+PY
+fi
+
 # sample.jar — small JAR with one compiled class + manifest. Tests JAR/ZIP path.
 if want sample.jar; then
     TMP=$(mktemp -d)
