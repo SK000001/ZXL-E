@@ -6,6 +6,20 @@ Historical record of shipped milestones, completed bench measurements, current-s
 
 ## Current-state log (most recent first)
 
+## Current state (2026-05-14, XLSX + PPTX bench shipped)
+
+Same delivered milestones as the prior entry; new measurement closes the roadmap "OOXML beyond DOCX" coverage gap. `tests/make_fixtures.sh` now generates `sample.xlsx` (118 KB, workbook + sharedStrings + worksheet) and `sample.pptx` (223 KB, 40-slide deck) as minimal OOXML-shaped ZIP-of-XML at deflate L6, mirroring `sample.docx`. Both are wired into `tests/bench.sh` next to the DOCX line.
+
+**Headline OOXML result (2026-05-14):** the M2 ZIP unwrap + M3a preflate path generalizes across all three common OOXML containers — no XLSX/PPTX-specific code needed. zxle beats xz-9e by **−19% to −23%** on each.
+
+| Fixture | size | zxle | xz-9e | zxle vs xz-9e |
+|---|---:|---:|---:|---:|
+| sample.docx | 585,600 | 473,051 | 585,696 | **−19.23%** |
+| sample.xlsx | 117,953 | 72,291 | 89,636 | **−19.35%** |
+| sample.pptx | 223,470 | 170,668 | 220,732 | **−22.68%** |
+
+Round-trip OK across all 45 default-bench fixtures (was 43 before adding the two OOXML fixtures). Default 8-file headline unchanged: per-file 0.3383, solid 0.3326.
+
 ## Current state (2026-05-13, large-corpus measurement shipped)
 
 Same delivered milestones as the prior entry (M1+M2+M3a–j+ZXLE_VER 3+M5--slow+M6 v1/v2/v3+fuzz harness+M7 steps 1/2/4); new **large-corpus measurement** lands in `tests/bench.sh` (silesia --fast variant + `ZXLE_GIANT=1` 1.06 GB section).
@@ -398,6 +412,16 @@ Predicted shape held: mixed-content `.tar.xz` ties xz-9e (xz already crushes mix
 ---
 
 ## Shipped milestone details
+
+### XLSX + PPTX bench fixtures (shipped 2026-05-14)
+- `tests/make_fixtures.sh` gains two new blocks producing `sample.xlsx` (workbook.xml + sharedStrings.xml with 4,000 strings + worksheet1.xml referencing them) and `sample.pptx` (presentation.xml + 40 slide parts, each with 200 text runs). Both are valid-shape OOXML containers — `[Content_Types].xml` + `_rels/.rels` + the format-specific part XMLs — written with `zipfile.ZIP_DEFLATED, compresslevel=6`, matching the existing `sample.docx` pattern. Deterministic via `random.seed(42)`.
+- `tests/bench.sh` adds two `bench_zip` lines next to the DOCX entry; total bench cases 43 → 45.
+- Measured 2026-05-14 (45/45 RT OK):
+  - sample.xlsx 117,953 B → zxle 72,291 B; xz-9e 89,636 B → **−19.35%** vs xz-9e (pack 870 ms, unpack 185 ms).
+  - sample.pptx 223,470 B → zxle 170,668 B; xz-9e 220,732 B → **−22.68%** vs xz-9e (pack 1,564 ms, unpack 600 ms).
+  - sample.docx (unchanged reference) 585,600 B → zxle 473,051 B; xz-9e 585,696 B → −19.23%.
+- Confirms roadmap "Coverage gaps the synthetic corpus doesn't surface" line claiming the M2 ZIP path should handle XLSX/PPTX with no per-format code: it does. No code change to `src/`; bench/fixture only.
+- `tests/corpus/` is gitignored, so the new .xlsx/.pptx blobs are local-only; `make_fixtures.sh` regenerates them deterministically.
 
 ### Large-corpus measurement — silesia --fast + 1 GB GIANT bench (shipped 2026-05-13)
 - `tests/bench.sh` ZXLE_SILESIA section gains a `--fast` mode alongside default and `--slow`. Same fixture (12 silesia files, 211 MB), three pack runs, all round-trip-checked.

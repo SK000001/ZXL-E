@@ -4,7 +4,7 @@ Recursive format-aware transform pipeline for general-purpose compression.
 
 Goal: be the smallest archive across **every** file type, not just one. Sister project to [ZXL](../Zxl) (which targets PE binaries specifically). ZXL-E uses ZXL as one of its backends when it detects PE streams.
 
-## Status (2026-05-13, M7 steps 1/2/4 + large-corpus measurement shipped)
+## Status (2026-05-14, XLSX + PPTX bench shipped)
 
 Default mode (xz-9e final-step + BCJ-x86 sub-stream for PE/ELF content) ties or beats xz-9e on the standard Silesia corpus and beats it by 6–60% on container-shaped artifacts. Optional `--slow` mode (zpaq -m5 final-step) matches the SOTA general-purpose codec on Silesia (ratio 0.1891) and stacks the gain on top of container unwrap (−29% to −47% vs xz-9e baseline on container fixtures). Optional `--fast` mode (xz -T0 --block-size=8MiB final-step) gives **5.9–9.07× pack speedup** at +3% size cost; speedup grows with input — 9.07× at 1 GB. Measured up to 1 GB (`ZXLE_GIANT=1`); no solid-mode cliff past the 128 MiB long-window.
 
@@ -40,8 +40,9 @@ Default mode (xz-9e final-step + BCJ-x86 sub-stream for PE/ELF content) ties or 
 | **M7 step 2 parallel --slow + default tier** | **shipped** — cross-codec tier runs both tiers on threads; DOCX −31%, MP3 −51% pack time on --slow path |
 | **M7 step 4 --fast flag** | **shipped** — `xz -T0 --block-size=8MiB` final-step; 5.9× at 51 MB, 9.07× at 1 GB; +3% size cost |
 | **Large-corpus measurement (1 GB)** | **shipped** — `ZXLE_GIANT=1` validates no solid-mode cliff at 1 GB; zxle matches tar+xz-9e +0.00% |
+| **XLSX + PPTX bench** | **shipped** — M2 ZIP path validated on OOXML beyond DOCX; sample.xlsx −19.35%, sample.pptx −22.68% vs xz-9e |
 
-## Headline numbers (2026-05-13)
+## Headline numbers (2026-05-14)
 
 | Fixture | xz-9e | zxle (default) | zxle --slow |
 |---|---|---|---|
@@ -52,6 +53,8 @@ Default mode (xz-9e final-step + BCJ-x86 sub-stream for PE/ELF content) ties or 
 | pe-deflate.zip | — | **−22.44%** | **−32.73%** vs xz-9e |
 | pe-deflate-l6.zip | — | **−22.76%** | **−33.00%** vs xz-9e |
 | sample.docx | — | −19.23% | **−47.41%** vs xz-9e |
+| sample.xlsx | — | **−19.35%** | — |
+| sample.pptx | — | **−22.68%** | — |
 | ntdll.dll.gz | — | **−19.23%** | **−29.43%** vs xz-9e |
 | mixed.tar.gz | — | **−22.92%** | **−30.65%** vs xz-9e |
 | mixed.tar.bz2 | — | **−21.79%** | — |

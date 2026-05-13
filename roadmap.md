@@ -4,9 +4,9 @@ Forward-looking plan: what's still ahead, what we haven't done that others have,
 
 ---
 
-## Current state (2026-05-13, large-corpus measurement shipped)
+## Current state (2026-05-14, XLSX + PPTX bench shipped)
 
-M1 + M2 + M3a–j + ZXLE_VER 3 final-step xz-9e + M5 --slow + per-fixture min-pack tier + M6 v1 + M6 v2 + M6 v3 + parser fuzz harness + M7 steps 1/2/4 + **large-corpus measurement (silesia --fast + ZXLE_GIANT=1 1 GB bench)** ship end-to-end.
+M1 + M2 + M3a–j + ZXLE_VER 3 final-step xz-9e + M5 --slow + per-fixture min-pack tier + M6 v1 + M6 v2 + M6 v3 + parser fuzz harness + M7 steps 1/2/4 + large-corpus measurement + **XLSX/PPTX bench (M2 ZIP path validated on OOXML beyond DOCX: −19.35% / −22.68% vs xz-9e)** ship end-to-end.
 
 Headline numbers and the milestone-by-milestone history are in [delivered.md](delivered.md). Latest reproducible bench numbers live in [README.md](README.md) "Headline numbers" table.
 
@@ -46,7 +46,7 @@ Most of these are not novel research problems — they're engineering items that
 - **GNU tar widening** — base-256 size encoding, pax extended headers, sparse files, long-name records. Currently rejected → KIND_OPAQUE on real GNU-formatted tars. Real-world coverage, no headline.
 - **ZIP variants** — ZIP64 (large archives), encrypted (legacy ZipCrypto + AES), DEFLATE64, BZIP2-in-ZIP, LZMA-in-ZIP, prefix bytes (self-extractors). All currently fall through to KIND_OPAQUE; common in real Windows-world ZIPs.
 - **APK / IPA / JAR signed-archive specifics** — verify the deflate roundtrip survives JAR signing's specific deflate output. Likely fine via preflate, but unmeasured.
-- **OOXML beyond DOCX** — XLSX / PPTX should already work via the M2 ZIP path (unmeasured).
+- ~~**OOXML beyond DOCX**~~ — **closed 2026-05-14.** `sample.xlsx` (117,953 B) → −19.35% vs xz-9e; `sample.pptx` (223,470 B) → −22.68% vs xz-9e. Same M2 ZIP unwrap + M3a preflate path as DOCX; no per-format code. Fixtures in `tests/make_fixtures.sh`, bench lines in `tests/bench.sh`.
 - **`.7z`** — LZMA2 + filters + delta + BCJ. Reproducibility of LZMA2 across versions is iffy. High effort, low certainty. Defer until everything else is exhausted.
 - **`.cab`** — Microsoft cabinet (MSZIP / LZX / Quantum). Niche but real on Windows-world artifacts (MSI installers).
 - **`.rpm`** — RPM v3/v4 header + cpio + zstd/xz body. Worth a sub-milestone if the real-world bench shows it matters.
