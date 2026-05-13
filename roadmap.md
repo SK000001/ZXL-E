@@ -10,7 +10,7 @@ M1 + M2 + M3a–j + ZXLE_VER 3 final-step xz-9e + M5 --slow + per-fixture min-pa
 
 Headline numbers and the milestone-by-milestone history are in [delivered.md](delivered.md). Latest reproducible bench numbers live in [README.md](README.md) "Headline numbers" table.
 
-The honest gap inventory ("what others have, we don't") is the next section. M7 step 3 (unwrap+force_opaque parallelism — deferred), M8 (GPU/ML), and M9 (specialized model training) are the remaining unstarted items in the roadmap.
+The honest gap inventory ("what others have, we don't") is the next section. **Next milestone is M8 (GPU match-finder)** — solid-mode xz-9e ratio at 10–30× faster pack via GPU suffix-array + match-finder, with a CPU entropy-code stage; output bit-identical to standard xz. M7 step 3 (unwrap+force_opaque parallelism — deferred), M8b (neural/pretrained-model backend — parked research), and M9 (specialized model training — deferred) are the other unstarted items.
 
 ---
 
@@ -110,21 +110,60 @@ Shipped milestones live in [delivered.md](delivered.md).
 
 **Risks:** subprocess fan-out on Windows is heavier than POSIX `fork`; need to use `posix_spawn` consistently. Determinism gate (`--fast` flag) needs careful manifest-flag plumbing (similar to `--slow`).
 
-### M8 — GPU / ML backend (research; aspirational)
+### M8 — GPU match-finder (next milestone; planned 2026-05-14)
 
-**Branch:** `feat/m8-gpu` · **Expected:** if it works, push past the zpaq-m5 efficient frontier on Silesia (target ratio 0.16–0.17, vs current --slow 0.1891) at GPU-class speed (10–100× faster than CPU paq8/cmix). Big "if" — this is research, not engineering.
+**Branch:** `feat/m8-gpu-matchfind` · **Expected:** xz-9e ratio (= solid mode, ~0.2284 on Silesia) at **10–30× faster pack** on a GPU-equipped machine. Output is **bit-identical to standard xz/zstd** (no archive format change, decoder unchanged). Shipped as a `--gpu` flag, peer of `--fast` and `--slow`.
 
-**Two viable directions:**
+**Core insight:** the bottleneck in high-ratio LZ codecs (xz-9e, zstd-19) is match-finding — for every input position, finding the longest repeated byte sequence in the long-window. This work is **embarrassingly parallel across positions** but requires seeing all prior bytes (solid dependency). GPU is the right tool: massively parallel reads with the whole input resident in VRAM. The slow sequential step (entropy coding) stays on CPU where it runs ~500 MB/s anyway.
 
-1. **nvCOMP fast-path** — NVIDIA's GPU-accelerated zstd/deflate. Same ratio class as CPU zstd (~0.25 on Silesia, i.e., looser than our default xz). Useful as a `--gpu-fast` flag for users who want very-fast pack at moderate ratio. Adds CUDA dep. Concrete, ~1 week of integration if a CUDA dev box is available.
-2. **Pretrained byte-level transformer / RNN backend** — bundle a small distilled model (10–50 MB), do GPU-accelerated arithmetic coding with it as the per-byte predictor. Could land in cmix territory at zpaq-class speed *on GPU*. CPU-only would still be slow. Adds onnxruntime / libtorch dep. Multi-week of work plus model selection / training.
+This is engineering, not research — algorithm is known (parallel suffix array + per-position match search), output is calculable, success criterion is concrete (same archive bytes, faster pack).
 
-**Why this is properly research-grade:**
-- Both paths require a GPU dependency; without one, no win.
-- Determinism: GPU floating-point isn't bit-exact across hardware. Arithmetic coding requires the predictor's output to be deterministic across encode/decode pairs. Workable (use fixed-point or quantized models) but adds complexity.
-- The compression community has been chasing this for ~15 years; nothing off-the-shelf currently delivers cmix-class ratio at zpaq-class speed.
+**Architecture (key design rule):** the GPU match-finder emits a **clean intermediate `match-stream`** (sequence of (offset, length, literal_bytes) per input position). Downstream consumers compose:
 
-**Decision gate:** don't start until M7 (parallelism) is landed. M7's payoff is known; M8's payoff is uncertain.
+```
+Input ──► GPU global match-finder ──► match-stream ──► [consumer]
+                                                          │
+                                                          ├── CPU optimal-parse + entropy-code  ──► standard xz/zstd archive   [M8 step 2]
+                                                          └── chunk-split + bridge side-stream  ──► ZXL-E chunked format       [M8 step 3, parked]
+```
+
+This keeps step 3 (chunked output with cross-chunk "bridge" matches for parallel decode) as a *small increment* on top of the shared match-finder, not a separate milestone. We do not build step 3 today.
+
+**Plan:**
+
+1. **GPU suffix array + match-finder prototype** — standalone tool that reads input bytes, emits a match-stream byte-identical to what `xz -9e`'s internal match-finder would produce on the same input. Validate against CPU output on a 100 MB sample. Measure throughput vs CPU. **Gating step:** if GPU suffix array doesn't hit projected throughput (memory-bandwidth bound on consumer GPUs is the real risk), the whole milestone deflates and we revisit.
+   - Starting point: published parallel SA-IS / DC3 suffix-array algorithms; per-position longest-match query is a parallel suffix-array walk.
+   - Risk: xz's match-finders use deep pointer-chasing (hash chains). The GPU version has to be batched-suffix-array-driven, structurally different. Equivalence verified against CPU output, not by reusing CPU code.
+
+2. **Wire match-stream → CPU entropy coder; ship `--gpu` flag.** Plumb the flag through `do_pack` / `min_pack_for_tier` / `pack_run` like `--fast` / `--slow`. Falls back to CPU `--fast` when no GPU is present (no-op error path). Final-step `CODEC_XZ_9E` invocation gets a `--gpu` variant; everything upstream (recipe, unwrap, per-stream recompression) is unchanged.
+   - Success criterion: pack output size within +1% of default xz-9e on Silesia, pack wall time at least 5× faster than `--fast`.
+   - Decode unchanged. Any xz/zstd decoder consumes the output.
+
+3. **Chunked output mode with bridges (PARKED, do not build today)** — adds a `--gpu-chunked` mode that partitions the match-stream into N chunks, routes cross-chunk matches to a bridge side-stream, emits new ZXL-E chunked format. Enables partial parallel decode and supports inputs larger than GPU VRAM. Requires ZXLE_VER 6 → 7 + decoder support + fuzz coverage. **Decision gate:** only ship when there is a named workload that demands either parallel decode or >VRAM input (today: silesia 211 MB, GIANT 1 GB both fit in 4 GB VRAM; decode is already 35× faster than pack so parallel-decode is the wrong target).
+
+**What this milestone does NOT do:**
+- Does not add a neural / pretrained-model backend. That's still aspirational research; parked separately under M8b (below) and reconsidered only after step 2 ships.
+- Does not change the archive format. Step 2's output is byte-identical to standard xz output (run `xz -d` on it).
+- Does not target GPU decode acceleration. Decode is already fast; this is a pack-side optimization.
+
+**Risks and known limits:**
+- **GPU memory ceiling.** Input must fit in VRAM for the global suffix array. Consumer GPUs: 4–24 GB; covers all current workloads. Above VRAM, fall back to CPU `--fast` (or step 3 chunked mode when shipped).
+- **CUDA dep.** Adds a build dependency. Box has NVIDIA hardware (RTX-class per PATH signals). Build gates on CUDA toolkit available; absence → flag is a no-op fallback.
+- **Optimal-parse DP serial on CPU.** Caps theoretical speedup. Realistic ceiling: ~20× pack on a single GPU, not 100×. Anyone expecting >100× should read this section.
+- **Determinism.** Match-finding is integer arithmetic on bytes; no float reproducibility issue. Different from the neural-model case where float determinism is hard.
+
+### M8b — Neural / pretrained-model backend (parked; research; reconsider after M8 ships)
+
+Originally bundled into M8. Pulled out because the engineering and research timescales differ by an order of magnitude.
+
+**Direction:** bundle a small distilled byte-level model (10–50 MB), use it as the per-byte predictor in a GPU arithmetic coder. Could land at cmix-class ratio (~0.13 on text) at zpaq-class throughput.
+
+**Why parked:**
+- Multi-month effort: model selection, distillation/training, fixed-point quantization for cross-hardware determinism, onnxruntime/libtorch integration, model bundle/versioning.
+- Ratio win is workload-dependent: cmix beats xz on text by ~30%, ties or loses on binary / already-compressed payloads. Without a target deployment, it's a generic-purpose model bet.
+- Compression community has been chasing this for ~15 years; nothing off-the-shelf delivers cmix-class ratio at production throughput.
+
+**Reconsider when:** M8 (match-finder) has shipped and there's a concrete workload where +30% ratio on text-heavy data is worth a model bundle + GPU dep + multi-month build.
 
 ### M9 — Specialized model training (research; deferred)
 
