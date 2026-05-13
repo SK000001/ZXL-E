@@ -3,8 +3,13 @@ graph.md
 zxle
 zxle.exe
 *.o
+*.obj
+*.exp
+*.lib
+*.pdb
 *.tmp
 *.zxle
+tools/m8/*.exe
 tests/corpus/
 tests/unpacked/
 tests/baseline/
