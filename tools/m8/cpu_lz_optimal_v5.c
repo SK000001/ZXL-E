@@ -1,18 +1,25 @@
-// M8a step 3 -- two-pass cost model.
+// M8a step 4 candidate (last attempt before gate decision).
 //
-// v3 used a static 8 bits/literal cost in the DP. Real Huffman cost on text-
-// heavy data is ~4-5 bits for common bytes and 8-12 for rare ones. Overstating
-// literal cost makes the DP accept bad short far-offset matches that would
-// have FSE-encoded larger than the literal runs they replace.
+// v4 hit the gate at 1 MB (+0.80%) but widened to +2.86% at 10 MB and +3.75%
+// at 30 MB. Hypothesis: the DP's match cost formula
+//   match_cost = (4 + log2(L) + log2(O)) * 8   (1/8-bit units)
+// underestimates real zstd encoding cost by ~2 bits. zstd's FSE offset code
+// uses ofBits = log2(O) RAW bits PLUS a ~6-bit FSE code-table contribution
+// (offset code has 32 symbols, entropy ~5-6 bits on real corpora). The
+// constant 4 covers only literal-length + match-length overhead.
 //
-// v4 runs two passes:
-//   Pass 1: forward DP with static 8-bit literal cost (== v3).
-//   Build byte_cost[256] from the pass-1 literal frequency distribution
-//     (-log2(p) * 8 in 1/8-bit units, clamped to [1, 12] bits).
-//   Pass 2: same forward DP with refined per-position literal cost
-//     lit_cost(i) = byte_cost[T[i]].
+// Effect of the underestimate: DP accepts short far-offset matches that
+// "save" 1-3 bits on our cost model but actually break even or lose under
+// real FSE. As input scales up, more such marginal matches exist (more
+// distinct offsets, larger log2(O)), so the gap to zstd-19 widens.
 //
-// Output sequences come from pass 2.
+// v5 changes one line: match overhead constant 4 -> 6 (+2 bits). Everything
+// else is identical to v4. If this materially closes the 10 MB / 30 MB gap,
+// it's an honest model fix; if not, M8a remains in the abandonment path.
+//
+// Also bumps M8_WALK_LIMIT 32 -> 128 to widen the candidate pool at scale --
+// at 10 MB+ many positions have dense SA neighborhoods that hit the cap
+// before observing useful smaller-offset tiers.
 
 #define ZSTD_STATIC_LINKING_ONLY
 #include <zstd.h>
@@ -46,7 +53,7 @@ static long read_file(const char *path, uint8_t **buf, long cap) {
 
 #define M8_MINMATCH 3
 #define M8_MAX_CANDS 8
-#define M8_WALK_LIMIT 32
+#define M8_WALK_LIMIT 128   // v5: 32 -> 128
 
 typedef struct { uint32_t len; uint32_t off; } cand_t;
 typedef struct { uint32_t start; uint8_t count; } cand_index_t;
@@ -136,15 +143,14 @@ static long collect_candidates(
     return pool_used;
 }
 
-// ---- Forward DP with rep state + per-byte literal cost --------------------
-
 static inline uint32_t log2_u32(uint32_t x) {
     if (x <= 1) return 0;
     return 31 - __builtin_clz(x);
 }
 
-static inline uint32_t match_cost(uint32_t l, uint32_t o)   { return (4 + log2_u32(l) + log2_u32(o)) * 8; }
-static inline uint32_t rep_cost(uint32_t l)                 { return (3 + log2_u32(l)) * 8; }
+// v5: match overhead constant bumped from 4 to 6 (+2 bits = ~FSE offset code).
+static inline uint32_t match_cost(uint32_t l, uint32_t o) { return (6 + log2_u32(l) + log2_u32(o)) * 8; }
+static inline uint32_t rep_cost(uint32_t l)               { return (3 + log2_u32(l)) * 8; }
 
 typedef struct {
     uint64_t cost;
@@ -178,8 +184,6 @@ static inline void try_step(fstate_t *F, long i, long j, uint64_t add_cost,
     }
 }
 
-// One DP pass. `lit_cost_arr` indexed by T[i] gives the per-byte literal cost
-// in 1/8-bit units. Pass NULL for the static 8-bit fallback.
 static long optimal_parse_pass(
     long n, const uint8_t *T,
     const cand_index_t *idx, const cand_t *pool,
@@ -198,7 +202,6 @@ static long optimal_parse_pass(
 
     for (long i = 0; i < n; i++) {
         if (F[i].cost == UINT64_MAX) continue;
-
         uint32_t lc = lit_cost_arr ? lit_cost_arr[T[i]] : (uint32_t)(8 * 8);
         try_step(F, i, i + 1, lc, 0, 0);
 
@@ -250,20 +253,17 @@ static long optimal_parse_pass(
         long end = step_pos[s];
         uint32_t ml = step_match_len[s];
         uint32_t mo = step_match_off[s];
-        if (ml == 0) {
-            i = end;
-        } else {
-            if (nrec >= recs_cap) {
-                free(F); free(step_match_len); free(step_match_off); free(step_pos);
-                return -1;
-            }
-            recs[nrec].lit_len   = (uint32_t)(i - lit_start);
-            recs[nrec].match_len = ml;
-            recs[nrec].match_off = mo;
-            nrec++;
-            i = end;
-            lit_start = i;
+        if (ml == 0) { i = end; continue; }
+        if (nrec >= recs_cap) {
+            free(F); free(step_match_len); free(step_match_off); free(step_pos);
+            return -1;
         }
+        recs[nrec].lit_len   = (uint32_t)(i - lit_start);
+        recs[nrec].match_len = ml;
+        recs[nrec].match_off = mo;
+        nrec++;
+        i = end;
+        lit_start = i;
     }
     if (lit_start < n) {
         if (nrec >= recs_cap) {
@@ -280,7 +280,6 @@ static long optimal_parse_pass(
     return nrec;
 }
 
-// Walk pass-1 records, count literal byte frequencies, derive byte_cost[256].
 static void build_literal_cost(
     long n, const uint8_t *T, const parse_record_t *recs, long nrec,
     uint32_t *byte_cost_out)
@@ -298,7 +297,7 @@ static void build_literal_cost(
     for (int b = 0; b < 256; b++) {
         double bits;
         if (total == 0 || freq[b] == 0) {
-            bits = 12.0;  // unseen byte: high penalty
+            bits = 12.0;
         } else {
             double p = (double)freq[b] / (double)total;
             bits = -log2(p);
@@ -344,10 +343,6 @@ int main(int argc, char **argv) {
     double t1 = now_sec();
     printf("SA+ISA+LCP : %.0f ms\n", (t1 - t0) * 1000.0);
 
-    // Observed avg candidates/position: ~3.15 at 102 KB, ~1.36 at 1 MB,
-    // ~1.08 at 5 MB, ~1.70 at 10 MB. Cap at 4*n covers worst case observed
-    // with margin while keeping the allocation manageable at 100 MB
-    // (4*100M*8 = 3.2 GB; n*8 would be 6.4 GB and OOMs on 8 GB RAM).
     long pool_cap = (long)n * 4;
     cand_index_t *idx = (cand_index_t *)malloc(sizeof(cand_index_t) * (size_t)n);
     cand_t *pool = (cand_t *)malloc(sizeof(cand_t) * (size_t)pool_cap);
@@ -360,30 +355,15 @@ int main(int argc, char **argv) {
 
     parse_record_t *recs = (parse_record_t *)malloc(sizeof(parse_record_t) * (size_t)(n + 1));
 
-    // Pass 1: static 8-bit literal cost.
     double tp1_0 = now_sec();
     long nrec1 = optimal_parse_pass(n, T, idx, pool, NULL, recs, n + 1);
     double tp1_1 = now_sec();
     if (nrec1 < 0) { fprintf(stderr, "pass1 DP fail\n"); return 4; }
     printf("pass1_dp   : %.0f ms  (%ld records)\n", (tp1_1 - tp1_0) * 1000.0, nrec1);
 
-    // Build per-byte cost from pass-1 literal distribution.
     uint32_t byte_cost[256];
     build_literal_cost(n, T, recs, nrec1, byte_cost);
-    {
-        // Quick summary: min/max/avg byte cost.
-        uint32_t lo = UINT32_MAX, hi = 0;
-        uint64_t sum = 0;
-        for (int b = 0; b < 256; b++) {
-            if (byte_cost[b] < lo) lo = byte_cost[b];
-            if (byte_cost[b] > hi) hi = byte_cost[b];
-            sum += byte_cost[b];
-        }
-        printf("lit_cost   : min=%.2fb max=%.2fb avg=%.2fb (1/8-bit units)\n",
-               lo / 8.0, hi / 8.0, (sum / 256.0) / 8.0);
-    }
 
-    // Pass 2: refined per-byte cost.
     double tp2_0 = now_sec();
     long nrec = optimal_parse_pass(n, T, idx, pool, byte_cost, recs, n + 1);
     double tp2_1 = now_sec();
@@ -412,23 +392,16 @@ int main(int argc, char **argv) {
     ZSTD_CCtx_setParameter(cctx, ZSTD_c_minMatch, M8_MINMATCH);
     ZSTD_CCtx_setParameter(cctx, ZSTD_c_validateSequences, 1);
     ZSTD_CCtx_setParameter(cctx, ZSTD_c_blockDelimiters, ZSTD_sf_noBlockDelimiters);
-    // Window must cover the largest offset across all blocks (sequences may be
-    // split across block boundaries; without a wide window, an offset that
-    // points past a block boundary fails ZSTD's "External sequences are not
-    // valid" check at >~9 MB inputs). 27 == 128 MiB, matches zstd --long=27.
     ZSTD_CCtx_setParameter(cctx, ZSTD_c_windowLog, 27);
     ZSTD_CCtx_setPledgedSrcSize(cctx, (size_t)n);
 
     size_t bound = ZSTD_compressBound((size_t)n);
     uint8_t *zout = (uint8_t *)malloc(bound);
-    double tz0 = now_sec();
     size_t zsize = ZSTD_compressSequences(cctx, zout, bound, seqs, (size_t)nrec, T, (size_t)n);
-    double tz1 = now_sec();
     if (ZSTD_isError(zsize)) {
         fprintf(stderr, "compressSequences fail: %s\n", ZSTD_getErrorName(zsize));
         return 6;
     }
-    printf("zstd-encode: %.0f ms  out=%zu bytes\n", (tz1 - tz0) * 1000.0, zsize);
 
     uint8_t *back = (uint8_t *)malloc((size_t)n);
     size_t got = ZSTD_decompress(back, (size_t)n, zout, zsize);
@@ -442,15 +415,14 @@ int main(int argc, char **argv) {
     ZSTD_CCtx_setParameter(ref, ZSTD_c_compressionLevel, 19);
     uint8_t *ref_out = (uint8_t *)malloc(bound);
     size_t ref_size = ZSTD_compress2(ref, ref_out, bound, T, (size_t)n);
-    printf("zstd-19    : out=%zu bytes\n", ref_size);
 
     double m8_ratio = (double)zsize / (double)n;
     double ref_ratio = (double)ref_size / (double)n;
     double delta = (double)((long long)zsize - (long long)ref_size) / (double)ref_size * 100.0;
     printf("---\n");
-    printf("M8a v4 (2p): %.4f  (%zu / %ld)\n", m8_ratio, zsize, n);
-    printf("zstd-19    : %.4f  (%zu / %ld)\n", ref_ratio, ref_size, n);
-    printf("delta      : %+.2f%% (M8a v4 vs zstd-19)\n", delta);
+    printf("M8a v5 (mc6): %.4f  (%zu / %ld)\n", m8_ratio, zsize, n);
+    printf("zstd-19     : %.4f  (%zu / %ld)\n", ref_ratio, ref_size, n);
+    printf("delta       : %+.2f%% (M8a v5 vs zstd-19)\n", delta);
 
     ZSTD_freeCCtx(cctx); ZSTD_freeCCtx(ref);
     free(T); free(SA); free(ISA); free(PLCP); free(LCP);

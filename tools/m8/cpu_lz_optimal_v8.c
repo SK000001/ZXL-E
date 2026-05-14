@@ -1,18 +1,36 @@
-// M8a step 3 -- two-pass cost model.
+// M8a step 4 candidate v8 -- per-128KB-block FSE tables.
 //
-// v3 used a static 8 bits/literal cost in the DP. Real Huffman cost on text-
-// heavy data is ~4-5 bits for common bytes and 8-12 for rare ones. Overstating
-// literal cost makes the DP accept bad short far-offset matches that would
-// have FSE-encoded larger than the literal runs they replace.
+// v5-v7 used a single global set of (byte_cost, of_fse_cost, ml_fse_cost)
+// learned from a global pass 1. The mixed silesia corpus contains very
+// different regions (mozilla = binary, webster = English text, nci = chemical
+// text); averaging cost tables across them discards the per-region signal that
+// zstd-19 captures via per-block FSE retuning.
 //
-// v4 runs two passes:
-//   Pass 1: forward DP with static 8-bit literal cost (== v3).
-//   Build byte_cost[256] from the pass-1 literal frequency distribution
-//     (-log2(p) * 8 in 1/8-bit units, clamped to [1, 12] bits).
-//   Pass 2: same forward DP with refined per-position literal cost
-//     lit_cost(i) = byte_cost[T[i]].
+// v8 segments the input into 128 KB blocks (matches zstd's internal block size
+// at level 19), learns per-block tables from pass 1, and pass 2 uses
+// cost_tables[i / 131072] at each position i. Candidate collection and the DP
+// itself stay global (cross-block matches allowed via windowLog=27).
 //
-// Output sequences come from pass 2.
+// v5 replaced the flat overhead constant 4 -> 6 ("offset code is ~6 bits FSE
+// on average"). In real zstd that constant is NOT flat: it depends on the
+// offset class (log2(offset)). Common offset classes -- small offsets and
+// classes that recur often -- get short FSE codes (~2-4 bits); rare classes
+// (very large offsets) get long codes (~7-8 bits).
+//
+// v6 learns this distribution from pass 1:
+//   pass 1: DP with v5 cost model
+//   collect of_class[c] = count of pass-1 matches with log2(offset) == c
+//   compute of_fse_cost[c] = -log2(of_class[c] / total_matches) bits,
+//           clamped to [2, 12] bits, in 1/8-bit units
+//   pass 2: match_cost(L, O) = of_fse_cost[log2(O)] + log2(O) * 8
+//                            + log2(L) * 8 + 32     // 4 bits const for ml+ll
+//
+// Effect: matches at the most-used offset classes are priced ~2-3 bits cheaper
+// than v5's flat 6-bit assumption; matches at exotic offset classes are priced
+// dearer -- so the DP rejects more marginal far-offset short matches. This is
+// the leverage zstd-19's per-block FSE retuning gives that we lack.
+//
+// Literal byte-cost from pass 1 (as in v4/v5) is also applied in pass 2.
 
 #define ZSTD_STATIC_LINKING_ONLY
 #include <zstd.h>
@@ -46,7 +64,7 @@ static long read_file(const char *path, uint8_t **buf, long cap) {
 
 #define M8_MINMATCH 3
 #define M8_MAX_CANDS 8
-#define M8_WALK_LIMIT 32
+#define M8_WALK_LIMIT 128   // v5: 32 -> 128
 
 typedef struct { uint32_t len; uint32_t off; } cand_t;
 typedef struct { uint32_t start; uint8_t count; } cand_index_t;
@@ -136,15 +154,33 @@ static long collect_candidates(
     return pool_used;
 }
 
-// ---- Forward DP with rep state + per-byte literal cost --------------------
-
 static inline uint32_t log2_u32(uint32_t x) {
     if (x <= 1) return 0;
     return 31 - __builtin_clz(x);
 }
 
-static inline uint32_t match_cost(uint32_t l, uint32_t o)   { return (4 + log2_u32(l) + log2_u32(o)) * 8; }
-static inline uint32_t rep_cost(uint32_t l)                 { return (3 + log2_u32(l)) * 8; }
+// v5 fallback: flat 6-bit overhead. Used in pass 1 (before of_fse_cost is built).
+static inline uint32_t match_cost_flat(uint32_t l, uint32_t o) { return (6 + log2_u32(l) + log2_u32(o)) * 8; }
+
+// v7 refined: use learned per-offset-class AND per-ml-class FSE cost.
+//   of_fse_cost_arr[log2(o)]  -- offset code FSE cost (1/8-bit units)
+//   ml_fse_cost_arr[log2(l)]  -- ml code FSE cost (1/8-bit units)
+//   log2(o)*8 + log2(l)*8     -- raw bits below the code class
+//   +16                       -- 2 bits constant for ll code (rough, the
+//                                 LL FSE cost would need its own learned table;
+//                                 deferred since LL has only ~16 useful classes
+//                                 and ~3-bit cost on average).
+// Per-block tables: of_cost[block * M8_OF_CLASSES + class], etc.
+static inline uint32_t match_cost_learned(uint32_t l, uint32_t o,
+                                          const uint32_t *of_row,
+                                          const uint32_t *ml_row)
+{
+    uint32_t oc = log2_u32(o);
+    uint32_t lc = log2_u32(l);
+    return of_row[oc] + ml_row[lc] + (oc + lc) * 8 + 16;
+}
+
+static inline uint32_t rep_cost(uint32_t l) { return (3 + log2_u32(l)) * 8; }
 
 typedef struct {
     uint64_t cost;
@@ -178,12 +214,22 @@ static inline void try_step(fstate_t *F, long i, long j, uint64_t add_cost,
     }
 }
 
-// One DP pass. `lit_cost_arr` indexed by T[i] gives the per-byte literal cost
-// in 1/8-bit units. Pass NULL for the static 8-bit fallback.
+#define M8_BLOCK_SIZE 131072
+#define M8_OF_CLASSES 32
+#define M8_ML_CLASSES 24
+
+// Per-block tables when use_perblock != 0:
+//   byte_cost_arr layout: [block * 256 + byte]
+//   of_fse_cost_arr layout: [block * M8_OF_CLASSES + class]
+//   ml_fse_cost_arr layout: [block * M8_ML_CLASSES + class]
+// When use_perblock == 0, NULL means flat fallback (pass 1).
 static long optimal_parse_pass(
     long n, const uint8_t *T,
     const cand_index_t *idx, const cand_t *pool,
     const uint32_t *lit_cost_arr,
+    const uint32_t *of_fse_cost_arr,
+    const uint32_t *ml_fse_cost_arr,
+    int use_perblock,
     parse_record_t *recs, long recs_cap)
 {
     fstate_t *F = (fstate_t *)malloc(sizeof(fstate_t) * (size_t)(n + 1));
@@ -199,7 +245,12 @@ static long optimal_parse_pass(
     for (long i = 0; i < n; i++) {
         if (F[i].cost == UINT64_MAX) continue;
 
-        uint32_t lc = lit_cost_arr ? lit_cost_arr[T[i]] : (uint32_t)(8 * 8);
+        long blk = use_perblock ? (i / M8_BLOCK_SIZE) : 0;
+        const uint32_t *lit_row = lit_cost_arr ? (use_perblock ? &lit_cost_arr[blk * 256] : lit_cost_arr) : NULL;
+        const uint32_t *of_row  = of_fse_cost_arr ? (use_perblock ? &of_fse_cost_arr[blk * M8_OF_CLASSES] : of_fse_cost_arr) : NULL;
+        const uint32_t *ml_row  = ml_fse_cost_arr ? (use_perblock ? &ml_fse_cost_arr[blk * M8_ML_CLASSES] : ml_fse_cost_arr) : NULL;
+
+        uint32_t lc = lit_row ? lit_row[T[i]] : (uint32_t)(8 * 8);
         try_step(F, i, i + 1, lc, 0, 0);
 
         const cand_t *c = &pool[idx[i].start];
@@ -208,7 +259,10 @@ static long optimal_parse_pass(
             uint32_t O = c[k].off;
             if ((long)i + L > n) continue;
             int is_rep = (O == F[i].rep[0]) || (O == F[i].rep[1]) || (O == F[i].rep[2]);
-            uint64_t add = is_rep ? rep_cost(L) : match_cost(L, O);
+            uint64_t add;
+            if (is_rep) add = rep_cost(L);
+            else if (of_row && ml_row) add = match_cost_learned(L, O, of_row, ml_row);
+            else add = match_cost_flat(L, O);
             try_step(F, i, i + L, add, L, O);
         }
 
@@ -250,20 +304,17 @@ static long optimal_parse_pass(
         long end = step_pos[s];
         uint32_t ml = step_match_len[s];
         uint32_t mo = step_match_off[s];
-        if (ml == 0) {
-            i = end;
-        } else {
-            if (nrec >= recs_cap) {
-                free(F); free(step_match_len); free(step_match_off); free(step_pos);
-                return -1;
-            }
-            recs[nrec].lit_len   = (uint32_t)(i - lit_start);
-            recs[nrec].match_len = ml;
-            recs[nrec].match_off = mo;
-            nrec++;
-            i = end;
-            lit_start = i;
+        if (ml == 0) { i = end; continue; }
+        if (nrec >= recs_cap) {
+            free(F); free(step_match_len); free(step_match_off); free(step_pos);
+            return -1;
         }
+        recs[nrec].lit_len   = (uint32_t)(i - lit_start);
+        recs[nrec].match_len = ml;
+        recs[nrec].match_off = mo;
+        nrec++;
+        i = end;
+        lit_start = i;
     }
     if (lit_start < n) {
         if (nrec >= recs_cap) {
@@ -280,7 +331,162 @@ static long optimal_parse_pass(
     return nrec;
 }
 
-// Walk pass-1 records, count literal byte frequencies, derive byte_cost[256].
+// Walk pass-1 records, count match offset CLASSES (log2(off) bucket).
+// Produce of_fse_cost_out[c] in 1/8-bit units, clamped to [2, 12] bits.
+// 32 classes covers offsets up to 2^32.
+// Per-block cost builders. Walk pass-1 records once with a cumulative position
+// counter; accumulate byte / of_class / ml_class histograms PER BLOCK; convert
+// to costs. A literal byte at position p goes to block p/BLOCK_SIZE; a match
+// starting at p attributes its (offset_class, ml_class) to block p/BLOCK_SIZE.
+//
+// Small-sample smoothing: if a block's literal-byte total < 256, blend with
+// a global histogram; same for match-class total < 64. Without this, a block
+// with very few samples produces noisy costs that hurt the parse.
+static void build_perblock_costs(
+    long n, const uint8_t *T,
+    const parse_record_t *recs, long nrec,
+    long num_blocks,
+    uint32_t *byte_cost_out,        // [num_blocks * 256]
+    uint32_t *of_fse_cost_out,      // [num_blocks * M8_OF_CLASSES]
+    uint32_t *ml_fse_cost_out)      // [num_blocks * M8_ML_CLASSES]
+{
+    uint64_t *bfreq = (uint64_t *)calloc((size_t)num_blocks * 256, sizeof(uint64_t));
+    uint64_t *oftab = (uint64_t *)calloc((size_t)num_blocks * M8_OF_CLASSES, sizeof(uint64_t));
+    uint64_t *mltab = (uint64_t *)calloc((size_t)num_blocks * M8_ML_CLASSES, sizeof(uint64_t));
+    uint64_t *btotal = (uint64_t *)calloc((size_t)num_blocks, sizeof(uint64_t));
+    uint64_t *moftot = (uint64_t *)calloc((size_t)num_blocks, sizeof(uint64_t));
+    uint64_t *mmltot = (uint64_t *)calloc((size_t)num_blocks, sizeof(uint64_t));
+    uint64_t gbfreq[256] = {0}, gbtotal = 0;
+    uint64_t goftab[M8_OF_CLASSES] = {0}, gmltab[M8_ML_CLASSES] = {0};
+    uint64_t gmoftot = 0, gmmltot = 0;
+
+    long pos = 0;
+    for (long r = 0; r < nrec; r++) {
+        for (uint32_t k = 0; k < recs[r].lit_len; k++) {
+            if (pos >= n) break;
+            long blk = pos / M8_BLOCK_SIZE;
+            uint8_t b = T[pos];
+            bfreq[blk * 256 + b]++;
+            btotal[blk]++;
+            gbfreq[b]++;
+            gbtotal++;
+            pos++;
+        }
+        if (recs[r].match_len) {
+            long blk = pos / M8_BLOCK_SIZE;
+            uint32_t oc = log2_u32(recs[r].match_off);
+            uint32_t lc = log2_u32(recs[r].match_len);
+            if (oc >= M8_OF_CLASSES) oc = M8_OF_CLASSES - 1;
+            if (lc >= M8_ML_CLASSES) lc = M8_ML_CLASSES - 1;
+            oftab[blk * M8_OF_CLASSES + oc]++;
+            mltab[blk * M8_ML_CLASSES + lc]++;
+            moftot[blk]++;
+            mmltot[blk]++;
+            goftab[oc]++;
+            gmltab[lc]++;
+            gmoftot++;
+            gmmltot++;
+            pos += recs[r].match_len;
+        }
+    }
+
+    // Blend smoothing weight: alpha = block_total / (block_total + smoothing_N).
+    // For literals smoothing_N = 256 (=1 sample per byte avg); for of/ml = 64.
+    for (long blk = 0; blk < num_blocks; blk++) {
+        double alpha_b = (double)btotal[blk] / (double)(btotal[blk] + 256);
+        double alpha_o = (double)moftot[blk] / (double)(moftot[blk] + 64);
+        double alpha_m = (double)mmltot[blk] / (double)(mmltot[blk] + 64);
+
+        for (int b = 0; b < 256; b++) {
+            double p_local  = btotal[blk] ? (double)bfreq[blk * 256 + b] / (double)btotal[blk] : 0.0;
+            double p_global = gbtotal ? (double)gbfreq[b] / (double)gbtotal : (1.0 / 256.0);
+            double p = alpha_b * p_local + (1.0 - alpha_b) * p_global;
+            double bits = (p > 0.0) ? -log2(p) : 12.0;
+            if (bits < 1.0) bits = 1.0;
+            if (bits > 12.0) bits = 12.0;
+            byte_cost_out[blk * 256 + b] = (uint32_t)(bits * 8.0 + 0.5);
+        }
+        for (int c = 0; c < M8_OF_CLASSES; c++) {
+            double p_local  = moftot[blk] ? (double)oftab[blk * M8_OF_CLASSES + c] / (double)moftot[blk] : 0.0;
+            double p_global = gmoftot ? (double)goftab[c] / (double)gmoftot : (1.0 / M8_OF_CLASSES);
+            double p = alpha_o * p_local + (1.0 - alpha_o) * p_global;
+            double bits = (p > 0.0) ? -log2(p) : 12.0;
+            if (bits < 2.0) bits = 2.0;
+            if (bits > 12.0) bits = 12.0;
+            of_fse_cost_out[blk * M8_OF_CLASSES + c] = (uint32_t)(bits * 8.0 + 0.5);
+        }
+        for (int c = 0; c < M8_ML_CLASSES; c++) {
+            double p_local  = mmltot[blk] ? (double)mltab[blk * M8_ML_CLASSES + c] / (double)mmltot[blk] : 0.0;
+            double p_global = gmmltot ? (double)gmltab[c] / (double)gmmltot : (1.0 / M8_ML_CLASSES);
+            double p = alpha_m * p_local + (1.0 - alpha_m) * p_global;
+            double bits = (p > 0.0) ? -log2(p) : 10.0;
+            if (bits < 1.0) bits = 1.0;
+            if (bits > 10.0) bits = 10.0;
+            ml_fse_cost_out[blk * M8_ML_CLASSES + c] = (uint32_t)(bits * 8.0 + 0.5);
+        }
+    }
+
+    free(bfreq); free(oftab); free(mltab);
+    free(btotal); free(moftot); free(mmltot);
+}
+
+static void build_ml_cost(
+    const parse_record_t *recs, long nrec,
+    uint32_t *ml_fse_cost_out)
+{
+    uint64_t ml_class[M8_ML_CLASSES] = {0};
+    uint64_t total = 0;
+    for (long r = 0; r < nrec; r++) {
+        if (recs[r].match_len == 0) continue;
+        uint32_t L = recs[r].match_len;
+        uint32_t c = log2_u32(L);
+        if (c >= M8_ML_CLASSES) c = M8_ML_CLASSES - 1;
+        ml_class[c]++;
+        total++;
+    }
+    for (int c = 0; c < M8_ML_CLASSES; c++) {
+        double bits;
+        if (total == 0 || ml_class[c] == 0) {
+            bits = 10.0;
+        } else {
+            double p = (double)ml_class[c] / (double)total;
+            bits = -log2(p);
+            if (bits < 1.0) bits = 1.0;
+            if (bits > 10.0) bits = 10.0;
+        }
+        ml_fse_cost_out[c] = (uint32_t)(bits * 8.0 + 0.5);
+    }
+}
+
+static void build_offset_cost(
+    const parse_record_t *recs, long nrec,
+    uint32_t *of_fse_cost_out)
+{
+    uint64_t of_class[M8_OF_CLASSES] = {0};
+    uint64_t total = 0;
+    for (long r = 0; r < nrec; r++) {
+        if (recs[r].match_len == 0) continue;
+        uint32_t o = recs[r].match_off;
+        if (o == 0) continue;
+        uint32_t c = log2_u32(o);
+        if (c >= M8_OF_CLASSES) c = M8_OF_CLASSES - 1;
+        of_class[c]++;
+        total++;
+    }
+    for (int c = 0; c < M8_OF_CLASSES; c++) {
+        double bits;
+        if (total == 0 || of_class[c] == 0) {
+            bits = 12.0;
+        } else {
+            double p = (double)of_class[c] / (double)total;
+            bits = -log2(p);
+            if (bits < 2.0) bits = 2.0;
+            if (bits > 12.0) bits = 12.0;
+        }
+        of_fse_cost_out[c] = (uint32_t)(bits * 8.0 + 0.5);
+    }
+}
+
 static void build_literal_cost(
     long n, const uint8_t *T, const parse_record_t *recs, long nrec,
     uint32_t *byte_cost_out)
@@ -298,7 +504,7 @@ static void build_literal_cost(
     for (int b = 0; b < 256; b++) {
         double bits;
         if (total == 0 || freq[b] == 0) {
-            bits = 12.0;  // unseen byte: high penalty
+            bits = 12.0;
         } else {
             double p = (double)freq[b] / (double)total;
             bits = -log2(p);
@@ -344,10 +550,6 @@ int main(int argc, char **argv) {
     double t1 = now_sec();
     printf("SA+ISA+LCP : %.0f ms\n", (t1 - t0) * 1000.0);
 
-    // Observed avg candidates/position: ~3.15 at 102 KB, ~1.36 at 1 MB,
-    // ~1.08 at 5 MB, ~1.70 at 10 MB. Cap at 4*n covers worst case observed
-    // with margin while keeping the allocation manageable at 100 MB
-    // (4*100M*8 = 3.2 GB; n*8 would be 6.4 GB and OOMs on 8 GB RAM).
     long pool_cap = (long)n * 4;
     cand_index_t *idx = (cand_index_t *)malloc(sizeof(cand_index_t) * (size_t)n);
     cand_t *pool = (cand_t *)malloc(sizeof(cand_t) * (size_t)pool_cap);
@@ -360,32 +562,22 @@ int main(int argc, char **argv) {
 
     parse_record_t *recs = (parse_record_t *)malloc(sizeof(parse_record_t) * (size_t)(n + 1));
 
-    // Pass 1: static 8-bit literal cost.
     double tp1_0 = now_sec();
-    long nrec1 = optimal_parse_pass(n, T, idx, pool, NULL, recs, n + 1);
+    long nrec1 = optimal_parse_pass(n, T, idx, pool, NULL, NULL, NULL, 0, recs, n + 1);
     double tp1_1 = now_sec();
     if (nrec1 < 0) { fprintf(stderr, "pass1 DP fail\n"); return 4; }
     printf("pass1_dp   : %.0f ms  (%ld records)\n", (tp1_1 - tp1_0) * 1000.0, nrec1);
 
-    // Build per-byte cost from pass-1 literal distribution.
-    uint32_t byte_cost[256];
-    build_literal_cost(n, T, recs, nrec1, byte_cost);
-    {
-        // Quick summary: min/max/avg byte cost.
-        uint32_t lo = UINT32_MAX, hi = 0;
-        uint64_t sum = 0;
-        for (int b = 0; b < 256; b++) {
-            if (byte_cost[b] < lo) lo = byte_cost[b];
-            if (byte_cost[b] > hi) hi = byte_cost[b];
-            sum += byte_cost[b];
-        }
-        printf("lit_cost   : min=%.2fb max=%.2fb avg=%.2fb (1/8-bit units)\n",
-               lo / 8.0, hi / 8.0, (sum / 256.0) / 8.0);
-    }
+    long num_blocks = (n + M8_BLOCK_SIZE - 1) / M8_BLOCK_SIZE;
+    uint32_t *byte_cost   = (uint32_t *)malloc(sizeof(uint32_t) * (size_t)num_blocks * 256);
+    uint32_t *of_fse_cost = (uint32_t *)malloc(sizeof(uint32_t) * (size_t)num_blocks * M8_OF_CLASSES);
+    uint32_t *ml_fse_cost = (uint32_t *)malloc(sizeof(uint32_t) * (size_t)num_blocks * M8_ML_CLASSES);
+    if (!byte_cost || !of_fse_cost || !ml_fse_cost) { fprintf(stderr, "perblock cost alloc fail\n"); return 5; }
+    build_perblock_costs(n, T, recs, nrec1, num_blocks, byte_cost, of_fse_cost, ml_fse_cost);
+    printf("perblock   : %ld blocks of %d bytes\n", num_blocks, M8_BLOCK_SIZE);
 
-    // Pass 2: refined per-byte cost.
     double tp2_0 = now_sec();
-    long nrec = optimal_parse_pass(n, T, idx, pool, byte_cost, recs, n + 1);
+    long nrec = optimal_parse_pass(n, T, idx, pool, byte_cost, of_fse_cost, ml_fse_cost, 1, recs, n + 1);
     double tp2_1 = now_sec();
     if (nrec < 0) { fprintf(stderr, "pass2 DP fail\n"); return 5; }
     printf("pass2_dp   : %.0f ms  (%ld records)\n", (tp2_1 - tp2_0) * 1000.0, nrec);
@@ -412,23 +604,16 @@ int main(int argc, char **argv) {
     ZSTD_CCtx_setParameter(cctx, ZSTD_c_minMatch, M8_MINMATCH);
     ZSTD_CCtx_setParameter(cctx, ZSTD_c_validateSequences, 1);
     ZSTD_CCtx_setParameter(cctx, ZSTD_c_blockDelimiters, ZSTD_sf_noBlockDelimiters);
-    // Window must cover the largest offset across all blocks (sequences may be
-    // split across block boundaries; without a wide window, an offset that
-    // points past a block boundary fails ZSTD's "External sequences are not
-    // valid" check at >~9 MB inputs). 27 == 128 MiB, matches zstd --long=27.
     ZSTD_CCtx_setParameter(cctx, ZSTD_c_windowLog, 27);
     ZSTD_CCtx_setPledgedSrcSize(cctx, (size_t)n);
 
     size_t bound = ZSTD_compressBound((size_t)n);
     uint8_t *zout = (uint8_t *)malloc(bound);
-    double tz0 = now_sec();
     size_t zsize = ZSTD_compressSequences(cctx, zout, bound, seqs, (size_t)nrec, T, (size_t)n);
-    double tz1 = now_sec();
     if (ZSTD_isError(zsize)) {
         fprintf(stderr, "compressSequences fail: %s\n", ZSTD_getErrorName(zsize));
         return 6;
     }
-    printf("zstd-encode: %.0f ms  out=%zu bytes\n", (tz1 - tz0) * 1000.0, zsize);
 
     uint8_t *back = (uint8_t *)malloc((size_t)n);
     size_t got = ZSTD_decompress(back, (size_t)n, zout, zsize);
@@ -442,18 +627,18 @@ int main(int argc, char **argv) {
     ZSTD_CCtx_setParameter(ref, ZSTD_c_compressionLevel, 19);
     uint8_t *ref_out = (uint8_t *)malloc(bound);
     size_t ref_size = ZSTD_compress2(ref, ref_out, bound, T, (size_t)n);
-    printf("zstd-19    : out=%zu bytes\n", ref_size);
 
     double m8_ratio = (double)zsize / (double)n;
     double ref_ratio = (double)ref_size / (double)n;
     double delta = (double)((long long)zsize - (long long)ref_size) / (double)ref_size * 100.0;
     printf("---\n");
-    printf("M8a v4 (2p): %.4f  (%zu / %ld)\n", m8_ratio, zsize, n);
-    printf("zstd-19    : %.4f  (%zu / %ld)\n", ref_ratio, ref_size, n);
-    printf("delta      : %+.2f%% (M8a v4 vs zstd-19)\n", delta);
+    printf("M8a v8 (blk): %.4f  (%zu / %ld)\n", m8_ratio, zsize, n);
+    printf("zstd-19     : %.4f  (%zu / %ld)\n", ref_ratio, ref_size, n);
+    printf("delta       : %+.2f%% (M8a v8 vs zstd-19)\n", delta);
 
     ZSTD_freeCCtx(cctx); ZSTD_freeCCtx(ref);
     free(T); free(SA); free(ISA); free(PLCP); free(LCP);
     free(idx); free(pool); free(recs); free(seqs); free(zout); free(back); free(ref_out);
+    free(byte_cost); free(of_fse_cost); free(ml_fse_cost);
     return 0;
 }
