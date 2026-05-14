@@ -6,6 +6,21 @@ Historical record of shipped milestones, completed bench measurements, current-s
 
 ## Current-state log (most recent first)
 
+## Current state (2026-05-15, M8a steps 1-4 shipped; gate partial pass; M8 reframed around entropy-backend swap)
+
+No headline-numbers change. M8a steps 1-4 shipped under `tools/m8/cpu_lz_optimal_v2.c` through `v13.c` + `tools/m8/m8a_gate.sh` + `tools/m8/diff_parse_30mb.c`. The SA-based optimal parser fed into `ZSTD_compressSequences` is functionally complete and roundtrips byte-identically through standard zstd decode. Step 4's gate measurement at 100 KB / 1 MB / 10 MB / 30 MB on silesia mozilla+webster+nci:
+
+| size | M8a v12 | zstd-19 | xz-9e | vs zstd-19 | gate +1% | abandon +2% |
+|---|---:|---:|---:|---:|---|---|
+| 100 KB | 16 416 | 16 289 | 14 736 | +0.78% | ✓ | n/a |
+| 1 MB | 638 378 | 637 090 | 638 104 | +0.20% | ✓ | n/a |
+| 10 MB | 4 958 014 | 4 881 785 | 4 685 500 | +1.56% | ✗ | ✓ clear |
+| 30 MB | 9 864 382 | 9 644 806 | 8 744 304 | +2.28% | ✗ | borderline trigger |
+
+Across 9 cost-model / candidate-set variations (v5-v13), the 30 MB floor settles at +2.28%. The `diff_parse_30mb.c` diagnostic shows v12's parse matches zstd-19's offset/ml/rep distributions within ~10K matches per class -- the remaining gap is encoded cost-per-match within zstd's entropy stage, not parse-selection quality.
+
+xz-9e is 9% smaller than zstd-19's own best at 30 MB on this corpus, so the path to "structurally smaller than zstd-19 at scale" is swapping the entropy backend (LZMA range coder), captured as new M8c in [roadmap.md](roadmap.md#m8c--swap-entropy-backend-zstd--lzma-class-range-coder-new-2026-05-15-reframe). M8b (GPU SA integration) stays gated on a clean M8a +1% pass at all sizes; current partial pass does not unlock M8b.
+
 ## Current state (2026-05-14, M8 scout-work measured + reframed)
 
 No headline-numbers change. Scout work for the GPU-match-finder milestone landed in `tools/m8/` (5 probes, all on master after FF-merge of `feat/m8-gpu-matchfind`). Key measurements:

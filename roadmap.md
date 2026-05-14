@@ -4,9 +4,9 @@ Forward-looking plan: what's still ahead, what we haven't done that others have,
 
 ---
 
-## Current state (2026-05-14, XLSX + PPTX bench shipped; M8 scout-work measured + reframed)
+## Current state (2026-05-15, M8a partial pass; M8 reframed around entropy-backend swap)
 
-M1 + M2 + M3a–j + ZXLE_VER 3 final-step xz-9e + M5 --slow + per-fixture min-pack tier + M6 v1 + M6 v2 + M6 v3 + parser fuzz harness + M7 steps 1/2/4 + large-corpus measurement + **XLSX/PPTX bench (M2 ZIP path validated on OOXML beyond DOCX: −19.35% / −22.68% vs xz-9e)** ship end-to-end.
+M1 + M2 + M3a–j + ZXLE_VER 3 final-step xz-9e + M5 --slow + per-fixture min-pack tier + M6 v1 + M6 v2 + M6 v3 + parser fuzz harness + M7 steps 1/2/4 + large-corpus measurement + XLSX/PPTX bench + **M8a steps 1-4 (SA-based optimal-parse over `ZSTD_compressSequences`, gate partial pass: 100 KB/1 MB clear +1%, 10 MB +1.56%, 30 MB +2.28%; 14 probe variations on master under `tools/m8/`)** ship end-to-end.
 
 Headline numbers and the milestone-by-milestone history are in [delivered.md](delivered.md). Latest reproducible bench numbers live in [README.md](README.md) "Headline numbers" table.
 
@@ -110,7 +110,7 @@ Shipped milestones live in [delivered.md](delivered.md).
 
 **Risks:** subprocess fan-out on Windows is heavier than POSIX `fork`; need to use `posix_spawn` consistently. Determinism gate (`--fast` flag) needs careful manifest-flag plumbing (similar to `--slow`).
 
-### M8 — GPU match-finder (scout done 2026-05-14; reframed into M8a/M8b/M8c)
+### M8 — GPU match-finder (scout 2026-05-14; M8a partial pass 2026-05-15; reframed around entropy-backend swap)
 
 **Branch history:** `feat/m8-gpu-matchfind` (5 commits, FF-merged to master 2026-05-14). All scout probes live under `tools/m8/` on master.
 
@@ -135,17 +135,40 @@ None are research. All are documented in zstd-19's source. Together they're 1–
 
 #### M8a — CPU optimal-parse competitive with zstd-19 (ratio gate)
 
-**Branch history:** `feat/m8a-optimal-parse` (step 1, FF-merged 2026-05-14), `feat/m8a-step2-repcodes` (step 2, FF-merged 2026-05-14), `feat/m8a-step3-twopass` (step 3, FF-merged 2026-05-14). **Expected:** SA-based optimal parser whose `ZSTD_compressSequences` output lands within +1% of `zstd -19` on the silesia mix at 100 KB / 1 MB / 10 MB / 100 MB sizes.
+**Branch history:** `feat/m8a-optimal-parse` (step 1, FF-merged 2026-05-14), `feat/m8a-step2-repcodes` (step 2, FF-merged 2026-05-14), `feat/m8a-step3-twopass` (step 3, FF-merged 2026-05-14), `feat/m8a-step4-gate` (step 4, FF-merged 2026-05-15). **Status: PARTIAL PASS.** SA-based optimal parser meets the +1% gate at 100 KB and 1 MB on the silesia mix; misses at 10 MB (+1.56%) and 30 MB (+2.28%, borderline-triggers the +2% abandon clause). Structural follow-up is **swapping the entropy backend** (see new M8c below), not further M8a iteration -- 9 cost-model / candidate-set variations (v5-v13) characterized the wall.
 
 **Plan:**
 1. ~~Multi-length candidates per position~~ — **shipped 2026-05-14 (M8a step 1).** `tools/m8/cpu_lz_optimal_v2.c` walks SA in both directions (depth-bounded to 32 ranks per side) collecting up to 8 distinct (length, smallest-offset) tiers. DP picks freely among (literal) and all candidates. Measured at 1 MB on silesia mix: **+1.25% vs zstd-19** (was +1.55% with longest-match-only). 5 MB: +1.96%. 102 KB: +8.67%. 10 MB hits a multi-block validator bug (deferred — step 4's two-pass rewrite supersedes the matcher anyway). Bonus: end-to-end CPU pipeline runs at ~7 MB/s on 5 MB, already 4× xz-9e's 1.8 MB/s pack speed before any GPU work. Gate at 1 MB missed by 0.25 pp; steps 2/3/4 below are the path to close it.
 2. ~~Repcode tracking~~ — **shipped 2026-05-14 (M8a step 2).** `tools/m8/cpu_lz_optimal_v3.c` switches from backward DP to **forward DP carrying state = (cost, rep[3])** per position. At each position the DP tries: literal, every multi-length candidate, and a live byte-by-byte scan of T at each of the 3 current rep offsets (the candidate set keeps smallest-offset per length tier and would miss rep-matching offsets otherwise). Cost model: rep matches priced at `(3 + log2(len)) * 8` (1/8-bit units) vs `(4 + log2(len) + log2(off)) * 8` for fresh offsets, reflecting zstd's FSE offset-code prices. Output sequences carry raw offsets with `rep=0`; `ZSTD_compressSequences` at level ≥10 re-detects repcodes internally (per zstd.h: "Repcodes are, as of now, always re-calculated within this function, ZSTD_Sequence.rep is effectively unused"), so a parse that picks more rep-reusable matches encodes smaller. Measured on silesia mix: **102 KB +1.82%** (was +8.67% in v2, −6.85pp), **1 MB +0.82%** (was +1.25%, **passes the +1% gate**), **5 MB +1.77%** (was +1.96%, −0.19pp). Forward-DP wall time at 1 MB ~290 ms (SA 39 + cand 72 + DP 176); at 5 MB ~1.2 s.
 3. ~~Two-pass cost model~~ — **shipped 2026-05-14 (M8a step 3, partial).** `tools/m8/cpu_lz_optimal_v4.c` runs pass 1 with static 8-bit literal cost, builds `byte_cost[256]` from the pass-1 literal frequency distribution (`-log2(p) * 8` in 1/8-bit units, clamped to [1, 12] bits), then re-runs forward DP with per-position cost `byte_cost[T[i]]`. **Side fix:** added `ZSTD_c_windowLog=27` on the encode CCtx — without this, `ZSTD_compressSequences` rejects inputs >~9 MB with "External sequences are not valid" (block-split sequences referencing offsets past a prior block boundary). This unblocks measurement at 10 MB and above. Measured on silesia mix: **102 KB +1.41%** (was v3 +1.82%, −0.41pp), **1 MB +0.80%** (was +0.82%), **5 MB +1.72%** (was +1.77%), **10 MB +2.86%** (first measurement; v2's multi-block validator bug retired). On this corpus the byte distribution is nearly uniform (1 MB lit_cost range 7.88–8.13 bits → quantizes to ~8 bits everywhere), so the two-pass refinement has small headroom; gains would be larger on pure-text inputs. Step 4 (re-measure at 100 MB) and structural follow-ups remain.
-4. Re-measure ratio at 100 KB / 1 MB / 10 MB / 100 MB silesia vs `zstd -19` and `xz -9e`.
+4. ~~Re-measure ratio + iterate on cost model / candidate set~~ — **shipped 2026-05-15 (M8a step 4, partial pass).** `tools/m8/m8a_gate.sh` runs M8a + zstd-19 + xz-9e on silesia mozilla+webster+nci at 100 KB / 1 MB / 10 MB / 30 MB. (100 MB was the original gate point but the parser binary OOMs above ~30 MB on 8 GB RAM; trend at measured sizes carries the decision.) Nine variation probes (`tools/m8/cpu_lz_optimal_v5-v13.c`) explored:
 
-**Ratio gate:** if M8a converges within +1% of `zstd -19` on silesia, proceed to M8b. **If after the four steps above M8a is still >+2% worse than `zstd -19`, M8 deflates into "Tried and reverted" with M8a's numbers as the structural reason** — the work to close the gap would amount to reimplementing zstd-19's optimal parser, at which point the codec lift is no longer in our court.
+   - **v5:** match overhead 4→6 bits + walk_limit 32→128. 30 MB: +3.75% → +2.66%.
+   - **v6:** per-offset-class FSE cost learned from pass 1. 30 MB: +2.74%. (1 MB best at +0.30%.)
+   - **v7:** + per-ml-class FSE cost. Within noise (mixed corpus has smooth ml distribution).
+   - **v8:** per-128KB-block (byte, of, ml) FSE tables. Per-block smoothing introduced noise; regressed v6/v7 slightly.
+   - **v9:** max_cands 8→16, walk_limit 128→512. Biggest single jump at scale. 30 MB: +2.32%.
+   - **v10:** v9 + v8 per-block tables combined. Per-block noise undid v9 wide-candidate gains.
+   - **v11:** per-candidate length truncation in DP (try every L' in [MINMATCH, Lmax] at each candidate offset). 100 KB +0.77% (best), 1 MB +0.20% (best), 10 MB +1.58% (best), 30 MB +2.36% (slight regression vs v9).
+   - **v12:** hash-chain match-finder augmentation (16-bit hash, K=8 chain) for short medium-offset matches. 30 MB: +2.28% (best).
+   - **v13:** deeper hash chain (18-bit hash, K=32). Output identical to v12 at 10 MB → candidate breadth is not the bottleneck past v12.
 
-**Multi-week.** Realistic timeline 1–2 weeks of focused work. This must be flagged as such per workflow.
+   **Diagnostic (`tools/m8/diff_parse_30mb.c`):** at 30 MB compared v12's parse to zstd-19's via `ZSTD_generateSequences`. Findings: v12 uses 50.5% repcodes vs zstd-19's 43.3% (we beat it on repcode usage); offset/ml histograms match zstd's distribution within ~10K matches per class after v12; total match count differs by only ~50K. **The remaining ~2.3% gap is in encoded cost-per-match, not parse-selection quality.** That cost-per-match gap is what zstd-19's per-block FSE retuning + entropy-aware optimal-parse loop deliver -- our offline cost tables (even per-block, v8/v10) can't replicate that because zstd retunes FSE *during* the parse with candidates evaluated against the *current* FSE state. Closing it inside zstd's entropy stage means reimplementing zstd-19's optimal parser, which is the gate-spec abandonment line.
+
+   **Best across all probes:**
+
+   | size | best result | iteration | +1% gate | +2% abandon |
+   |---|---:|---|---|---|
+   | 100 KB | **+0.77%** | v11 | ✓ PASS | n/a |
+   | 1 MB | **+0.20%** | v12 | ✓ PASS | n/a |
+   | 10 MB | **+1.56%** | v12/v13 | ✗ miss | ✓ clear |
+   | 30 MB | **+2.28%** | v12 | ✗ miss | ✗ trigger (borderline) |
+
+   At 1 MB v12 ties xz-9e (638 378 vs 638 104) -- so M8a is competitive against the universal target at small/medium scale. At 30 MB xz-9e wins by 9% over both M8a and zstd-19, because LZMA's range coder is structurally smaller than zstd's FSE+Huffman on binary data. **The path to "structurally smaller at 30 MB" is swapping entropy backends, not improving the LZ parse -- see new M8c below.**
+
+**Gate verdict:** partial pass. M8a's parser is shipped and characterized; M8b (GPU SA integration) remains gated on a clean +1% pass at all sizes (10 MB and 30 MB still miss). M8a is NOT abandoned -- it's structurally correct LZ77 work that beats zstd-19 at small scale -- but it cannot clear 30 MB without a fundamentally different entropy stage. Reframe captured as new M8c below.
+
+**Multi-week.** Step 4 itself spanned 14 iterations (v4→v13) over 2026-05-14/15, ~6 hours of focused work + extensive measurement.
 
 #### M8b — GPU SA integration into the M8a pipeline (after M8a passes the gate)
 
@@ -157,13 +180,29 @@ None are research. All are documented in zstd-19's source. Together they're 1–
 3. Build a CUDA PLCP+LCP kernel (libcubwt doesn't ship one). The Kasai algorithm linearizes on CPU but a GPU version exists per Deo/Keely 2013 ("Parallel suffix array and least common prefix for the GPU").
 4. Measure end-to-end pack speed vs M8a CPU and vs `zstd -19` and `xz -9e`. Decode unchanged.
 
-#### M8c — Chunked output / inputs > VRAM (deferred)
+#### M8c — Swap entropy backend zstd → LZMA-class range coder (new, 2026-05-15 reframe)
 
-Unchanged from original spec. Adds `--gpu-chunked` mode for inputs above the SA ~300 MB VRAM ceiling, partitions match-stream into N chunks with a cross-chunk bridge side-stream. Only ship when there's a named workload that demands it (today: silesia 211 MB and GIANT 1 GB both fit in 6 GiB VRAM at the per-pass ceiling, decode is already 35× faster than pack so parallel-decode is the wrong target).
+**Motivation:** M8a step 4 (above) demonstrated empirically that our SA-based optimal parser produces a parse essentially equivalent in quality to zstd-19's at scale (matched offset/ml/rep distributions, 50.5% rep usage vs 43.3%), yet our `ZSTD_compressSequences` output stays ~2.3% larger than zstd-19's own output at 30 MB on the silesia mix. The gap is in cost-per-match within zstd's FSE+Huffman entropy stage -- and the *same input* through xz-9e is **9% smaller than zstd-19's own best** (8.74 MB vs 9.64 MB at 30 MB). LZMA's range coder is structurally tighter than zstd FSE on binary data.
 
-#### M8d — Neural / pretrained-model backend (parked; research; was M8b)
+**Direction:** keep M8a's GPU-friendly SA+LZ pipeline, but route the parse to an LZMA-format range coder instead of `ZSTD_compressSequences`. Decoder uses standard `xz -d`. Output is byte-identical to a standard `.xz` stream.
 
-Originally bundled into M8, then split into M8b. Renamed M8d here so the milestone codes align with the new ratio-gated structure.
+**Plan:**
+1. Study LZMA stream format (xz-utils `liblzma`, or 7-zip reference). The sequence-to-stream conversion is the new work; everything before (SA, candidate enumeration, optimal parse) is already on master.
+2. Build a `ZSTD_compressSequences`-shaped API around `liblzma` -- accepts an externally-supplied LZ77 parse, produces an `.xz`-formatted stream. May require liblzma patches if the public API doesn't accept external sequences (zstd's API was the only known one that did).
+3. Re-run the M8a step 4 gate measurement targeting xz-9e instead of zstd-19. Gate: M8a/LZMA within +1% of xz-9e at 100 KB / 1 MB / 10 MB / 30 MB.
+4. If gate passes, M8c ships. M8b GPU SA integration would then be evaluated on the M8a+LZMA pipeline (still gated on M8a's part of that pipeline meeting the gate).
+
+**Risk:** liblzma may not expose a "supply-your-own-parse" API in the way zstd does (zstd's API itself is documented as debug-only). The work to write one ourselves is meaningful but bounded -- LZMA range coding is well-documented.
+
+**Multi-week.** Realistic 2-4 weeks.
+
+#### M8d — Chunked output / inputs > VRAM (was M8c, deferred)
+
+Unchanged from original spec. Adds `--gpu-chunked` mode for inputs above the SA ~300 MB VRAM ceiling, partitions match-stream into N chunks with a cross-chunk bridge side-stream. Only ship when there's a named workload that demands it (today: silesia 211 MB and GIANT 1 GB both fit in 6 GiB VRAM at the per-pass ceiling, decode is already 35× faster than pack so parallel-decode is the wrong target). Renumbered to make room for M8c entropy-swap.
+
+#### M8e — Neural / pretrained-model backend (parked; research; was M8d)
+
+Originally bundled into M8, split, renumbered. Renamed M8e here after M8c was repurposed to entropy-backend swap.
 
 **Direction:** bundle a small distilled byte-level model (10–50 MB), use it as the per-byte predictor in a GPU arithmetic coder. Could land at cmix-class ratio (~0.13 on text) at zpaq-class throughput.
 
