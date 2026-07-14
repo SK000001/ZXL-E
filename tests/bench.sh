@@ -330,6 +330,110 @@ if [ -n "$ZPAQ" ]; then
     bench_zpaq "MP3 (packMP3)"         tests/corpus/synth.mp3
 fi
 
+# Competitor: 7-Zip -t7z -mx=9 -ms=on (solid LZMA2, BCJ auto-filter). The
+# strongest widely-deployed container-level competitor -- what an outside
+# evaluator reaches for first. Uses the standalone 7zr console build
+# (make 7zip-deps) or a system 7z if present.
+SEVENZ=""
+[ -x third_party/7zip/7zr.exe ] && SEVENZ=third_party/7zip/7zr.exe
+[ -z "$SEVENZ" ] && [ -x third_party/7zip/7zr ] && SEVENZ=third_party/7zip/7zr
+[ -z "$SEVENZ" ] && command -v 7z >/dev/null 2>&1 && SEVENZ=7z
+if [ -n "$SEVENZ" ]; then
+    echo
+    echo "=== Competitor: 7-Zip -mx=9 -ms=on vs zxle (size + RT) ==="
+    bench_7z() {
+        local label="$1" SRC="$2"
+        [ -f "$SRC" ] || return 0
+        local base; base=$(basename "$SRC")
+        local arc="tests/baseline/$base.7z"
+        local recdir="tests/unpacked/$base.7z.d"
+        rm -f "$arc"; rm -rf "$recdir"; mkdir -p "$recdir"
+        local t0 sz_ms ext_ms SZ_RT
+        t0=$EPOCHREALTIME
+        "$SEVENZ" a -t7z -mx=9 -ms=on "$arc" "$SRC" >/dev/null 2>&1 || { echo "  $label: 7z a failed"; return 0; }
+        sz_ms=$(elapsed_ms "$t0")
+        t0=$EPOCHREALTIME
+        "$SEVENZ" x -o"$recdir" -y "$arc" >/dev/null 2>&1 || { echo "  $label: 7z x failed"; return 0; }
+        ext_ms=$(elapsed_ms "$t0")
+        local extracted; extracted=$(find "$recdir" -type f 2>/dev/null | head -1)
+        cmp -s "$SRC" "$extracted" && SZ_RT=OK || SZ_RT=FAIL
+        local SZ ORIG XZ ZX
+        ORIG=$(stat -c%s "$SRC")
+        SZ=$(stat -c%s "$arc")
+        ZX=$(stat -c%s "tests/baseline/$base.zxle" 2>/dev/null || echo 0)
+        XZ=$(xz -9e -c "$SRC" 2>/dev/null | wc -c)
+        printf "  %s (%s):\n" "$label" "$base"
+        printf "    orig=%d  zxle=%d  7z-mx9=%d  xz-9e=%d  rt=%s\n" "$ORIG" "$ZX" "$SZ" "$XZ" "$SZ_RT"
+        if [ "$ZX" -gt 0 ]; then
+            printf "    7z vs zxle: %s   7z vs xz-9e: %s   perf: pack=%dms extract=%dms\n" \
+                "$(awk -v a="$SZ" -v b="$ZX" 'BEGIN{printf "%+.2f%%", (a-b)*100/b}')" \
+                "$(awk -v a="$SZ" -v b="$XZ" 'BEGIN{printf "%+.2f%%", (a-b)*100/b}')" \
+                "$sz_ms" "$ext_ms"
+        fi
+        rm -f "$arc"; rm -rf "$recdir"
+    }
+    bench_7z "ZIP unwrap"            tests/corpus/pe-deflate.zip
+    bench_7z "ZIP/L6 (preflate)"     tests/corpus/pe-deflate-l6.zip
+    bench_7z "DOCX (real ZIP/L6)"    tests/corpus/sample.docx
+    bench_7z "JAR (real ZIP/L6)"     tests/corpus/sample.jar
+    bench_7z "gzip wrapper"          tests/corpus/ntdll.dll.gz
+    bench_7z "gz of mixed.tar"       tests/corpus/mixed.tar.gz
+    bench_7z "deb-shape ar"          tests/corpus/mixed.deb
+    bench_7z "JPEG (brunsli)"        tests/corpus/synth.jpg
+    bench_7z "PNG (IDAT zlib-L9)"    "$CORPUS/test.png"
+    bench_7z "MP3 (packMP3)"         tests/corpus/synth.mp3
+fi
+
+# Competitor combo: precomp -cn + xz -9e. Standalone precomp understates the
+# real competition (repacker pipelines chain an unwrapper with a strong final
+# codec); precomp's pure-unwrap .pcf through the same final codec we use is
+# the honest baseline for zxle's whole thesis.
+if [ -n "$PRECOMP" ]; then
+    echo
+    echo "=== Competitor combo: precomp -cn | xz -9e vs zxle (size + RT) ==="
+    bench_precomp_xz() {
+        local label="$1" SRC="$2"
+        [ -f "$SRC" ] || return 0
+        local base; base=$(basename "$SRC")
+        local pcf="tests/baseline/$base.cn.pcf" rec="tests/unpacked/$base.pcxz.bin"
+        rm -f "$pcf" "$pcf.xz" "$rec"
+        local t0 pc_ms rec_ms PC_RT
+        t0=$EPOCHREALTIME
+        "$PRECOMP" -cn -o"$pcf" "$SRC" >/dev/null 2>&1 || { echo "  $label: precomp -cn failed"; return 0; }
+        xz -9e --threads=1 -c "$pcf" > "$pcf.xz" 2>/dev/null
+        pc_ms=$(elapsed_ms "$t0")
+        t0=$EPOCHREALTIME
+        xz -d -c "$pcf.xz" > "$pcf.rt" 2>/dev/null
+        "$PRECOMP" -r -o"$rec" "$pcf.rt" >/dev/null 2>&1 || { echo "  $label: precomp -r failed"; return 0; }
+        rec_ms=$(elapsed_ms "$t0")
+        cmp -s "$SRC" "$rec" && PC_RT=OK || PC_RT=FAIL
+        local SZ ORIG XZ ZX
+        ORIG=$(stat -c%s "$SRC")
+        SZ=$(stat -c%s "$pcf.xz")
+        ZX=$(stat -c%s "tests/baseline/$base.zxle" 2>/dev/null || echo 0)
+        XZ=$(xz -9e -c "$SRC" 2>/dev/null | wc -c)
+        printf "  %s (%s):\n" "$label" "$base"
+        printf "    orig=%d  zxle=%d  precomp+xz=%d  xz-9e=%d  rt=%s\n" "$ORIG" "$ZX" "$SZ" "$XZ" "$PC_RT"
+        if [ "$ZX" -gt 0 ]; then
+            printf "    precomp+xz vs zxle: %s   vs xz-9e: %s   perf: pack=%dms restore=%dms\n" \
+                "$(awk -v a="$SZ" -v b="$ZX" 'BEGIN{printf "%+.2f%%", (a-b)*100/b}')" \
+                "$(awk -v a="$SZ" -v b="$XZ" 'BEGIN{printf "%+.2f%%", (a-b)*100/b}')" \
+                "$pc_ms" "$rec_ms"
+        fi
+        rm -f "$pcf" "$pcf.xz" "$pcf.rt" "$rec"
+    }
+    bench_precomp_xz "ZIP unwrap"            tests/corpus/pe-deflate.zip
+    bench_precomp_xz "ZIP/L6 (preflate)"     tests/corpus/pe-deflate-l6.zip
+    bench_precomp_xz "DOCX (real ZIP/L6)"    tests/corpus/sample.docx
+    bench_precomp_xz "JAR (real ZIP/L6)"     tests/corpus/sample.jar
+    bench_precomp_xz "gzip wrapper"          tests/corpus/ntdll.dll.gz
+    bench_precomp_xz "gz of mixed.tar"       tests/corpus/mixed.tar.gz
+    bench_precomp_xz "deb-shape ar"          tests/corpus/mixed.deb
+    bench_precomp_xz "JPEG (brunsli)"        tests/corpus/synth.jpg
+    bench_precomp_xz "PNG (IDAT zlib-L9)"    "$CORPUS/test.png"
+    bench_precomp_xz "MP3 (packMP3)"         tests/corpus/synth.mp3
+fi
+
 # ZXL-E --slow mode (zpaq -m5 final-step) on headline fixtures. Gated by
 # ZXLE_SLOW=1 because per-fixture pack adds ~5-10x over default xz-9e, and
 # the typical bench run shouldn't double its wall time.
@@ -541,6 +645,31 @@ if [ "${ZXLE_SILESIA:-0}" = "1" ] && [ -d tests/corpus/silesia ]; then
             "$SIL_XZ" "$(ratio "$SIL_XZ" "$SIL_SUM")" "$SIL_XZ_MS"
         printf "  tar + zstd-19    %12d  ratio=%s  pack=%dms\n" \
             "$SIL_ZSTD" "$(ratio "$SIL_ZSTD" "$SIL_SUM")" "$SIL_ZSTD_MS"
+        # 7z solid baseline: own cache file so the 3-codec cache line format
+        # above stays untouched.
+        if [ -n "$SEVENZ" ]; then
+            SIL7Z_CACHE=tests/baseline/silesia.7z.cache.txt
+            SIL_7Z=0; SIL_7Z_MS=0
+            if [ -n "$SIL_HASH" ] && [ -f "$SIL7Z_CACHE" ] && \
+               [ "$(awk '{print $1}' "$SIL7Z_CACHE")" = "$SIL_HASH" ]; then
+                SIL_7Z=$(awk '{print $2}' "$SIL7Z_CACHE")
+                SIL_7Z_MS=$(awk '{print $3}' "$SIL7Z_CACHE")
+            else
+                SARC="tests/baseline/silesia.7z"
+                rm -f "$SARC"
+                t0=$EPOCHREALTIME
+                "$SEVENZ" a -t7z -mx=9 -ms=on "$SARC" "$SIL_TAR" >/dev/null 2>&1 && \
+                    SIL_7Z=$(stat -c%s "$SARC") || SIL_7Z=0
+                SIL_7Z_MS=$(elapsed_ms "$t0")
+                rm -f "$SARC"
+                [ -n "$SIL_HASH" ] && [ "$SIL_7Z" -gt 0 ] && \
+                    echo "$SIL_HASH $SIL_7Z $SIL_7Z_MS" > "$SIL7Z_CACHE"
+            fi
+            if [ "$SIL_7Z" -gt 0 ]; then
+                printf "  7z -mx9 (tar)    %12d  ratio=%s  pack=%dms\n" \
+                    "$SIL_7Z" "$(ratio "$SIL_7Z" "$SIL_SUM")" "$SIL_7Z_MS"
+            fi
+        fi
         if [ "$SIL_ZPAQ" -gt 0 ]; then
             printf "  zpaq -m5 (tar)   %12d  ratio=%s  pack=%dms\n" \
                 "$SIL_ZPAQ" "$(ratio "$SIL_ZPAQ" "$SIL_SUM")" "$SIL_ZPAQ_MS"

@@ -97,6 +97,17 @@ zpaq-deps:
 	fi
 	@echo "zpaq ready at $(PWD)/$(ZPAQ_DIR)/. Add to PATH for --slow mode, or use tests/bench.sh which auto-detects."
 
+SEVENZIP_DIR = third_party/7zip
+
+# 7zip-deps: required only for the 7-Zip competitor section of bench.sh.
+# Pulls the standalone console build (7zr.exe, .7z-only) from 7-zip.org.
+7zip-deps:
+	@if [ ! -x $(SEVENZIP_DIR)/7zr.exe ] && [ ! -x $(SEVENZIP_DIR)/7zr ]; then \
+	  mkdir -p $(SEVENZIP_DIR) && \
+	  curl -fsSL -o $(SEVENZIP_DIR)/7zr.exe https://www.7-zip.org/a/7zr.exe; \
+	fi
+	@echo "7zr ready at $(PWD)/$(SEVENZIP_DIR)/."
+
 PRECOMP_DIR = third_party/precomp
 
 # precomp-deps: required only for the precomp competitor section of bench.sh.
@@ -117,7 +128,7 @@ real-fixtures:
 
 # Convenience: fetch + build everything a fresh clone needs to run the full
 # bench. ~10 min on a fresh machine (preflate + brunsli cmake builds dominate).
-all-deps: preflate-deps brunsli-deps packmp3-deps zpaq-deps precomp-deps real-fixtures
+all-deps: preflate-deps brunsli-deps packmp3-deps zpaq-deps precomp-deps 7zip-deps real-fixtures
 	@echo
 	@echo "All deps ready. Next:"
 	@echo "  make                          # builds zxle"
@@ -128,4 +139,4 @@ all-deps: preflate-deps brunsli-deps packmp3-deps zpaq-deps precomp-deps real-fi
 clean:
 	rm -f $(BIN) src/*.o tests/*.zxle tests/*.tmp
 
-.PHONY: all clean preflate-deps brunsli-deps packmp3-deps zpaq-deps precomp-deps real-fixtures all-deps
+.PHONY: all clean preflate-deps brunsli-deps packmp3-deps zpaq-deps precomp-deps 7zip-deps real-fixtures all-deps
