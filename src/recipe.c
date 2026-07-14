@@ -100,6 +100,14 @@ void unpack_recipe(const uint8_t *recipe, size_t rlen,
             unpack_zst(recipe + r, zrl, s, out, len, tmp_prefix);
             r += zrl;
             written += len;
+        } else if (op == OP_ZIP_STORE) {
+            /* Nested ZIP recipe shares this OP vocabulary; recurse in place. */
+            if (r + 4 > rlen) die("recipe ZIP_STORE recipe_len truncated");
+            uint32_t zprl = r32(recipe + r); r += 4;
+            if (r + zprl > rlen) die("recipe ZIP_STORE recipe overflow");
+            unpack_recipe(recipe + r, zprl, s, out, len, tmp_prefix);
+            r += zprl;
+            written += len;
         } else if (op == OP_PREFLATE) {
             if (r + 1 > rlen) die("recipe PREFLATE bucket truncated");
             uint8_t bk = recipe[r]; r += 1;

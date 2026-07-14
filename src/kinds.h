@@ -36,6 +36,8 @@
  * Each manifest entry gains u32 crc32 (of the original file bytes, zlib
  * polynomial) between mode and kind; unpack verifies every reconstructed
  * entry against it. Trailing payload per-bucket csize widens u32 -> u64.
+ * v7 also adds OP_ZIP_STORE (0x0A): ZIP/JAR entries inside tar/ar recurse
+ * through pack_zip instead of falling to OP_STORE.
  * v3..v7 cannot interoperate. */
 #define ZXLE_VER 7
 
@@ -75,6 +77,9 @@
  *   0x07 BZ2_STORE  -- (u32 bz2_recipe_len)(bz2_recipe_bytes); call unpack_bz2.
  *   0x08 XZ_STORE   -- (u32 xz_recipe_len)(xz_recipe_bytes); call unpack_xz.
  *   0x09 ZSTD_STORE -- (u32 zst_recipe_len)(zst_recipe_bytes); call unpack_zst.
+ *   0x0A ZIP_STORE  -- (u32 zip_recipe_len)(zip_recipe_bytes); the nested ZIP
+ *                      recipe uses this same OP vocabulary; unpack_recipe
+ *                      recurses to reconstruct `len` ZIP bytes in place.
  */
 #define OP_STRUCT     0x00
 #define OP_REDEFLATE  0x01
@@ -86,6 +91,7 @@
 #define OP_BZ2_STORE  0x07
 #define OP_XZ_STORE   0x08
 #define OP_ZSTD_STORE 0x09
+#define OP_ZIP_STORE  0x0A
 
 /* Per-kind recipe layouts (parsed by their respective pack_<kind> and
  * unpack_<kind>):

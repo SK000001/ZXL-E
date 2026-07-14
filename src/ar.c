@@ -6,6 +6,7 @@
 #include "bz2.h"
 #include "xz.h"
 #include "zst.h"
+#include "zip.h"
 
 int pack_ar(const uint8_t *p, size_t n, const char *tmp_prefix,
             Buf *recipe, Buf *b0, Buf *b1) {
@@ -17,7 +18,7 @@ int pack_ar(const uint8_t *p, size_t n, const char *tmp_prefix,
     buf_append(recipe, p, 8);
 
     size_t cur = 8;
-    int entries = 0, gzip_stored = 0, bz2_stored = 0, xz_stored = 0, zstd_stored = 0, png_stored = 0, jpeg_stored = 0, stored_plain = 0;
+    int entries = 0, gzip_stored = 0, bz2_stored = 0, xz_stored = 0, zstd_stored = 0, png_stored = 0, jpeg_stored = 0, zip_stored = 0, stored_plain = 0;
 
     while (cur < n) {
         if (cur + 60 > n) return -1;
@@ -132,6 +133,20 @@ int pack_ar(const uint8_t *p, size_t n, const char *tmp_prefix,
                 }
                 buf_free(&zs_recipe);
             }
+            if (!handled && size >= 22 && body[0] == 0x50 && body[1] == 0x4B) {
+                char tp[1024];
+                snprintf(tp, sizeof(tp), "%s.arzip.%zu", tmp_prefix, cur);
+                Buf zip_recipe; buf_init(&zip_recipe);
+                if (pack_zip(body, (size_t)size, tp, &zip_recipe, b0, b1) == 0) {
+                    buf_u8(recipe, OP_ZIP_STORE);
+                    buf_u32(recipe, (uint32_t)size);
+                    buf_u32(recipe, (uint32_t)zip_recipe.n);
+                    buf_append(recipe, zip_recipe.p, zip_recipe.n);
+                    zip_stored++;
+                    handled = 1;
+                }
+                buf_free(&zip_recipe);
+            }
             if (!handled) {
                 uint8_t bk = bucket_for_bytes(body, (size_t)size);
                 buf_u8(recipe, OP_STORE);
@@ -153,7 +168,7 @@ int pack_ar(const uint8_t *p, size_t n, const char *tmp_prefix,
         entries++;
     }
 
-    fprintf(stderr, "    ar: %d entries (%d store, %d gzip-store, %d bz2-store, %d xz-store, %d zstd-store, %d png-store, %d jpeg-store)\n",
-            entries, stored_plain, gzip_stored, bz2_stored, xz_stored, zstd_stored, png_stored, jpeg_stored);
+    fprintf(stderr, "    ar: %d entries (%d store, %d gzip-store, %d bz2-store, %d xz-store, %d zstd-store, %d png-store, %d jpeg-store, %d zip-store)\n",
+            entries, stored_plain, gzip_stored, bz2_stored, xz_stored, zstd_stored, png_stored, jpeg_stored, zip_stored);
     return 0;
 }

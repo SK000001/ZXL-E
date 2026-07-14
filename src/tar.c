@@ -6,6 +6,7 @@
 #include "bz2.h"
 #include "xz.h"
 #include "zst.h"
+#include "zip.h"
 
 int pack_tar(const uint8_t *p, size_t n, const char *tmp_prefix,
              Buf *recipe, Buf *b0, Buf *b1) {
@@ -14,7 +15,7 @@ int pack_tar(const uint8_t *p, size_t n, const char *tmp_prefix,
     if (memcmp(p + 257, "ustar", 5) != 0) return -1;
 
     size_t cur = 0;
-    int regulars = 0, jpeg_stored = 0, png_stored = 0, gzip_stored = 0, bz2_stored = 0, xz_stored = 0, zstd_stored = 0, stored_plain = 0;
+    int regulars = 0, jpeg_stored = 0, png_stored = 0, gzip_stored = 0, bz2_stored = 0, xz_stored = 0, zstd_stored = 0, zip_stored = 0, stored_plain = 0;
 
     while (cur + 512 <= n) {
         const uint8_t *hdr = p + cur;
@@ -80,6 +81,21 @@ int pack_tar(const uint8_t *p, size_t n, const char *tmp_prefix,
                     handled = 1;
                 }
                 buf_free(&brn);
+            }
+            if (!handled && is_regular && size >= 22 &&
+                p[cur] == 0x50 && p[cur+1] == 0x4B) {
+                char tp[1024];
+                snprintf(tp, sizeof(tp), "%s.tzip.%zu", tmp_prefix, cur);
+                Buf zip_recipe; buf_init(&zip_recipe);
+                if (pack_zip(p + cur, (size_t)size, tp, &zip_recipe, b0, b1) == 0) {
+                    buf_u8(recipe, OP_ZIP_STORE);
+                    buf_u32(recipe, (uint32_t)size);
+                    buf_u32(recipe, (uint32_t)zip_recipe.n);
+                    buf_append(recipe, zip_recipe.p, zip_recipe.n);
+                    zip_stored++;
+                    handled = 1;
+                }
+                buf_free(&zip_recipe);
             }
             if (!handled && is_regular && size >= 18 &&
                 p[cur] == 0x1F && p[cur+1] == 0x8B && p[cur+2] == 0x08) {
@@ -174,7 +190,7 @@ int pack_tar(const uint8_t *p, size_t n, const char *tmp_prefix,
         buf_append(recipe, p + cur, n - cur);
     }
 
-    fprintf(stderr, "    tar: %d regular (%d store, %d jpeg-store, %d png-store, %d gzip-store, %d bz2-store, %d xz-store, %d zstd-store)\n",
-            regulars, stored_plain, jpeg_stored, png_stored, gzip_stored, bz2_stored, xz_stored, zstd_stored);
+    fprintf(stderr, "    tar: %d regular (%d store, %d jpeg-store, %d png-store, %d gzip-store, %d bz2-store, %d xz-store, %d zstd-store, %d zip-store)\n",
+            regulars, stored_plain, jpeg_stored, png_stored, gzip_stored, bz2_stored, xz_stored, zstd_stored, zip_stored);
     return 0;
 }

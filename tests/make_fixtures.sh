@@ -197,6 +197,22 @@ if want mixed.deb; then
     fi
 fi
 
+# zip-in.tar — tar containing a ZIP (sample.jar) + a plain DLL. Tests
+# OP_ZIP_STORE routing inside pack_tar (v7).
+if want zip-in.tar; then
+    CORPUS="${ZXLE_CORPUS:-../../../Zxl/tests}"
+    if [ -f sample.jar ] && [ -f "$CORPUS/kernel32.dll" ]; then
+        TMP=$(mktemp -d)
+        cp sample.jar "$TMP/"
+        cp "$CORPUS/kernel32.dll" "$TMP/"
+        (cd "$TMP" && tar cf zip-in.tar sample.jar kernel32.dll)
+        mv "$TMP/zip-in.tar" .
+        rm -rf "$TMP"
+    else
+        echo "skipping zip-in.tar -- sample.jar or corpus DLL not found"
+    fi
+fi
+
 # gz-in.tar — tar containing a .gz file + a plain DLL. Tests OP_GZIP_STORE
 # routing inside pack_tar.
 if want gz-in.tar; then
