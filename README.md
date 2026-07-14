@@ -4,9 +4,9 @@ Recursive format-aware transform pipeline for general-purpose compression.
 
 Goal: be the smallest archive across **every** file type, not just one. Sister project to [ZXL](../Zxl) (which targets PE binaries specifically). ZXL-E uses ZXL as one of its backends when it detects PE streams.
 
-## Status (2026-05-14, XLSX + PPTX bench shipped)
+## Status (2026-07-14, v7 format + OP_ZIP_STORE + hardening + bench widening shipped)
 
-Default mode (xz-9e final-step + BCJ-x86 sub-stream for PE/ELF content) ties or beats xz-9e on the standard Silesia corpus and beats it by 6–60% on container-shaped artifacts. Optional `--slow` mode (zpaq -m5 final-step) matches the SOTA general-purpose codec on Silesia (ratio 0.1891) and stacks the gain on top of container unwrap (−29% to −47% vs xz-9e baseline on container fixtures). Optional `--fast` mode (xz -T0 --block-size=8MiB final-step) gives **5.9–9.07× pack speedup** at +3% size cost; speedup grows with input — 9.07× at 1 GB. Measured up to 1 GB (`ZXLE_GIANT=1`); no solid-mode cliff past the 128 MiB long-window.
+Default mode (xz-9e final-step + BCJ-x86 sub-stream for x86/x64 PE/ELF content) ties or beats xz-9e on the standard Silesia corpus and beats it by 5–80% on container-shaped artifacts. Optional `--slow` mode (zpaq -m5 final-step) matches the SOTA general-purpose codec on Silesia (ratio 0.1891) and stacks the gain on top of container unwrap (−29% to −47% vs xz-9e baseline on container fixtures). Optional `--fast` mode (xz -T0 with input-scaled blocks) gives **5.4–12× pack speedup** at +0.6% (1 GB) to +2.1% (211 MB) size cost. Measured up to 1 GB (`ZXLE_GIANT=1`). The v7 wire format compresses the manifest (recipes carry raw container-structure bytes — was up to 65% of archive size) and crc32-verifies every entry at unpack. Against competitors on the container fixtures: 7-Zip `-mx=9 -ms=on` loses to zxle by 15–47% (it has no unwrap path); the closest peer combo `precomp -cn | xz -9e` loses on 5 fixtures, ties 3, and wins 2 small ones (JAR −1.05%, JPEG −0.70% — tracked in roadmap).
 
 | Stage | Status |
 |---|---|
@@ -41,8 +41,15 @@ Default mode (xz-9e final-step + BCJ-x86 sub-stream for PE/ELF content) ties or 
 | **M7 step 4 --fast flag** | **shipped** — `xz -T0 --block-size=8MiB` final-step; 5.9× at 51 MB, 9.07× at 1 GB; +3% size cost |
 | **Large-corpus measurement (1 GB)** | **shipped** — `ZXLE_GIANT=1` validates no solid-mode cliff at 1 GB; zxle matches tar+xz-9e +0.00% |
 | **XLSX + PPTX bench** | **shipped** — M2 ZIP path validated on OOXML beyond DOCX; sample.xlsx −19.35%, sample.pptx −22.68% vs xz-9e |
+| **M8a CPU optimal-parse (scout)** | **partial pass** — SA-based parse ties zstd-19 at ≤1 MB, +1.6–2.3% at 10–30 MB; reframed as M8c entropy-backend swap (see roadmap) |
+| **ZXLE_VER 7: compressed manifest + crc32 + 64-bit IO** | **shipped** — manifest xz'd (was raw; 65% of sample.jar archive), per-entry crc32 verified at unpack, 2 GiB Windows cap fixed; jar −51% vs v6, pptx −2.8%, tar family −1% |
+| **OP_ZIP_STORE (zip-in-tar/ar recursion)** | **shipped** — JAR/ZIP inside tar/ar unwraps recursively; zip-in.tar −3.83% vs prior, −5.61% vs xz-9e |
+| **BCJ arch guard** | **shipped** — only x86/x64 PE/ELF route to the xz --x86 bucket; ARM64 binaries no longer get the wrong filter |
+| **--fast input-scaled blocks** | **shipped** — block = bucket/ncpus clamp [8,64] MiB; 1 GB size cost +3.24% → +0.58% at 5.4× speedup |
+| **Pack/unpack hardening** | **shipped** — duplicate basenames refused at pack; zip-slip names refused at unpack |
+| **7z + precomp-cn\|xz competitor bench** | **shipped** — 7z ties xz-9e on containers (zxle +15–47%); precomp\|xz is the close peer (zxle wins 5, ties 3, loses JAR/JPEG) |
 
-## Headline numbers (2026-05-14)
+## Headline numbers (2026-07-14, ZXLE_VER 7)
 
 | Fixture | xz-9e | zxle (default) | zxle --slow |
 |---|---|---|---|
@@ -50,41 +57,45 @@ Default mode (xz-9e final-step + BCJ-x86 sub-stream for PE/ELF content) ties or 
 | 8-file corpus (solid ratio) | — | **0.3326** | — |
 | Silesia 211 MB (ratio) | 0.2284 | 0.2269 | **0.1891** (matches zpaq -m5) |
 | GIANT 1.06 GB (ratio) | 0.2283 | **0.2283** (+0.00% vs xz-9e) | — (impractical) |
-| pe-deflate.zip | — | **−22.44%** | **−32.73%** vs xz-9e |
+| pe-deflate.zip | — | **−22.45%** | **−32.73%** vs xz-9e |
 | pe-deflate-l6.zip | — | **−22.76%** | **−33.00%** vs xz-9e |
-| sample.docx | — | −19.23% | **−47.41%** vs xz-9e |
-| sample.xlsx | — | **−19.35%** | — |
-| sample.pptx | — | **−22.68%** | — |
+| sample.docx | — | −19.26% | **−47.41%** vs xz-9e |
+| sample.xlsx | — | **−19.83%** | — |
+| sample.pptx | — | **−24.85%** | — |
 | ntdll.dll.gz | — | **−19.23%** | **−29.43%** vs xz-9e |
-| mixed.tar.gz | — | **−22.92%** | **−30.65%** vs xz-9e |
-| mixed.tar.bz2 | — | **−21.79%** | — |
-| mixed.tar.zst3 (default-3) | — | **−22.70%** | — |
-| mixed.tar.zst (level-19) | — | **−12.95%** | — |
-| mixed.deb | — | **−20.70%** | **−31.16%** vs xz-9e |
+| mixed.tar | — | **−9.05%** | — |
+| mixed.tar.gz | — | **−23.65%** | **−30.65%** vs xz-9e |
+| mixed.tar.bz2 | — | **−22.54%** | — |
+| mixed.tar.zst3 (default-3) | — | **−23.44%** | — |
+| mixed.tar.zst (level-19) | — | **−13.78%** | — |
+| mixed.deb | — | **−21.38%** | **−31.16%** vs xz-9e |
 | zip-with-jpeg.zip | — | **−21.95%** | — |
-| zip-with-png.zip | — | **−23.49%** | — |
-| gz-in.tar | — | **−17.09%** | — |
-| bz2-in.tar | — | **−14.09%** | — |
-| xz-in.tar | — | **−4.22%** | — |
-| zst-in.tar | — | **−8.47%** | — |
-| sample.jar | — | −59.33% | −59.33% (--slow tier picks default) |
+| zip-with-png.zip | — | **−23.50%** | — |
+| gz-in.tar | — | **−17.82%** | — |
+| bz2-in.tar | — | **−14.28%** | — |
+| xz-in.tar | — | **−4.56%** | — |
+| zst-in.tar | — | **−8.83%** | — |
+| zip-in.tar (new, OP_ZIP_STORE) | — | **−5.61%** | — |
+| sample.jar | — | **−80.22%** (3,044 B) | −80.22% (--slow tier picks default) |
 
-`--fast` pack-time speedup (size cost +2.8–3.2%, ratio unchanged in the manifest format):
+(--slow percentages are from the 2026-05-14 measurement on the v6 format; v7 shifts them slightly in zxle's favor.)
 
-| Fixture | default pack | --fast pack | speedup |
-|---|---:|---:|---:|
-| silesia mozilla (51 MB single) | 23.4 s | 4.0 s | **5.9×** |
-| Silesia 211 MB | 247 s | 42 s | **5.9×** |
-| GIANT 1.06 GB | 617 s | 68 s | **9.07×** |
+`--fast` pack-time speedup (input-scaled blocks, 2026-07-14, 16 logical CPUs, single-input packs):
+
+| Fixture | default pack | --fast pack | speedup | size cost |
+|---|---:|---:|---:|---:|
+| silesia mozilla (51 MB single) | 23.4 s | 4.0 s | **5.9×** | +2.77% |
+| silesia.tar 211 MB | 247 s | 20.6 s | **12×** | +2.10% |
+| giant 1.06 GB | 617 s | 113 s | **5.4×** | **+0.58%** |
 
 ## Architecture
 
 Five-stage pipeline:
 
-1. **Recursive container unwrap** — peel ZIP / tar / ar / .deb / gzip / bzip2 / zstd / xz down to raw streams plus a recipe to rebuild byte-identical originals.
+1. **Recursive container unwrap** — peel ZIP / tar / ar / .deb / gzip / bzip2 / zstd / xz down to raw streams plus a recipe to rebuild byte-identical originals. Since v7, ZIP/JAR entries *inside* tar/ar recurse through the ZIP unwrapper too (OP_ZIP_STORE).
 2. **Per-stream format-aware recompression** — DEFLATE → preflate (or zlib-L9 redeflate fast path), JPEG → brunsli, PNG IDAT → preflate over inflated pixels, MP3 → packMP3.
-3. **Per-OP bucket routing (M6 v3)** — every recipe op carries a u8 bucket byte; PE/ELF bytes (sniffed on inflated payload) route to a dedicated sub-stream finalized with `xz -9e --x86` (BCJ filter); PNG pixel data, text, and already-compressed bytes stay in the main bucket. Mixed-content containers (DLL+image inside one tar/deb) split across both buckets per-entry.
-4. **Cross-stream solid mode** — main bucket finalized with xz -9e (default) or zpaq -m5 (`--slow`); BCJ bucket always finalized with xz -9e --x86.
+3. **Per-OP bucket routing (M6 v3)** — every recipe op carries a u8 bucket byte; x86/x64 PE/ELF bytes (machine field parsed, not just magic) route to a dedicated sub-stream finalized with `xz -9e --x86` (BCJ filter); PNG pixel data, text, non-x86 binaries, and already-compressed bytes stay in the main bucket. Mixed-content containers (DLL+image inside one tar/deb) split across both buckets per-entry.
+4. **Cross-stream solid mode** — main bucket finalized with xz -9e (default) or zpaq -m5 (`--slow`); BCJ bucket always finalized with xz -9e --x86. The manifest (recipes + structural bytes) is xz-compressed as its own block (v7) and every entry carries a crc32 that unpack verifies.
 5. **min-pack fallthrough** — every pack runs both the unwrap path and an all-opaque path; the smaller wins. Saves us from regressions on tightly-deflated tiny inputs. With `--slow`, also tiers default-mode candidate on small inputs and keeps the smaller — guaranteeing pareto optimality.
 
 Each stage is known in isolation; the integrated product does not exist publicly.
@@ -102,7 +113,7 @@ bash tests/bench.sh                   # default bench (~5 min)
 ZXLE_SILESIA=1 ZXLE_SLOW=1 bash tests/bench.sh   # full bench incl. Silesia + --slow (~30-60 min)
 ```
 
-`make all-deps` is the umbrella target: `preflate-deps brunsli-deps packmp3-deps zpaq-deps precomp-deps real-fixtures`. Each is also runnable individually if you want to skip something (e.g. only `preflate-deps` is required for the build itself; brunsli/packmp3/zpaq/precomp are only needed for their respective format routes / competitor benches).
+`make all-deps` is the umbrella target: `preflate-deps brunsli-deps packmp3-deps zpaq-deps precomp-deps 7zip-deps real-fixtures`. Each is also runnable individually if you want to skip something (e.g. only `preflate-deps` is required for the build itself; brunsli/packmp3/zpaq are only needed for their respective format routes, precomp/7zip only for the competitor bench sections).
 
 Host requirements:
 - `gcc` + `g++` (C11 / C++14)
@@ -121,6 +132,7 @@ make brunsli-deps    # optional: cbrunsli/dbrunsli for JPEG routing
 make packmp3-deps    # optional: packMP3 for MP3 routing
 make zpaq-deps       # optional: zpaq for --slow mode
 make precomp-deps    # optional: precomp v0.4.7 competitor in bench
+make 7zip-deps       # optional: standalone 7zr for the 7-Zip competitor bench
 make real-fixtures   # optional: silesia + real .deb + real .tar.xz
 make
 ```
@@ -134,7 +146,7 @@ zxle pack [--slow] [--fast] out.zxle file1 file2 ...
 zxle unpack out.zxle outdir/
 ```
 
-Default mode finalizes the solid stream with `xz -9e --threads=1`. `--slow` finalizes with `zpaq -m5` (cmix-class context mixing); 5–10× slower pack but dense enough to match zpaq -m5 on the standard Silesia corpus while still capturing the container-unwrap wins. `--fast` finalizes with `xz -9e --threads=0 --block-size=8MiB` (one worker per logical CPU, 8 MiB blocks); ~6–9× faster pack at +3% size cost, scales better with input size. `--slow` codec choice rides in the manifest header so `unpack` auto-detects; `--fast` only changes the encoder side and `xz -d` consumes the multi-block stream transparently.
+Default mode finalizes the solid stream with `xz -9e --threads=1`. `--slow` finalizes with `zpaq -m5` (cmix-class context mixing); 5–10× slower pack but dense enough to match zpaq -m5 on the standard Silesia corpus while still capturing the container-unwrap wins. `--fast` finalizes with `xz -9e --threads=0` and an input-scaled block size (`bucket/ncpus`, clamped [8 MiB, 64 MiB]); 5–12× faster pack at +0.6% (1 GB) to +2.8% (51 MB) size cost. `--slow` codec choice rides in the manifest header so `unpack` auto-detects; `--fast` only changes the encoder side and `xz -d` consumes the multi-block stream transparently. Unpack verifies a per-entry crc32 and refuses archives whose entry names would escape the output directory; pack refuses duplicate basenames.
 
 ## See also
 

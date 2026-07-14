@@ -6,6 +6,20 @@ Historical record of shipped milestones, completed bench measurements, current-s
 
 ## Current-state log (most recent first)
 
+## Current state (2026-07-14, v7 format + OP_ZIP_STORE + hardening + bench widening shipped)
+
+Five ships in one session, driven by the improvements review (`improvements.md` triage; surviving items folded into roadmap.md):
+
+1. **v7 format — xz-compressed manifest + per-entry crc32 + 64-bit IO.** The manifest (recipes carry raw container-structure bytes: 512 B tar headers, ZIP LFH/CD/EOCD, padding) is now xz -9e'd as a whole, with a stored-raw fallback when xz is not smaller. Measured manifest share was **65% of archive on sample.jar, 12.3% on the mixed.tar family**. Every manifest entry gains a u32 crc32 of the original bytes, verified after each entry reconstructs at unpack — catches raw-manifest corruption *and* silent reproduction drift from decode-side xz/zstd/bzip2 version skew (previously length-only). `read_whole_file` moves off 32-bit `ftell` (2 GiB Windows cap, below the documented 3–4 GB malloc ceiling); per-bucket csize widens u32 → u64. ZXLE_VER 6 → 7.
+2. **OP_ZIP_STORE (0x0A, folded into v7).** ZIP/JAR entries inside tar/ar recurse through pack_zip instead of falling to OP_STORE. New fixture `zip-in.tar` (sample.jar + kernel32.dll): 325,213 → 312,745 (**−3.83%**) vs the pre-change binary, **−5.61% vs xz-9e**.
+3. **BCJ arch guard.** `bucket_for_bytes` now parses the PE machine field / ELF e_machine and routes only x86/x64 to bucket 1 (xz --x86). ARM64 PE/ELF previously got the x86 branch filter (reversible but ratio-negative). x86 fixtures byte-identical.
+4. **--fast block scaling.** Block size becomes `bucket_size/ncpus` clamped [8 MiB, 64 MiB] instead of fixed 8 MiB. Measured (16 CPUs, single-input packs): silesia.tar 211 MB 49,551,097 → 49,090,937 (−0.93%; +3.05% → **+2.10%** vs default) at 18.5 → 20.6 s; giant 1.06 GB 249,747,265 → 243,273,189 (−2.59%; +3.24% → **+0.58%** vs default) at 73.2 → 113.3 s (8.4× → 5.4× over default's 617 s). Larger blocks measured *slower* (memory pressure from concurrent 9e encoders); 64 MiB is the empirical knee.
+5. **Hardening + bench widening.** Pack refuses duplicate basenames (silent overwrite at unpack); unpack rejects separator/dot-dot/drive-colon entry names (zip-slip, verified with a hand-patched hostile archive). Bench gains **7-Zip -mx=9 -ms=on** (new `make 7zip-deps` pulls 7zr) and **precomp -cn | xz -9e** competitor sections plus a cached 7z silesia baseline.
+
+Competitor signal (2026-07-14): 7z ties xz-9e on every container fixture (no unwrap path) — zxle wins **+15% to +47%** against it. The honest precomp-cn|xz-9e combo: zxle wins pe-deflate +2.3%, ntdll.dll.gz +3.2%, mixed.deb +2.9%, mixed.tar.gz +1.1%; ties DOCX/PNG/MP3; **loses JAR −1.05% (3,012 vs 3,044) and JPEG −0.70%** (packJPG beats brunsli) — both now tracked in roadmap.md.
+
+Headline v7 fixture deltas vs xz-9e (66/66 RT OK; 8-file per-file 0.3383 / solid 0.3326 unchanged): sample.jar **−80.22%** (3,044 B; was 6,260 in v6), sample.pptx −24.85% (was −22.68%), sample.xlsx −19.83%, mixed.tar.gz −23.65% (was −22.92%), mixed.tar −9.05% (was −8.17%), mixed.deb −21.38%, gz-in.tar −17.82%, zip-in.tar −5.61% (new); blob-dominated fixtures (mp3/jpg/png, real deb/xz) cost +12–16 B from the crc/u64 overhead under the raw-manifest fallback.
+
 ## Current state (2026-05-15, M8a steps 1-4 shipped; gate partial pass; M8 reframed around entropy-backend swap)
 
 No headline-numbers change. M8a steps 1-4 shipped under `tools/m8/cpu_lz_optimal_v2.c` through `v13.c` + `tools/m8/m8a_gate.sh` + `tools/m8/diff_parse_30mb.c`. The SA-based optimal parser fed into `ZSTD_compressSequences` is functionally complete and roundtrips byte-identically through standard zstd decode. Step 4's gate measurement at 100 KB / 1 MB / 10 MB / 30 MB on silesia mozilla+webster+nci:
@@ -439,6 +453,37 @@ Predicted shape held: mixed-content `.tar.xz` ties xz-9e (xz already crushes mix
 ---
 
 ## Shipped milestone details
+
+### v7 format — compressed manifest, per-entry crc32, 64-bit IO, OP_ZIP_STORE (shipped 2026-07-14)
+- **Motivating measurement:** a script over `tests/baseline/*.zxle` showed manifest share of archive size at **100% (synth.mp3/jpg blobs), 65% (sample.jar), 12.3% (mixed.tar family), 8–9% (pptx, zip-with-jpeg)**. Recipes were storing raw container-structure bytes (`OP_STRUCT` tar headers, padding, zero-tails; ZIP LFH/CD/EOCD) plus brunsli/packMP3/preflate blobs directly in an uncompressed manifest region.
+- **Manifest compression (zxle.c `pack_run`):** manifest is built into a `Buf`, xz -9e'd via temp files; header becomes `u32 raw_mlen + u32 comp_mlen`, where `comp_mlen==0` means stored raw (chosen when xz is not smaller, or manifest <200 B — below xz's container overhead floor). Degenerate-shape guard: manifests >64 MiB (concatenated-tars shape where OP_STRUCT swallows most of the input) compress with `-T0 --block-size=8MiB` instead of `-9e -T1`.
+- **Integrity (crc32):** each manifest entry carries `u32 crc32` (zlib polynomial) of the original file bytes, between mode and kind. `do_unpack` re-reads every reconstructed entry and dies on size or crc mismatch. This closes two silent-corruption classes: flipped bits in a raw-stored manifest region, and decode-side tool-version skew (unpack_xz/zst re-encode with PATH tools and previously verified length only).
+- **64-bit IO:** `read_whole_file` used `long ftell` — 32-bit on Win64, capping inputs at 2 GiB (below the documented 3–4 GB malloc ceiling; docs corrected). Now `_ftelli64`/`ftello`; `fsize` uses `_stati64`. Trailing-payload per-bucket `csize` widened u32 → u64.
+- **OP_ZIP_STORE (0x0A):** pack_tar/pack_ar feed PK-prefixed regular entries through `pack_zip`; nested ZIP recipes share the recipe-op vocabulary so `unpack_recipe` recurses in place. pack_zip's strict validation makes false PK positives fall through to OP_STORE safely. Fixture `zip-in.tar` (make_fixtures.sh) + bench line. This closes one axis of the nested-dispatch asymmetry; remaining axes (gz/tar/zip inside ZIP, non-tar payloads inside gz/bz2/xz/zst) are in roadmap.md.
+- **Hardening:** `do_pack` refuses duplicate entry basenames (previously: silent overwrite at unpack). `do_unpack` rejects entry names containing `/`, `\`, `:`, `.`/`..`, or empty (zip-slip; verified with a hand-patched hostile archive — rejected, no file escape).
+- **Measured (2026-07-14, 66/66 RT OK, --slow RT OK):** sample.jar 6,260 → **3,044** (−51.4% vs v6; −80.22% vs xz-9e; beats precomp's 3,047), sample.pptx −2.8% vs v6, sample.xlsx −0.6%, mixed.tar family −0.95%, gz-in.tar/mixed.deb −0.9%, zip-in.tar 325,213 → 312,745 (−3.83%, −5.61% vs xz-9e). Worst regression +16 B (blob-dominated manifests under raw fallback). 8-file per-file 0.3383 / solid 0.3326 unchanged. ZXLE_VER 6 → 7; v6 archives are not readable by v7 (consistent with the project's no-compat stance while the format is unreleased).
+
+### BCJ arch guard — machine-aware bucket routing (shipped 2026-07-14)
+- `bucket_for_bytes` parsed only magic: every PE ("MZ") and ELF went to bucket 1 = `xz --x86`. An ARM64 ELF/PE got the x86 branch filter — reversible, but ratio-negative on foreign branch encodings.
+- Now parses PE machine (u16 at `e_lfanew`+4; keeps 0x014C i386 / 0x8664 x64) and ELF `e_machine` (offset 18, endian-aware per EI_DATA; keeps EM_386=3 / EM_X86_64=62). Everything else → bucket 0. Bare-DOS MZ without a PE header stays bucket 1 (x86 by construction).
+- Verified with synthetic fake ARM64 ELF/PE (now single-bucket) and fake x64 ELF (still bucket 1); x86 bench fixtures byte-identical (pe-deflate.zip 1,755,573).
+
+### --fast block-size scaling (shipped 2026-07-14)
+- `--fast` block size becomes `bucket_size / zxle_ncpus()` clamped [8 MiB, 64 MiB] (preset-9e dict), replacing fixed 8 MiB. Measured A/B on 16 logical CPUs (single-input packs, not the 12-file bench section):
+
+| input | 8 MiB fixed | scaled | size Δ | vs default size cost |
+|---|---|---|---|---|
+| silesia.tar 211 MB | 18.5 s / 49,551,097 | 20.6 s / 49,090,937 | −0.93% | +3.05% → +2.10% |
+| giant 1.06 GB | 73.2 s / 249,747,265 | 113.3 s / 243,273,189 | −2.59% | +3.24% → +0.58% |
+| mozilla 51 MB | unchanged (3.2 MiB/worker clamps to the 8 MiB floor) | | | |
+
+- Tuning notes: one ceil'd block per worker (66 MiB ×16) measured *slower* (129.4 s) than 64 MiB — concurrent 9e encoders hit memory pressure before the wave-quantization win appears; size/(2·ncpu) landed between (98.2 s / 244,614,913). 64 MiB cap is the empirical knee. Speedup over default at 1 GB drops 8.4× → 5.4×; the trade is intentional for a ratio-first project and documented in README.
+
+### Bench widening — 7-Zip + precomp-cn|xz-9e competitors (shipped 2026-07-14)
+- New `make 7zip-deps` pulls the standalone 7zr console build into `third_party/7zip/` (mirrors zpaq-deps); bench auto-detects it or a system `7z`.
+- `bench_7z` runs `7z a -t7z -mx=9 -ms=on` (solid LZMA2, BCJ auto-filter) on the headline fixtures, RT-verified. Result: 7z lands within ±0.2% of xz-9e on every container fixture (no unwrap path) — **zxle wins +15% (MP3) to +47% (PNG), +405% on JAR**.
+- `bench_precomp_xz` runs `precomp -cn | xz -9e -T1` — the honest peer combo (standalone precomp's own final step understated it). zxle wins pe-deflate +2.34%, ntdll.dll.gz +3.23%, mixed.deb +2.87%, mixed.tar.gz +1.05%; ties DOCX (−0.02%), PNG (+0.01%), MP3 (+0.06%); **loses JAR −1.05% and JPEG −0.70%** (precomp's packJPG beats brunsli on synth.jpg: 116,656 vs 117,478). Both gaps tracked in roadmap.md "Per-stream improvements".
+- Silesia section gains a cached `7z -mx9` solid baseline (own cache file `silesia.7z.cache.txt`).
 
 ### XLSX + PPTX bench fixtures (shipped 2026-05-14)
 - `tests/make_fixtures.sh` gains two new blocks producing `sample.xlsx` (workbook.xml + sharedStrings.xml with 4,000 strings + worksheet1.xml referencing them) and `sample.pptx` (presentation.xml + 40 slide parts, each with 200 text runs). Both are valid-shape OOXML containers — `[Content_Types].xml` + `_rels/.rels` + the format-specific part XMLs — written with `zipfile.ZIP_DEFLATED, compresslevel=6`, matching the existing `sample.docx` pattern. Deterministic via `random.seed(42)`.
