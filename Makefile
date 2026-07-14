@@ -82,6 +82,18 @@ packmp3-deps:
 	@cd $(PACKMP3_DIR)/source && $(MAKE) RES= || true
 	@echo "packmp3 built. Add $(PWD)/$(PACKMP3_DIR)/source to PATH, or use tests/bench.sh which auto-detects."
 
+PACKJPG_DIR = third_party/packjpg
+
+# packjpg-deps: optional; enables the packJPG JPEG codec (tried alongside
+# brunsli, smaller blob wins). Same build pattern as packMP3 (same author).
+packjpg-deps:
+	@if [ ! -d $(PACKJPG_DIR) ]; then \
+	  mkdir -p third_party && \
+	  git clone --depth 1 https://github.com/packjpg/packJPG.git $(PACKJPG_DIR); \
+	fi
+	@cd $(PACKJPG_DIR)/source && $(MAKE) RES= || true
+	@echo "packjpg built. Add $(PWD)/$(PACKJPG_DIR)/source to PATH, or use tests/bench.sh which auto-detects."
+
 ZPAQ_DIR = third_party/zpaq
 
 # zpaq-deps: required for `zxle pack --slow` (zpaq -m5 final-step). Pulls the
@@ -128,7 +140,7 @@ real-fixtures:
 
 # Convenience: fetch + build everything a fresh clone needs to run the full
 # bench. ~10 min on a fresh machine (preflate + brunsli cmake builds dominate).
-all-deps: preflate-deps brunsli-deps packmp3-deps zpaq-deps precomp-deps 7zip-deps real-fixtures
+all-deps: preflate-deps brunsli-deps packmp3-deps packjpg-deps zpaq-deps precomp-deps 7zip-deps real-fixtures
 	@echo
 	@echo "All deps ready. Next:"
 	@echo "  make                          # builds zxle"
@@ -139,4 +151,4 @@ all-deps: preflate-deps brunsli-deps packmp3-deps zpaq-deps precomp-deps 7zip-de
 clean:
 	rm -f $(BIN) src/*.o tests/*.zxle tests/*.tmp
 
-.PHONY: all clean preflate-deps brunsli-deps packmp3-deps zpaq-deps precomp-deps 7zip-deps real-fixtures all-deps
+.PHONY: all clean preflate-deps brunsli-deps packmp3-deps packjpg-deps zpaq-deps precomp-deps 7zip-deps real-fixtures all-deps

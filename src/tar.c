@@ -72,7 +72,7 @@ int pack_tar(const uint8_t *p, size_t n, const char *tmp_prefix,
                 char tp[2048];
                 snprintf(tp, sizeof(tp), "%s.tj.%zu", tmp_prefix, cur);
                 Buf brn; buf_init(&brn);
-                if (try_brunsli_buf(p + cur, (size_t)size, tp, &brn) == 0) {
+                if (try_jpeg_buf(p + cur, (size_t)size, tp, &brn) == 0) {
                     buf_u8(recipe, OP_JPEG_STORE);
                     buf_u32(recipe, (uint32_t)size);
                     buf_u32(recipe, (uint32_t)brn.n);

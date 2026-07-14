@@ -37,7 +37,9 @@
  * polynomial) between mode and kind; unpack verifies every reconstructed
  * entry against it. Trailing payload per-bucket csize widens u32 -> u64.
  * v7 also adds OP_ZIP_STORE (0x0A): ZIP/JAR entries inside tar/ar recurse
- * through pack_zip instead of falling to OP_STORE.
+ * through pack_zip instead of falling to OP_STORE. JPEG blobs (KIND_JPEG
+ * manifest blob and OP_JPEG_STORE payload) gain a leading u8 codec byte:
+ * 0 = brunsli, 1 = packJPG; pack tries both and keeps the smaller.
  * v3..v7 cannot interoperate. */
 #define ZXLE_VER 7
 
@@ -67,8 +69,10 @@
  *                      consume raw_size bytes from solid bucket, preflate-
  *                      rejoin to reproduce the original deflate stream
  *                      byte-identically.
- *   0x04 JPEG_STORE -- (u32 brn_len)(brn_bytes); brunsli-decode brn to `len`
- *                      JPEG bytes, write to output. Solid not consumed.
+ *   0x04 JPEG_STORE -- (u32 blob_len)(u8 codec)(payload); codec 0 = brunsli,
+ *                      1 = packJPG. Decode to `len` JPEG bytes, write to
+ *                      output. Solid not consumed. blob_len includes the
+ *                      codec byte.
  *   0x05 PNG_STORE  -- (u32 png_recipe_len)(png_recipe_bytes); call unpack_png
  *                      to reconstruct `len` PNG bytes; consumes inflated IDAT
  *                      bytes from the solid stream (per the PNG recipe).

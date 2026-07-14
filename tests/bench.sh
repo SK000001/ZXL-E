@@ -38,6 +38,13 @@ if [ -x third_party/packmp3/source/packMP3.exe ] || \
     export PATH
 fi
 
+# Auto-discover locally-built packJPG binary so the JPEG codec race engages.
+if [ -x third_party/packjpg/source/packJPG.exe ] || \
+   [ -x third_party/packjpg/source/packJPG ]; then
+    PATH="$PWD/third_party/packjpg/source:$PATH"
+    export PATH
+fi
+
 # Auto-discover the zpaq binary so --slow mode (final-step zpaq -m5) works.
 if [ -x third_party/zpaq/zpaq.exe ] || [ -x third_party/zpaq/zpaq ]; then
     PATH="$PWD/third_party/zpaq:$PATH"

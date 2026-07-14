@@ -144,7 +144,7 @@ int pack_zip(const uint8_t *p, size_t n, const char *tmp_prefix,
                 char tp[2048];
                 snprintf(tp, sizeof(tp), "%s.zj.%u", tmp_prefix, i);
                 Buf brn; buf_init(&brn);
-                if (try_brunsli_buf(p + e->payload_off, e->raw_size, tp, &brn) == 0) {
+                if (try_jpeg_buf(p + e->payload_off, e->raw_size, tp, &brn) == 0) {
                     buf_u8(recipe, OP_JPEG_STORE);
                     buf_u32(recipe, e->raw_size);
                     buf_u32(recipe, (uint32_t)brn.n);

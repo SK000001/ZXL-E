@@ -99,7 +99,7 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
             }
         }
         if (!force_opaque && !unwrapped && fsz >= 4 && fb[0]==0xFF && fb[1]==0xD8 && fb[2]==0xFF) {
-            if (try_brunsli_buf(fb, fsz, tp, &ents[i].brn) == 0) {
+            if (try_jpeg_buf(fb, fsz, tp, &ents[i].brn) == 0) {
                 ents[i].kind = KIND_JPEG;
                 unwrapped = 1;
             }
@@ -786,16 +786,11 @@ static int do_unpack(int argc, char **argv) {
             unpack_recipe(ents[i].recipe, ents[i].recipe_len, &sol, of, ents[i].orig_size, p);
             fclose(of);
         } else if (ents[i].kind == KIND_JPEG) {
+            size_t jn = 0;
+            uint8_t *jpg = unpack_jpeg_blob(ents[i].brn, ents[i].brn_len, p, &jn);
+            if (jn > 0 && fwrite(jpg, 1, jn, of) != jn) die("fwrite jpeg out");
+            free(jpg);
             fclose(of);
-            char tmp_brn[2048], cmd2[4096];
-            snprintf(tmp_brn, sizeof(tmp_brn), "%s.brn.tmp", p);
-            FILE *bf = fopen(tmp_brn, "wb");
-            if (!bf) die("fopen tmp brn");
-            if (ents[i].brn_len > 0 && fwrite(ents[i].brn, 1, ents[i].brn_len, bf) != ents[i].brn_len) die("fwrite tmp brn");
-            fclose(bf);
-            snprintf(cmd2, sizeof(cmd2), "dbrunsli \"%s\" \"%s\" >%s 2>&1", tmp_brn, p, ZXLE_DEVNULL);
-            run(cmd2);
-            unlink(tmp_brn);
         } else if (ents[i].kind == KIND_PNG) {
             unpack_png(ents[i].recipe, ents[i].recipe_len, &sol, of, ents[i].orig_size);
             fclose(of);
@@ -867,6 +862,7 @@ static void prepend_third_party_to_path(const char *argv0) {
     static const char *subdirs[] = {
         "third_party/brunsli/build/artifacts",
         "third_party/packmp3/source",
+        "third_party/packjpg/source",
         "third_party/zpaq",
     };
     for (size_t i = 0; i < sizeof(subdirs)/sizeof(subdirs[0]); i++) {

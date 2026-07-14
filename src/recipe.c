@@ -2,6 +2,7 @@
 #include "kinds.h"
 #include "deflate.h"
 #include "preflate_shim.h"
+#include "jpeg.h"
 #include "png.h"
 #include "gz.h"
 #include "bz2.h"
@@ -47,19 +48,8 @@ void unpack_recipe(const uint8_t *recipe, size_t rlen,
             if (r + 4 > rlen) die("recipe JPEG_STORE brn_len truncated");
             uint32_t brn_len = r32(recipe + r); r += 4;
             if (r + brn_len > rlen) die("recipe JPEG_STORE brn overflow");
-            char tmp_brn[2048], tmp_jpg[2048], cmd[4096];
-            snprintf(tmp_brn, sizeof(tmp_brn), "%s.uj.brn.tmp", tmp_prefix);
-            snprintf(tmp_jpg, sizeof(tmp_jpg), "%s.uj.jpg.tmp", tmp_prefix);
-            FILE *bf = fopen(tmp_brn, "wb");
-            if (!bf) die("fopen tmp brn");
-            if (brn_len > 0 && fwrite(recipe + r, 1, brn_len, bf) != brn_len) die("fwrite tmp brn");
-            fclose(bf);
-            snprintf(cmd, sizeof(cmd), "dbrunsli \"%s\" \"%s\" >%s 2>&1", tmp_brn, tmp_jpg, ZXLE_DEVNULL);
-            run(cmd);
-            unlink(tmp_brn);
             size_t got_n = 0;
-            uint8_t *got = read_whole_file(tmp_jpg, &got_n);
-            unlink(tmp_jpg);
+            uint8_t *got = unpack_jpeg_blob(recipe + r, brn_len, tmp_prefix, &got_n);
             if (got_n != len) die("JPEG_STORE size mismatch");
             if (fwrite(got, 1, got_n, out) != got_n) die("fwrite JPEG_STORE");
             free(got);
