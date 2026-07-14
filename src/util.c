@@ -105,9 +105,33 @@ void buf_u64(Buf *b, uint64_t v) {
 
 uint8_t bucket_for_bytes(const uint8_t *p, size_t n) {
     if (n < 4) return 0;
-    if (p[0] == 0x4D && p[1] == 0x5A) return 1;                  /* PE: "MZ" */
-    if (p[0] == 0x7F && p[1] == 0x45 && p[2] == 0x4C && p[3] == 0x46)
-        return 1;                                                /* ELF */
+    if (p[0] == 0x4D && p[1] == 0x5A) {                          /* PE: "MZ" */
+        /* Bucket 1 is finalized with xz --x86 (BCJ); only route machines the
+         * x86 branch filter actually helps. Non-x86 PE (ARM64 etc.) goes to
+         * bucket 0 -- the filter is reversible but costs ratio on foreign
+         * branch encodings. Machine field: u16 at e_lfanew+4. */
+        if (n >= 0x40) {
+            uint32_t pe_off = r32(p + 0x3C);
+            if ((uint64_t)pe_off + 6 <= n &&
+                p[pe_off] == 'P' && p[pe_off+1] == 'E' &&
+                p[pe_off+2] == 0 && p[pe_off+3] == 0) {
+                uint16_t machine = r16(p + pe_off + 4);
+                return (machine == 0x014C || machine == 0x8664) ? 1 : 0;
+            }
+        }
+        return 1;  /* DOS-only / unparsable MZ: x86 by construction */
+    }
+    if (p[0] == 0x7F && p[1] == 0x45 && p[2] == 0x4C && p[3] == 0x46) { /* ELF */
+        /* e_machine u16 at offset 18, endianness per EI_DATA (offset 5).
+         * EM_386 = 3, EM_X86_64 = 62. */
+        if (n >= 20) {
+            uint16_t m = (p[5] == 2)
+                ? (uint16_t)((p[18] << 8) | p[19])
+                : (uint16_t)(p[18] | (p[19] << 8));
+            return (m == 3 || m == 62) ? 1 : 0;
+        }
+        return 1;
+    }
     return 0;
 }
 

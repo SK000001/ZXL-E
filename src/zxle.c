@@ -592,8 +592,8 @@ static void verify_entry(const char *path, uint32_t want_crc, uint64_t want_size
     uint32_t c = crc32_buf(got, got_n);
     free(got);
     if ((uint64_t)got_n != want_size) {
-        fprintf(stderr, "zxle: %s: size %zu != %llu\n", path, got_n,
-                (unsigned long long)want_size);
+        fprintf(stderr, "zxle: %s: size %llu != %llu\n", path,
+                (unsigned long long)got_n, (unsigned long long)want_size);
         die("entry size mismatch");
     }
     if (c != want_crc) {
