@@ -210,6 +210,22 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
         snprintf(tmp_concat,  sizeof(tmp_concat),  "%s.b%d.concat.tmp", out, b);
         snprintf(tmp_payload, sizeof(tmp_payload), "%s.b%d.pack.tmp",   out, b);
 
+        /* M7 step 4 tuning: --fast used a fixed 8 MiB block size, which
+         * overpays ratio at scale (128 blocks at 1 GB for <=16 workers).
+         * Scale block size with the bucket (one worker's share, capped at
+         * the 64 MiB preset-9e dict). Measured on the giant fixture this is
+         * the best size point that keeps >5x speedup; larger blocks (one
+         * ceil'd block per worker) got *slower* -- 16 concurrent 9e encoders
+         * hit memory pressure before the wave-quantization win shows up. */
+        char fastopt[64] = "--threads=1";
+        if (fast) {
+            uint64_t bs = (uint64_t)bucket_solid[b]->n / (uint64_t)zxle_ncpus();
+            if (bs < (uint64_t)8  << 20) bs = (uint64_t)8  << 20;
+            if (bs > (uint64_t)64 << 20) bs = (uint64_t)64 << 20;
+            snprintf(fastopt, sizeof(fastopt), "--threads=0 --block-size=%llu",
+                     (unsigned long long)bs);
+        }
+
         FILE *cf = fopen(tmp_concat, "wb");
         if (!cf) die("fopen concat");
         if (fwrite(bucket_solid[b]->p, 1, bucket_solid[b]->n, cf) != bucket_solid[b]->n)
@@ -225,23 +241,20 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
             break;
         case CODEC_XZ_9E_X86:
             /* M7 step 4: --fast switches the final-step xz encoder to
-             * --threads=0 with an 8 MiB block size. Without an explicit
-             * block size, preset 9e's 64 MiB dict yields a 192 MiB default
-             * block -- inputs below that fit in one block and don't
-             * parallelize. 8 MiB blocks cost ~2.8% ratio on a 51 MB silesia
-             * fixture for ~5.7x pack-time speedup. xz -d handles multi-block
-             * streams transparently so the manifest format is unchanged. */
+             * --threads=0 with an input-scaled block size (fastopt above).
+             * Without an explicit block size, preset 9e's 64 MiB dict yields
+             * a 192 MiB default block -- inputs below that fit in one block
+             * and don't parallelize. xz -d handles multi-block streams
+             * transparently so the manifest format is unchanged. */
             snprintf(cmd, sizeof(cmd),
                      "xz -9e --x86 --lzma2=preset=9e -c %s \"%s\" > \"%s\" 2>%s",
-                     fast ? "--threads=0 --block-size=8388608" : "--threads=1",
-                     tmp_concat, tmp_payload, ZXLE_DEVNULL);
+                     fastopt, tmp_concat, tmp_payload, ZXLE_DEVNULL);
             break;
         case CODEC_XZ_9E:
         default:
             snprintf(cmd, sizeof(cmd),
                      "xz -9e -c %s \"%s\" > \"%s\" 2>%s",
-                     fast ? "--threads=0 --block-size=8388608" : "--threads=1",
-                     tmp_concat, tmp_payload, ZXLE_DEVNULL);
+                     fastopt, tmp_concat, tmp_payload, ZXLE_DEVNULL);
             break;
         }
         run(cmd);
@@ -308,7 +321,13 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
         if (!mf) die("fopen manifest tmp");
         if (fwrite(mbuf.p, 1, mbuf.n, mf) != mbuf.n) die("fwrite manifest tmp");
         fclose(mf);
-        snprintf(cmd, sizeof(cmd), "xz -9e --threads=1 -c \"%s\" > \"%s\" 2>%s",
+        /* Degenerate-shape guard: a recipe that stores a huge raw payload in
+         * OP_STRUCT (e.g. concatenated tars) can make the manifest rival the
+         * input size; -9e -T1 there would dominate pack time. Realistic
+         * manifests are <1 MB. */
+        snprintf(cmd, sizeof(cmd), "xz -9e %s -c \"%s\" > \"%s\" 2>%s",
+                 mbuf.n > ((size_t)64 << 20)
+                     ? "--threads=0 --block-size=8388608" : "--threads=1",
                  m_in, m_xz, ZXLE_DEVNULL);
         if (try_run(cmd) == 0) {
             comp_m = read_whole_file(m_xz, &comp_mlen);

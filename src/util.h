@@ -39,6 +39,7 @@ int try_run_parallel(const char **cmds, int n_cmds, int *rcs_out);
 
 long long fsize(const char *path);
 const char *basename_of(const char *p);
+int zxle_ncpus(void);
 
 uint8_t *read_whole_file(const char *path, size_t *out_len);
 

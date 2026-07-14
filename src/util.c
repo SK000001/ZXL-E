@@ -68,6 +68,17 @@ long long fsize(const char *path) {
 #endif
 }
 
+int zxle_ncpus(void) {
+#ifdef _WIN32
+    const char *e = getenv("NUMBER_OF_PROCESSORS");
+    int n = e ? atoi(e) : 0;
+    return n > 0 ? n : 4;
+#else
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? (int)n : 4;
+#endif
+}
+
 const char *basename_of(const char *p) {
     const char *s = p;
     for (const char *q = p; *q; q++) if (*q == '/' || *q == '\\') s = q + 1;
