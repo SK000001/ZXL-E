@@ -53,7 +53,9 @@ void buf_free(Buf *b);
 void buf_reserve(Buf *b, size_t want);
 void buf_append(Buf *b, const void *d, size_t n);
 void buf_u8(Buf *b, uint8_t v);
+void buf_u16(Buf *b, uint16_t v);
 void buf_u32(Buf *b, uint32_t v);
+void buf_u64(Buf *b, uint64_t v);
 
 /* M6 v3: solid stream is split across N buckets (currently 2: bucket 0 main,
  * bucket 1 x86/BCJ). On decode side, Solids carries the decompressed bytes

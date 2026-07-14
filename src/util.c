@@ -55,9 +55,17 @@ int try_run_parallel(const char **cmds, int n_cmds, int *rcs_out) {
 }
 
 long long fsize(const char *path) {
+#ifdef _WIN32
+    /* MinGW's plain stat maps to _stat64i32 (32-bit st_size); use the 64-bit
+     * variant so files >2 GiB report correctly. */
+    struct _stati64 st;
+    if (_stati64(path, &st) != 0) die("stat");
+    return (long long)st.st_size;
+#else
     struct stat st;
     if (stat(path, &st) != 0) die("stat");
     return (long long)st.st_size;
+#endif
 }
 
 const char *basename_of(const char *p) {
@@ -82,9 +90,17 @@ void buf_append(Buf *b, const void *d, size_t n) {
     b->n += n;
 }
 void buf_u8(Buf *b, uint8_t v)   { buf_append(b, &v, 1); }
+void buf_u16(Buf *b, uint16_t v) {
+    uint8_t t[2] = { (uint8_t)(v & 0xFF), (uint8_t)((v >> 8) & 0xFF) };
+    buf_append(b, t, 2);
+}
 void buf_u32(Buf *b, uint32_t v) {
     uint8_t t[4]; for (int i=0;i<4;i++) t[i] = (v>>(i*8))&0xFF;
     buf_append(b, t, 4);
+}
+void buf_u64(Buf *b, uint64_t v) {
+    uint8_t t[8]; for (int i=0;i<8;i++) t[i] = (uint8_t)((v>>(i*8))&0xFF);
+    buf_append(b, t, 8);
 }
 
 uint8_t bucket_for_bytes(const uint8_t *p, size_t n) {
@@ -98,8 +114,15 @@ uint8_t bucket_for_bytes(const uint8_t *p, size_t n) {
 uint8_t *read_whole_file(const char *path, size_t *out_len) {
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "fopen %s\n", path); die("fopen"); }
-    if (fseek(f, 0, SEEK_END) != 0) die("fseek");
-    long sz = ftell(f);
+    /* 64-bit seek/tell: plain ftell returns 32-bit long on Windows, capping
+     * inputs at 2 GiB. */
+#ifdef _WIN32
+    if (_fseeki64(f, 0, SEEK_END) != 0) die("fseek");
+    long long sz = _ftelli64(f);
+#else
+    if (fseeko(f, 0, SEEK_END) != 0) die("fseek");
+    long long sz = (long long)ftello(f);
+#endif
     if (sz < 0) die("ftell");
     rewind(f);
     uint8_t *buf = malloc((size_t)sz + 1);

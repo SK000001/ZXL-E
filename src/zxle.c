@@ -18,18 +18,31 @@
 #include "mp3.h"
 #include "recipe.h"
 #include <pthread.h>
+#include <zlib.h>
 
 typedef struct {
     const char *path;
     const char *name;
     uint64_t    orig_size;
     uint32_t    mode;
+    uint32_t    crc;        /* v7: crc32 of the original file bytes */
     uint8_t     kind;
     uint8_t     opaque_bucket;  /* M6 v1: which solid bucket KIND_OPAQUE bytes go to */
     Buf         recipe;     /* most kinds */
     Buf         brn;        /* KIND_JPEG */
     Buf         pmp;        /* KIND_MP3  */
 } PackEntry;
+
+/* crc32 over an arbitrary-size buffer (zlib's crc32 takes a 32-bit uInt len). */
+static uint32_t crc32_buf(const uint8_t *p, size_t n) {
+    uLong c = crc32(0L, Z_NULL, 0);
+    while (n > 0) {
+        uInt chunk = n > (1u << 30) ? (1u << 30) : (uInt)n;
+        c = crc32(c, p, chunk);
+        p += chunk; n -= chunk;
+    }
+    return (uint32_t)c;
+}
 
 /* M6 codec ids stored in the v4+ trailing payload's per-bucket header. */
 #define CODEC_XZ_9E       0
@@ -66,6 +79,7 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
         ents[i].name      = basename_of(files[i]);
         ents[i].orig_size = fsz;
         ents[i].mode      = (uint32_t)st.st_mode;
+        ents[i].crc       = crc32_buf(fb, fsz);
         buf_init(&ents[i].recipe);
         buf_init(&ents[i].brn);
         buf_init(&ents[i].pmp);
@@ -244,40 +258,18 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
         unlink(tmp_payload);
     }
 
-    /* Manifest size. v6: dropped the v5 unwrap_bucket field; recipes carry
-     * per-OP buckets internally. KIND_OPAQUE still has opaque_bucket. */
-    size_t mlen = 0;
-    for (int i = 0; i < n; i++) {
-        mlen += 2 + strlen(ents[i].name) + 8 + 4 + 1;
-        if (ents[i].kind == KIND_OPAQUE) mlen += 1;  /* opaque_bucket */
-        if (ents[i].kind == KIND_ZIP)   mlen += 4 + ents[i].recipe.n;
-        if (ents[i].kind == KIND_JPEG)  mlen += 4 + ents[i].brn.n;
-        if (ents[i].kind == KIND_MP3)   mlen += 4 + ents[i].pmp.n;
-        if (ents[i].kind == KIND_PNG)   mlen += 4 + ents[i].recipe.n;
-        if (ents[i].kind == KIND_GZIP)  mlen += 4 + ents[i].recipe.n;
-        if (ents[i].kind == KIND_TAR)   mlen += 4 + ents[i].recipe.n;
-        if (ents[i].kind == KIND_AR)    mlen += 4 + ents[i].recipe.n;
-        if (ents[i].kind == KIND_BZIP2) mlen += 4 + ents[i].recipe.n;
-        if (ents[i].kind == KIND_ZSTD)  mlen += 4 + ents[i].recipe.n;
-        if (ents[i].kind == KIND_XZ)    mlen += 4 + ents[i].recipe.n;
-    }
-
-    FILE *o = fopen(out, "wb");
-    if (!o) die("fopen out");
-    fwrite(ZXLE_MAGIC, 1, 4, o);
-    fputc(ZXLE_VER, o);
-    /* Flags byte: bit 0 = bucket-0 codec (0 = xz-9e, 1 = zpaq -m5). v4 always
-     * has 1 or 2 buckets; bucket 1 (when present) is always xz-9e+x86 BCJ. */
-    fputc(slow ? 0x01 : 0x00, o);
-    wu32(o, (uint32_t)mlen);
+    /* Build the manifest in memory. v7: entries gain u32 crc32 after mode;
+     * recipes carry per-OP buckets internally; KIND_OPAQUE has opaque_bucket. */
+    Buf mbuf; buf_init(&mbuf);
     for (int i = 0; i < n; i++) {
         size_t plen = strlen(ents[i].name);
-        wu16(o, (uint16_t)plen);
-        fwrite(ents[i].name, 1, plen, o);
-        wu64(o, ents[i].orig_size);
-        wu32(o, ents[i].mode);
-        fputc(ents[i].kind, o);
-        if (ents[i].kind == KIND_OPAQUE) fputc(ents[i].opaque_bucket, o);
+        buf_u16(&mbuf, (uint16_t)plen);
+        buf_append(&mbuf, ents[i].name, plen);
+        buf_u64(&mbuf, ents[i].orig_size);
+        buf_u32(&mbuf, ents[i].mode);
+        buf_u32(&mbuf, ents[i].crc);
+        buf_u8(&mbuf, ents[i].kind);
+        if (ents[i].kind == KIND_OPAQUE) buf_u8(&mbuf, ents[i].opaque_bucket);
 
         const Buf *blob = NULL;
         switch (ents[i].kind) {
@@ -294,19 +286,63 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
         default: break;
         }
         if (blob) {
-            wu32(o, (uint32_t)blob->n);
-            if (blob->n > 0) fwrite(blob->p, 1, blob->n, o);
+            buf_u32(&mbuf, (uint32_t)blob->n);
+            if (blob->n > 0) buf_append(&mbuf, blob->p, blob->n);
         }
     }
 
+    /* v7: xz the manifest block. Recipes hold the raw container-structure
+     * bytes (512 B tar headers, ZIP LFH/CD/EOCD, padding) which are highly
+     * redundant; storing them uncompressed cost up to 12% of archive size on
+     * tar-shaped fixtures and 65% on entry-heavy ZIPs. comp_mlen==0 in the
+     * header means the raw manifest follows (xz not smaller -- tiny inputs
+     * and manifests dominated by brunsli/packMP3 blobs). Manifests below the
+     * xz container overhead floor skip the probe entirely. */
+    uint8_t *comp_m = NULL;
+    size_t   comp_mlen = 0;
+    if (mbuf.n >= 200) {
+        char m_in[1024], m_xz[1024];
+        snprintf(m_in, sizeof(m_in), "%s.mf.tmp",    out);
+        snprintf(m_xz, sizeof(m_xz), "%s.mf.xz.tmp", out);
+        FILE *mf = fopen(m_in, "wb");
+        if (!mf) die("fopen manifest tmp");
+        if (fwrite(mbuf.p, 1, mbuf.n, mf) != mbuf.n) die("fwrite manifest tmp");
+        fclose(mf);
+        snprintf(cmd, sizeof(cmd), "xz -9e --threads=1 -c \"%s\" > \"%s\" 2>%s",
+                 m_in, m_xz, ZXLE_DEVNULL);
+        if (try_run(cmd) == 0) {
+            comp_m = read_whole_file(m_xz, &comp_mlen);
+            if (comp_mlen >= mbuf.n) { free(comp_m); comp_m = NULL; comp_mlen = 0; }
+        }
+        unlink(m_in);
+        unlink(m_xz);
+    }
+
+    FILE *o = fopen(out, "wb");
+    if (!o) die("fopen out");
+    fwrite(ZXLE_MAGIC, 1, 4, o);
+    fputc(ZXLE_VER, o);
+    /* Flags byte: bit 0 = bucket-0 codec (0 = xz-9e, 1 = zpaq -m5). v4 always
+     * has 1 or 2 buckets; bucket 1 (when present) is always xz-9e+x86 BCJ. */
+    fputc(slow ? 0x01 : 0x00, o);
+    wu32(o, (uint32_t)mbuf.n);
+    wu32(o, (uint32_t)comp_mlen);
+    if (comp_m) {
+        if (fwrite(comp_m, 1, comp_mlen, o) != comp_mlen) die("fwrite manifest xz");
+    } else {
+        if (mbuf.n > 0 && fwrite(mbuf.p, 1, mbuf.n, o) != mbuf.n) die("fwrite manifest");
+    }
+    free(comp_m);
+    buf_free(&mbuf);
+
     /* Trailing payload header: u8 num_buckets, then per-bucket
-     * (u8 codec_id, u32 csize, csize bytes). num_buckets is 1 if no x86
+     * (u8 codec_id, u64 csize, csize bytes). num_buckets is 1 if no x86
      * entries, else 2. */
     int num_buckets = (bucket_solid[1]->n > 0) ? 2 : 1;
     fputc((uint8_t)num_buckets, o);
     for (int b = 0; b < num_buckets; b++) {
         fputc((uint8_t)bucket_codec[b], o);
-        wu32(o, (uint32_t)bucket_payload[b].n);
+        wu64(o, (uint64_t)bucket_payload[b].n);
         if (bucket_payload[b].n > 0)
             fwrite(bucket_payload[b].p, 1, bucket_payload[b].n, o);
     }
@@ -455,6 +491,7 @@ typedef struct {
     char     name[1024];
     uint64_t orig_size;
     uint32_t mode;
+    uint32_t crc;           /* v7: crc32 of the original file bytes */
     uint8_t  kind;
     uint8_t  opaque_bucket;  /* M6 v1: which solid bucket KIND_OPAQUE bytes come from */
     uint8_t *recipe;        /* points into manifest buffer */
@@ -468,7 +505,7 @@ typedef struct {
 /* Decompress one trailing-payload bucket: write the codec-input bytes from
  * `f` (current offset) of length `csize` to a temp file, run the inverse
  * codec, return the decompressed bytes. Caller frees. */
-static uint8_t *decompress_bucket(FILE *f, uint32_t csize, uint8_t codec_id,
+static uint8_t *decompress_bucket(FILE *f, uint64_t csize, uint8_t codec_id,
                                   const char *tmp_prefix, size_t *out_len) {
     /* Empty bucket: nothing to decompress, but allocate a 1-byte sentinel
      * so the caller's bucket_bytes[b] is non-NULL; consume zero file bytes. */
@@ -487,7 +524,7 @@ static uint8_t *decompress_bucket(FILE *f, uint32_t csize, uint8_t codec_id,
     if (!bf) die("fopen bucket in");
     {
         uint8_t buf[65536];
-        size_t left = csize;
+        uint64_t left = csize;
         while (left > 0) {
             size_t want = left < sizeof(buf) ? left : sizeof(buf);
             size_t got = fread(buf, 1, want, f);
@@ -545,6 +582,26 @@ static uint8_t *decompress_bucket(FILE *f, uint32_t csize, uint8_t codec_id,
     return bytes;
 }
 
+/* v7: verify a reconstructed entry against the manifest crc32. Catches both
+ * payload corruption in the unprotected manifest region and silent
+ * reproduction drift (e.g. a decode-side xz/zstd/bzip2 version whose
+ * re-encode differs from the pack machine's). */
+static void verify_entry(const char *path, uint32_t want_crc, uint64_t want_size) {
+    size_t got_n = 0;
+    uint8_t *got = read_whole_file(path, &got_n);
+    uint32_t c = crc32_buf(got, got_n);
+    free(got);
+    if ((uint64_t)got_n != want_size) {
+        fprintf(stderr, "zxle: %s: size %zu != %llu\n", path, got_n,
+                (unsigned long long)want_size);
+        die("entry size mismatch");
+    }
+    if (c != want_crc) {
+        fprintf(stderr, "zxle: %s\n", path);
+        die("entry crc mismatch");
+    }
+}
+
 static int do_unpack(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: zxle unpack <in.zxle> <outdir>\n"); return 1; }
     const char *in = argv[0];
@@ -558,12 +615,39 @@ static int do_unpack(int argc, char **argv) {
     if (ver != ZXLE_VER) die("bad version");
     (void)flags;  /* v4: codec is per-bucket in the trailing payload header, not in flags */
 
-    uint8_t mlen_b[4];
-    if (fread(mlen_b, 1, 4, f) != 4) die("read mlen");
-    uint32_t mlen = r32(mlen_b);
-    uint8_t *manifest = malloc(mlen ? mlen : 1);
-    if (!manifest) die("malloc manifest");
-    if (mlen > 0 && fread(manifest, 1, mlen, f) != mlen) die("read manifest");
+    /* v7 header: u32 raw_mlen + u32 comp_mlen. comp_mlen==0 -> manifest is
+     * stored raw; else comp_mlen bytes of xz follow, decompressing to
+     * raw_mlen bytes. */
+    uint8_t mlen_b[8];
+    if (fread(mlen_b, 1, 8, f) != 8) die("read mlen");
+    uint32_t mlen      = r32(mlen_b);
+    uint32_t comp_mlen = r32(mlen_b + 4);
+    uint8_t *manifest = NULL;
+    if (comp_mlen == 0) {
+        manifest = malloc(mlen ? mlen : 1);
+        if (!manifest) die("malloc manifest");
+        if (mlen > 0 && fread(manifest, 1, mlen, f) != mlen) die("read manifest");
+    } else {
+        char m_xz[1024], m_raw[1024], mcmd[4096];
+        snprintf(m_xz,  sizeof(m_xz),  "%s.mf.xz.tmp",  in);
+        snprintf(m_raw, sizeof(m_raw), "%s.mf.raw.tmp", in);
+        uint8_t *comp = malloc(comp_mlen);
+        if (!comp) die("malloc manifest xz");
+        if (fread(comp, 1, comp_mlen, f) != comp_mlen) die("read manifest xz");
+        FILE *mf = fopen(m_xz, "wb");
+        if (!mf) die("fopen manifest xz tmp");
+        if (fwrite(comp, 1, comp_mlen, mf) != comp_mlen) die("fwrite manifest xz tmp");
+        fclose(mf);
+        free(comp);
+        snprintf(mcmd, sizeof(mcmd), "xz -d -c \"%s\" > \"%s\" 2>%s",
+                 m_xz, m_raw, ZXLE_DEVNULL);
+        run(mcmd);
+        size_t got = 0;
+        manifest = read_whole_file(m_raw, &got);
+        unlink(m_xz);
+        unlink(m_raw);
+        if (got != mlen) die("manifest size mismatch");
+    }
 
     int count = 0, cap = 0;
     UnpackEntry *ents = NULL;
@@ -572,10 +656,11 @@ static int do_unpack(int argc, char **argv) {
         if (count == cap) { cap = cap ? cap*2 : 16; ents = realloc(ents, (size_t)cap * sizeof(UnpackEntry)); if (!ents) die("realloc"); }
         if (mp + 2 > mlen) die("manifest truncated");
         uint16_t pl = r16(manifest + mp); mp += 2;
-        if (pl >= sizeof(ents[0].name) || mp + pl + 8 + 4 + 1 > mlen) die("manifest overflow");
+        if (pl >= sizeof(ents[0].name) || mp + pl + 8 + 4 + 4 + 1 > mlen) die("manifest overflow");
         memcpy(ents[count].name, manifest + mp, pl); ents[count].name[pl] = 0; mp += pl;
         ents[count].orig_size = (uint64_t)r32(manifest + mp) | ((uint64_t)r32(manifest + mp + 4) << 32); mp += 8;
         ents[count].mode = r32(manifest + mp); mp += 4;
+        ents[count].crc  = r32(manifest + mp); mp += 4;
         ents[count].kind = manifest[mp]; mp += 1;
         ents[count].opaque_bucket = 0;
         if (ents[count].kind == KIND_OPAQUE) {
@@ -623,9 +708,9 @@ static int do_unpack(int argc, char **argv) {
     for (int b = 0; b < num_buckets; b++) {
         int codec_id = fgetc(f);
         if (codec_id < 0) die("codec_id eof");
-        uint8_t cs[4];
-        if (fread(cs, 1, 4, f) != 4) die("csize eof");
-        uint32_t csize = r32(cs);
+        uint8_t cs[8];
+        if (fread(cs, 1, 8, f) != 8) die("csize eof");
+        uint64_t csize = (uint64_t)r32(cs) | ((uint64_t)r32(cs + 4) << 32);
         char tprefix[1024];
         snprintf(tprefix, sizeof(tprefix), "%s.bucket%d", in, b);
         bucket_bytes[b] = decompress_bucket(f, csize, (uint8_t)codec_id, tprefix, &bucket_len[b]);
@@ -704,6 +789,7 @@ static int do_unpack(int argc, char **argv) {
         } else {
             die("unknown kind");
         }
+        verify_entry(p, ents[i].crc, ents[i].orig_size);
     }
     for (int b = 0; b < num_buckets; b++) {
         if (sol.pos[b] != bucket_len[b]) die("bucket stream not fully consumed");

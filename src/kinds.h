@@ -28,8 +28,16 @@
  * ZSTD recipes gain a u8 bucket field that selects which bucket the
  * inflated body bytes come from when inner_kind==0; ignored when
  * inner_kind==1 (the inner recipe's per-OP buckets handle routing).
- * v3/v4/v5/v6 cannot interoperate. */
-#define ZXLE_VER 6
+ * v7 (2026-07-14): compressed manifest + integrity. Header becomes
+ * magic/ver/flags + u32 raw_mlen + u32 comp_mlen; comp_mlen>0 means the
+ * manifest block is xz -9e compressed (recipes carry raw container-structure
+ * bytes -- tar headers, ZIP central directories -- that were previously
+ * stored uncompressed), comp_mlen==0 means stored raw (xz not smaller).
+ * Each manifest entry gains u32 crc32 (of the original file bytes, zlib
+ * polynomial) between mode and kind; unpack verifies every reconstructed
+ * entry against it. Trailing payload per-bucket csize widens u32 -> u64.
+ * v3..v7 cannot interoperate. */
+#define ZXLE_VER 7
 
 /* Top-level container kind tag (one byte per manifest entry). */
 #define KIND_OPAQUE 0
