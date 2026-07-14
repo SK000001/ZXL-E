@@ -448,6 +448,18 @@ static int do_pack(int argc, char **argv) {
     int n = argc - 1;
     char **files = argv + 1;
 
+    /* Entries are stored by basename; two inputs sharing one would silently
+     * overwrite each other at unpack. Refuse up front. */
+    for (int i = 0; i < n; i++) {
+        for (int j = i + 1; j < n; j++) {
+            if (strcmp(basename_of(files[i]), basename_of(files[j])) == 0) {
+                fprintf(stderr, "zxle: duplicate entry name '%s' (%s, %s)\n",
+                        basename_of(files[i]), files[i], files[j]);
+                return 1;
+            }
+        }
+    }
+
     /* min-pack tiers:
      *   1. Primary tier: requested slow flag (xz-9e or zpaq -m5 final).
      *      Inside, runs unwrap + (optional) force_opaque, keeps smaller.
@@ -677,6 +689,14 @@ static int do_unpack(int argc, char **argv) {
         uint16_t pl = r16(manifest + mp); mp += 2;
         if (pl >= sizeof(ents[0].name) || mp + pl + 8 + 4 + 4 + 1 > mlen) die("manifest overflow");
         memcpy(ents[count].name, manifest + mp, pl); ents[count].name[pl] = 0; mp += pl;
+        /* Entries are basenames by construction; a separator, drive colon, or
+         * ".." in a name means a crafted archive trying to escape outdir. */
+        if (pl == 0 || strchr(ents[count].name, '/') || strchr(ents[count].name, '\\') ||
+            strchr(ents[count].name, ':') || strcmp(ents[count].name, ".") == 0 ||
+            strcmp(ents[count].name, "..") == 0) {
+            fprintf(stderr, "zxle: bad entry name '%s'\n", ents[count].name);
+            die("unsafe entry name");
+        }
         ents[count].orig_size = (uint64_t)r32(manifest + mp) | ((uint64_t)r32(manifest + mp + 4) << 32); mp += 8;
         ents[count].mode = r32(manifest + mp); mp += 4;
         ents[count].crc  = r32(manifest + mp); mp += 4;
