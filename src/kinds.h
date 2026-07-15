@@ -40,6 +40,10 @@
  * through pack_zip instead of falling to OP_STORE. JPEG blobs (KIND_JPEG
  * manifest blob and OP_JPEG_STORE payload) gain a leading u8 codec byte:
  * 0 = brunsli, 1 = packJPG; pack tries both and keeps the smaller.
+ * Flags bit 1 = merged manifest: when bucket 0 is xz and non-empty, the
+ * manifest is the first raw_mlen bytes of decoded bucket 0 and no manifest
+ * block follows the header (comp_mlen written as 0). Saves one xz container
+ * overhead and shares context between structural bytes and content.
  * v3..v7 cannot interoperate. */
 #define ZXLE_VER 7
 

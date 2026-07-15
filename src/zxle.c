@@ -33,6 +33,72 @@ typedef struct {
     Buf         pmp;        /* KIND_MP3  */
 } PackEntry;
 
+/* M6 codec ids stored in the v4+ trailing payload's per-bucket header. */
+#define CODEC_XZ_9E       0
+#define CODEC_XZ_9E_X86   1
+#define CODEC_ZPAQ_M5     2
+
+/* Compress one solid bucket's bytes with the given codec into *payload.
+ * `tag` keys the temp filenames (callers may finalize competing candidates
+ * for the same logical bucket). fast: xz --threads=0 with an input-scaled
+ * block size -- bucket/ncpus clamped [8 MiB, 64 MiB] (the preset-9e dict);
+ * fixed 8 MiB overpaid ratio at scale (128 blocks at 1 GB for <=16 workers),
+ * and larger blocks measured *slower* (16 concurrent 9e encoders hit memory
+ * pressure before the wave-quantization win shows up). */
+static void finalize_bucket(const Buf *in_buf, int codec, int fast,
+                            const char *out, int tag, Buf *payload) {
+    char cmd[4096], tmp_concat[1024], tmp_payload[1024];
+    snprintf(tmp_concat,  sizeof(tmp_concat),  "%s.b%d.concat.tmp", out, tag);
+    snprintf(tmp_payload, sizeof(tmp_payload), "%s.b%d.pack.tmp",   out, tag);
+
+    char fastopt[64] = "--threads=1";
+    if (fast) {
+        uint64_t bs = (uint64_t)in_buf->n / (uint64_t)zxle_ncpus();
+        if (bs < (uint64_t)8  << 20) bs = (uint64_t)8  << 20;
+        if (bs > (uint64_t)64 << 20) bs = (uint64_t)64 << 20;
+        snprintf(fastopt, sizeof(fastopt), "--threads=0 --block-size=%llu",
+                 (unsigned long long)bs);
+    }
+
+    FILE *cf = fopen(tmp_concat, "wb");
+    if (!cf) die("fopen concat");
+    if (fwrite(in_buf->p, 1, in_buf->n, cf) != in_buf->n) die("fwrite solid");
+    fclose(cf);
+
+    switch (codec) {
+    case CODEC_ZPAQ_M5:
+        unlink(tmp_payload);
+        snprintf(cmd, sizeof(cmd),
+                 "zpaq a \"%s\" \"%s\" -m5 >%s 2>&1",
+                 tmp_payload, tmp_concat, ZXLE_DEVNULL);
+        break;
+    case CODEC_XZ_9E_X86:
+        /* BCJ filter is recorded in the xz block header, so plain `xz -d`
+         * reverses it; xz -d also consumes --fast's multi-block streams
+         * transparently, so the manifest format is unchanged either way. */
+        snprintf(cmd, sizeof(cmd),
+                 "xz -9e --x86 --lzma2=preset=9e -c %s \"%s\" > \"%s\" 2>%s",
+                 fastopt, tmp_concat, tmp_payload, ZXLE_DEVNULL);
+        break;
+    case CODEC_XZ_9E:
+    default:
+        snprintf(cmd, sizeof(cmd),
+                 "xz -9e -c %s \"%s\" > \"%s\" 2>%s",
+                 fastopt, tmp_concat, tmp_payload, ZXLE_DEVNULL);
+        break;
+    }
+    run(cmd);
+
+    size_t plen = 0;
+    uint8_t *pbytes = read_whole_file(tmp_payload, &plen);
+    if (!pbytes) die("read packed bucket");
+    buf_append(payload, pbytes, plen);
+    free(pbytes);
+
+    unlink(tmp_concat);
+    unlink(tmp_payload);
+}
+
 /* crc32 over an arbitrary-size buffer (zlib's crc32 takes a 32-bit uInt len). */
 static uint32_t crc32_buf(const uint8_t *p, size_t n) {
     uLong c = crc32(0L, Z_NULL, 0);
@@ -43,11 +109,6 @@ static uint32_t crc32_buf(const uint8_t *p, size_t n) {
     }
     return (uint32_t)c;
 }
-
-/* M6 codec ids stored in the v4+ trailing payload's per-bucket header. */
-#define CODEC_XZ_9E       0
-#define CODEC_XZ_9E_X86   1
-#define CODEC_ZPAQ_M5     2
 
 /* pack_run — main pack body. force_opaque=1 skips all container-unwrap routing
  * and stores every input as KIND_OPAQUE. slow=1 finalizes the solid stream
@@ -190,87 +251,6 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
         free(fb);
     }
 
-    /* M6 finalize: pack each non-empty bucket separately. Bucket 0 ("main")
-     * uses the requested codec (xz-9e or zpaq-m5 per slow); bucket 1 ("x86")
-     * always uses xz-9e with the BCJ x86 filter regardless of slow because
-     * BCJ's win is filter-not-codec, and the bucket only contains x86 code. */
-    char cmd[4096];
-    char tmp_concat[1024], tmp_payload[1024];
-    int  bucket_codec[2] = {
-        slow ? CODEC_ZPAQ_M5 : CODEC_XZ_9E,
-        CODEC_XZ_9E_X86,
-    };
-    Buf *bucket_solid[2] = { &solid, &solid_x86 };
-    Buf  bucket_payload[2];
-    buf_init(&bucket_payload[0]);
-    buf_init(&bucket_payload[1]);
-
-    for (int b = 0; b < 2; b++) {
-        if (bucket_solid[b]->n == 0) continue;
-        snprintf(tmp_concat,  sizeof(tmp_concat),  "%s.b%d.concat.tmp", out, b);
-        snprintf(tmp_payload, sizeof(tmp_payload), "%s.b%d.pack.tmp",   out, b);
-
-        /* M7 step 4 tuning: --fast used a fixed 8 MiB block size, which
-         * overpays ratio at scale (128 blocks at 1 GB for <=16 workers).
-         * Scale block size with the bucket (one worker's share, capped at
-         * the 64 MiB preset-9e dict). Measured on the giant fixture this is
-         * the best size point that keeps >5x speedup; larger blocks (one
-         * ceil'd block per worker) got *slower* -- 16 concurrent 9e encoders
-         * hit memory pressure before the wave-quantization win shows up. */
-        char fastopt[64] = "--threads=1";
-        if (fast) {
-            uint64_t bs = (uint64_t)bucket_solid[b]->n / (uint64_t)zxle_ncpus();
-            if (bs < (uint64_t)8  << 20) bs = (uint64_t)8  << 20;
-            if (bs > (uint64_t)64 << 20) bs = (uint64_t)64 << 20;
-            snprintf(fastopt, sizeof(fastopt), "--threads=0 --block-size=%llu",
-                     (unsigned long long)bs);
-        }
-
-        FILE *cf = fopen(tmp_concat, "wb");
-        if (!cf) die("fopen concat");
-        if (fwrite(bucket_solid[b]->p, 1, bucket_solid[b]->n, cf) != bucket_solid[b]->n)
-            die("fwrite solid");
-        fclose(cf);
-
-        switch (bucket_codec[b]) {
-        case CODEC_ZPAQ_M5:
-            unlink(tmp_payload);
-            snprintf(cmd, sizeof(cmd),
-                     "zpaq a \"%s\" \"%s\" -m5 >%s 2>&1",
-                     tmp_payload, tmp_concat, ZXLE_DEVNULL);
-            break;
-        case CODEC_XZ_9E_X86:
-            /* M7 step 4: --fast switches the final-step xz encoder to
-             * --threads=0 with an input-scaled block size (fastopt above).
-             * Without an explicit block size, preset 9e's 64 MiB dict yields
-             * a 192 MiB default block -- inputs below that fit in one block
-             * and don't parallelize. xz -d handles multi-block streams
-             * transparently so the manifest format is unchanged. */
-            snprintf(cmd, sizeof(cmd),
-                     "xz -9e --x86 --lzma2=preset=9e -c %s \"%s\" > \"%s\" 2>%s",
-                     fastopt, tmp_concat, tmp_payload, ZXLE_DEVNULL);
-            break;
-        case CODEC_XZ_9E:
-        default:
-            snprintf(cmd, sizeof(cmd),
-                     "xz -9e -c %s \"%s\" > \"%s\" 2>%s",
-                     fastopt, tmp_concat, tmp_payload, ZXLE_DEVNULL);
-            break;
-        }
-        run(cmd);
-
-        /* Read packed bytes into the per-bucket buffer; we'll concatenate
-         * them with bucket headers after writing the manifest. */
-        size_t plen = 0;
-        uint8_t *pbytes = read_whole_file(tmp_payload, &plen);
-        if (!pbytes) die("read packed bucket");
-        buf_append(&bucket_payload[b], pbytes, plen);
-        free(pbytes);
-
-        unlink(tmp_concat);
-        unlink(tmp_payload);
-    }
-
     /* Build the manifest in memory. v7: entries gain u32 crc32 after mode;
      * recipes carry per-OP buckets internally; KIND_OPAQUE has opaque_bucket. */
     Buf mbuf; buf_init(&mbuf);
@@ -304,52 +284,114 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
         }
     }
 
-    /* v7: xz the manifest block. Recipes hold the raw container-structure
-     * bytes (512 B tar headers, ZIP LFH/CD/EOCD, padding) which are highly
-     * redundant; storing them uncompressed cost up to 12% of archive size on
-     * tar-shaped fixtures and 65% on entry-heavy ZIPs. comp_mlen==0 in the
-     * header means the raw manifest follows (xz not smaller -- tiny inputs
-     * and manifests dominated by brunsli/packMP3 blobs). Manifests below the
-     * xz container overhead floor skip the probe entirely. */
+    /* M6 finalize: pack each non-empty bucket separately. Bucket 0 ("main")
+     * uses the requested codec (xz-9e or zpaq-m5 per slow); bucket 1 ("x86")
+     * always uses xz-9e with the BCJ x86 filter regardless of slow because
+     * BCJ's win is filter-not-codec, and the bucket only contains x86 code. */
+    int  bucket_codec[2] = {
+        slow ? CODEC_ZPAQ_M5 : CODEC_XZ_9E,
+        CODEC_XZ_9E_X86,
+    };
+    Buf  bucket_payload[2];
+    buf_init(&bucket_payload[0]);
+    buf_init(&bucket_payload[1]);
+    if (solid_x86.n > 0)
+        finalize_bucket(&solid_x86, CODEC_XZ_9E_X86, fast, out, 1, &bucket_payload[1]);
+
+    /* Split-path manifest compression, shared by the non-merged branches
+     * below. Recipes hold the raw container-structure bytes (512 B tar
+     * headers, ZIP LFH/CD/EOCD, padding) which are highly redundant; storing
+     * them uncompressed cost up to 12% of archive size on tar-shaped fixtures
+     * and 65% on entry-heavy ZIPs. comp_mlen==0 in the header means the raw
+     * manifest follows (xz not smaller). Manifests below the xz container
+     * overhead floor (200 B) skip the probe. */
     uint8_t *comp_m = NULL;
     size_t   comp_mlen = 0;
-    if (mbuf.n >= 200) {
-        char m_in[1024], m_xz[1024];
-        snprintf(m_in, sizeof(m_in), "%s.mf.tmp",    out);
-        snprintf(m_xz, sizeof(m_xz), "%s.mf.xz.tmp", out);
-        FILE *mf = fopen(m_in, "wb");
-        if (!mf) die("fopen manifest tmp");
-        if (fwrite(mbuf.p, 1, mbuf.n, mf) != mbuf.n) die("fwrite manifest tmp");
-        fclose(mf);
-        /* Degenerate-shape guard: a recipe that stores a huge raw payload in
-         * OP_STRUCT (e.g. concatenated tars) can make the manifest rival the
-         * input size; -9e -T1 there would dominate pack time. Realistic
-         * manifests are <1 MB. */
-        snprintf(cmd, sizeof(cmd), "xz -9e %s -c \"%s\" > \"%s\" 2>%s",
-                 mbuf.n > ((size_t)64 << 20)
-                     ? "--threads=0 --block-size=8388608" : "--threads=1",
-                 m_in, m_xz, ZXLE_DEVNULL);
-        if (try_run(cmd) == 0) {
-            comp_m = read_whole_file(m_xz, &comp_mlen);
-            if (comp_mlen >= mbuf.n) { free(comp_m); comp_m = NULL; comp_mlen = 0; }
+    int      m_split_done = 0;
+#define SPLIT_MANIFEST_XZ() do {                                              \
+        m_split_done = 1;                                                     \
+        if (mbuf.n >= 200) {                                                  \
+            char m_in[1024], m_xz[1024], mcmd[4096];                          \
+            snprintf(m_in, sizeof(m_in), "%s.mf.tmp",    out);                \
+            snprintf(m_xz, sizeof(m_xz), "%s.mf.xz.tmp", out);                \
+            FILE *mf = fopen(m_in, "wb");                                     \
+            if (!mf) die("fopen manifest tmp");                               \
+            if (fwrite(mbuf.p, 1, mbuf.n, mf) != mbuf.n)                      \
+                die("fwrite manifest tmp");                                   \
+            fclose(mf);                                                       \
+            /* Degenerate-shape guard: OP_STRUCT-heavy manifests (e.g.        \
+             * concatenated tars) can rival the input size; -9e -T1 there     \
+             * would dominate pack time. */                                   \
+            snprintf(mcmd, sizeof(mcmd), "xz -9e %s -c \"%s\" > \"%s\" 2>%s", \
+                     mbuf.n > ((size_t)64 << 20)                              \
+                         ? "--threads=0 --block-size=8388608" : "--threads=1",\
+                     m_in, m_xz, ZXLE_DEVNULL);                               \
+            if (try_run(mcmd) == 0) {                                         \
+                comp_m = read_whole_file(m_xz, &comp_mlen);                   \
+                if (comp_mlen >= mbuf.n) {                                    \
+                    free(comp_m); comp_m = NULL; comp_mlen = 0;               \
+                }                                                             \
+            }                                                                 \
+            unlink(m_in);                                                     \
+            unlink(m_xz);                                                     \
+        }                                                                     \
+    } while (0)
+
+    /* v7 merged mode (flags bit 1): when bucket 0 is xz and non-empty, the
+     * manifest rides at the head of bucket 0's stream instead of its own xz
+     * block -- saves one xz container overhead and shares context between
+     * the recipe's structural bytes and the content (sample.jar 3,044 ->
+     * 2,804). Which layout wins is input-dependent (pptx measured +44 B
+     * merged), so on small inputs both candidates are built and the smaller
+     * kept, mirroring the min-pack philosophy; past the threshold merged
+     * wins by construction (fixed ~60 B saving, context effects vanish).
+     * Bucket-0-empty archives (blob-only) and --slow (zpaq bucket) always
+     * take the split path with its raw-manifest fallback. */
+    int merged = 0;
+    if (!slow && solid.n > 0) {
+        Buf merged0; buf_init(&merged0);
+        buf_append(&merged0, mbuf.p, mbuf.n);
+        buf_append(&merged0, solid.p, solid.n);
+        finalize_bucket(&merged0, CODEC_XZ_9E, fast, out, 0, &bucket_payload[0]);
+        buf_free(&merged0);
+        merged = 1;
+        if (mbuf.n + solid.n < ((size_t)8 << 20)) {
+            Buf split_pay; buf_init(&split_pay);
+            finalize_bucket(&solid, CODEC_XZ_9E, fast, out, 2, &split_pay);
+            SPLIT_MANIFEST_XZ();
+            size_t cost_merged = bucket_payload[0].n;
+            size_t cost_split  = split_pay.n + (comp_m ? comp_mlen : mbuf.n);
+            if (cost_split < cost_merged) {
+                buf_free(&bucket_payload[0]);
+                bucket_payload[0] = split_pay;
+                merged = 0;
+            } else {
+                buf_free(&split_pay);
+                free(comp_m); comp_m = NULL; comp_mlen = 0;
+            }
         }
-        unlink(m_in);
-        unlink(m_xz);
+    } else if (solid.n > 0) {
+        finalize_bucket(&solid, bucket_codec[0], fast, out, 0, &bucket_payload[0]);
     }
+    if (!merged && !m_split_done) SPLIT_MANIFEST_XZ();
+#undef SPLIT_MANIFEST_XZ
 
     FILE *o = fopen(out, "wb");
     if (!o) die("fopen out");
     fwrite(ZXLE_MAGIC, 1, 4, o);
     fputc(ZXLE_VER, o);
-    /* Flags byte: bit 0 = bucket-0 codec (0 = xz-9e, 1 = zpaq -m5). v4 always
-     * has 1 or 2 buckets; bucket 1 (when present) is always xz-9e+x86 BCJ. */
-    fputc(slow ? 0x01 : 0x00, o);
+    /* Flags byte: bit 0 = bucket-0 codec (0 = xz-9e, 1 = zpaq -m5); bit 1 =
+     * manifest merged into bucket 0 (no manifest block after the header --
+     * the first raw_mlen bytes of decoded bucket 0 are the manifest). */
+    fputc((slow ? 0x01 : 0x00) | (merged ? 0x02 : 0x00), o);
     wu32(o, (uint32_t)mbuf.n);
     wu32(o, (uint32_t)comp_mlen);
-    if (comp_m) {
-        if (fwrite(comp_m, 1, comp_mlen, o) != comp_mlen) die("fwrite manifest xz");
-    } else {
-        if (mbuf.n > 0 && fwrite(mbuf.p, 1, mbuf.n, o) != mbuf.n) die("fwrite manifest");
+    if (!merged) {
+        if (comp_m) {
+            if (fwrite(comp_m, 1, comp_mlen, o) != comp_mlen) die("fwrite manifest xz");
+        } else {
+            if (mbuf.n > 0 && fwrite(mbuf.p, 1, mbuf.n, o) != mbuf.n) die("fwrite manifest");
+        }
     }
     free(comp_m);
     buf_free(&mbuf);
@@ -357,7 +399,7 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
     /* Trailing payload header: u8 num_buckets, then per-bucket
      * (u8 codec_id, u64 csize, csize bytes). num_buckets is 1 if no x86
      * entries, else 2. */
-    int num_buckets = (bucket_solid[1]->n > 0) ? 2 : 1;
+    int num_buckets = (solid_x86.n > 0) ? 2 : 1;
     fputc((uint8_t)num_buckets, o);
     for (int b = 0; b < num_buckets; b++) {
         fputc((uint8_t)bucket_codec[b], o);
@@ -644,40 +686,75 @@ static int do_unpack(int argc, char **argv) {
     if (fread(magic,1,4,f) != 4 || memcmp(magic, ZXLE_MAGIC, 4) != 0) die("bad magic");
     int ver = fgetc(f), flags = fgetc(f);
     if (ver != ZXLE_VER) die("bad version");
-    (void)flags;  /* v4: codec is per-bucket in the trailing payload header, not in flags */
+    /* flags bit 0 is informational here (codec is per-bucket in the trailing
+     * payload header); bit 1 = manifest merged into bucket 0. */
+    int merged = (flags & 0x02) != 0;
 
-    /* v7 header: u32 raw_mlen + u32 comp_mlen. comp_mlen==0 -> manifest is
-     * stored raw; else comp_mlen bytes of xz follow, decompressing to
-     * raw_mlen bytes. */
+    /* v7 header: u32 raw_mlen + u32 comp_mlen. Split mode: a manifest block
+     * follows (comp_mlen==0 -> stored raw, else xz decompressing to
+     * raw_mlen). Merged mode: no block here -- the first raw_mlen bytes of
+     * decoded bucket 0 are the manifest. */
     uint8_t mlen_b[8];
     if (fread(mlen_b, 1, 8, f) != 8) die("read mlen");
     uint32_t mlen      = r32(mlen_b);
     uint32_t comp_mlen = r32(mlen_b + 4);
     uint8_t *manifest = NULL;
-    if (comp_mlen == 0) {
+    if (!merged) {
+        if (comp_mlen == 0) {
+            manifest = malloc(mlen ? mlen : 1);
+            if (!manifest) die("malloc manifest");
+            if (mlen > 0 && fread(manifest, 1, mlen, f) != mlen) die("read manifest");
+        } else {
+            char m_xz[1024], m_raw[1024], mcmd[4096];
+            snprintf(m_xz,  sizeof(m_xz),  "%s.mf.xz.tmp",  in);
+            snprintf(m_raw, sizeof(m_raw), "%s.mf.raw.tmp", in);
+            uint8_t *comp = malloc(comp_mlen);
+            if (!comp) die("malloc manifest xz");
+            if (fread(comp, 1, comp_mlen, f) != comp_mlen) die("read manifest xz");
+            FILE *mf = fopen(m_xz, "wb");
+            if (!mf) die("fopen manifest xz tmp");
+            if (fwrite(comp, 1, comp_mlen, mf) != comp_mlen) die("fwrite manifest xz tmp");
+            fclose(mf);
+            free(comp);
+            snprintf(mcmd, sizeof(mcmd), "xz -d -c \"%s\" > \"%s\" 2>%s",
+                     m_xz, m_raw, ZXLE_DEVNULL);
+            run(mcmd);
+            size_t got = 0;
+            manifest = read_whole_file(m_raw, &got);
+            unlink(m_xz);
+            unlink(m_raw);
+            if (got != mlen) die("manifest size mismatch");
+        }
+    }
+
+    /* Read the trailing-payload bucket header: u8 num_buckets, then
+     * per-bucket (u8 codec_id, u64 csize, csize bytes). Decompress each
+     * bucket into its own buffer; KIND_OPAQUE entries dispatch by their
+     * opaque_bucket field, other kinds always read from bucket 0. */
+    int num_buckets = fgetc(f);
+    if (num_buckets <= 0 || num_buckets > 2) die("invalid num_buckets");
+    uint8_t *bucket_bytes[2] = {0};
+    size_t bucket_len[2] = {0};
+    for (int b = 0; b < num_buckets; b++) {
+        int codec_id = fgetc(f);
+        if (codec_id < 0) die("codec_id eof");
+        uint8_t cs[8];
+        if (fread(cs, 1, 8, f) != 8) die("csize eof");
+        uint64_t csize = (uint64_t)r32(cs) | ((uint64_t)r32(cs + 4) << 32);
+        char tprefix[1024];
+        snprintf(tprefix, sizeof(tprefix), "%s.bucket%d", in, b);
+        bucket_bytes[b] = decompress_bucket(f, csize, (uint8_t)codec_id, tprefix, &bucket_len[b]);
+        if (!bucket_bytes[b]) die("decompress bucket");
+    }
+    fclose(f);
+
+    /* Merged mode: manifest is the head of decoded bucket 0; copy it out so
+     * ownership matches the split path, and offset the solid view past it. */
+    if (merged) {
+        if ((uint64_t)mlen > bucket_len[0]) die("merged manifest overflow");
         manifest = malloc(mlen ? mlen : 1);
         if (!manifest) die("malloc manifest");
-        if (mlen > 0 && fread(manifest, 1, mlen, f) != mlen) die("read manifest");
-    } else {
-        char m_xz[1024], m_raw[1024], mcmd[4096];
-        snprintf(m_xz,  sizeof(m_xz),  "%s.mf.xz.tmp",  in);
-        snprintf(m_raw, sizeof(m_raw), "%s.mf.raw.tmp", in);
-        uint8_t *comp = malloc(comp_mlen);
-        if (!comp) die("malloc manifest xz");
-        if (fread(comp, 1, comp_mlen, f) != comp_mlen) die("read manifest xz");
-        FILE *mf = fopen(m_xz, "wb");
-        if (!mf) die("fopen manifest xz tmp");
-        if (fwrite(comp, 1, comp_mlen, mf) != comp_mlen) die("fwrite manifest xz tmp");
-        fclose(mf);
-        free(comp);
-        snprintf(mcmd, sizeof(mcmd), "xz -d -c \"%s\" > \"%s\" 2>%s",
-                 m_xz, m_raw, ZXLE_DEVNULL);
-        run(mcmd);
-        size_t got = 0;
-        manifest = read_whole_file(m_raw, &got);
-        unlink(m_xz);
-        unlink(m_raw);
-        if (got != mlen) die("manifest size mismatch");
+        memcpy(manifest, bucket_bytes[0], mlen);
     }
 
     int count = 0, cap = 0;
@@ -736,36 +813,18 @@ static int do_unpack(int argc, char **argv) {
         count++;
     }
 
-    /* Read the trailing-payload bucket header: u8 num_buckets, then
-     * per-bucket (u8 codec_id, u32 csize, csize bytes). Decompress each
-     * bucket into its own buffer; KIND_OPAQUE entries dispatch by their
-     * opaque_bucket field, other kinds always read from bucket 0. */
-    int num_buckets = fgetc(f);
-    if (num_buckets <= 0 || num_buckets > 2) die("invalid num_buckets");
-    uint8_t *bucket_bytes[2] = {0};
-    size_t bucket_len[2] = {0};
-    for (int b = 0; b < num_buckets; b++) {
-        int codec_id = fgetc(f);
-        if (codec_id < 0) die("codec_id eof");
-        uint8_t cs[8];
-        if (fread(cs, 1, 8, f) != 8) die("csize eof");
-        uint64_t csize = (uint64_t)r32(cs) | ((uint64_t)r32(cs + 4) << 32);
-        char tprefix[1024];
-        snprintf(tprefix, sizeof(tprefix), "%s.bucket%d", in, b);
-        bucket_bytes[b] = decompress_bucket(f, csize, (uint8_t)codec_id, tprefix, &bucket_len[b]);
-        if (!bucket_bytes[b]) die("decompress bucket");
-    }
-    fclose(f);
-
     if (ZXLE_MKDIR(outdir) != 0 && errno != EEXIST) die("mkdir outdir");
 
     /* M6 v3: build a Solids snapshot pointing at each decoded bucket; recipes
      * carry per-OP bucket bytes that the walker dispatches on. KIND_OPAQUE
-     * dispatches at the manifest level (single opaque_bucket per entry). */
+     * dispatches at the manifest level (single opaque_bucket per entry).
+     * Merged mode: bucket 0's solid bytes start after the manifest prefix. */
+    size_t off0 = merged ? mlen : 0;
     Solids sol;
     for (int b = 0; b < ZXLE_NUM_BUCKETS; b++) {
-        sol.p[b]   = b < num_buckets ? bucket_bytes[b] : NULL;
-        sol.len[b] = b < num_buckets ? bucket_len[b]   : 0;
+        size_t off = (b == 0) ? off0 : 0;
+        sol.p[b]   = b < num_buckets ? bucket_bytes[b] + off : NULL;
+        sol.len[b] = b < num_buckets ? bucket_len[b] - off   : 0;
         sol.pos[b] = 0;
     }
     for (int i = 0; i < count; i++) {
@@ -826,7 +885,7 @@ static int do_unpack(int argc, char **argv) {
         verify_entry(p, ents[i].crc, ents[i].orig_size);
     }
     for (int b = 0; b < num_buckets; b++) {
-        if (sol.pos[b] != bucket_len[b]) die("bucket stream not fully consumed");
+        if (sol.pos[b] != sol.len[b]) die("bucket stream not fully consumed");
         free(bucket_bytes[b]);
     }
 
