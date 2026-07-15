@@ -6,6 +6,17 @@ Historical record of shipped milestones, completed bench measurements, current-s
 
 ## Current-state log (most recent first)
 
+## Current state (2026-07-15, JPEG codec race + merged-manifest layout shipped — clean competitor sweep)
+
+Two ships closing the last measured competitor losses (JAR −1.05%, JPEG −0.70% vs `precomp -cn | xz -9e` from the 2026-07-14 bench):
+
+1. **JPEG codec race.** JPEG blobs (KIND_JPEG manifest blob + OP_JPEG_STORE payload) gain a leading u8 codec byte (0 = brunsli, 1 = packJPG); `try_jpeg_buf` runs both verified round-trips and keeps the smaller. New `make packjpg-deps` (same build pattern and author as packMP3). synth.jpg 117,478 → **116,612** — beats precomp+xz (116,656) and standalone precomp (116,670).
+2. **Merged-manifest layout (flags bit 1).** The remaining JAR gap was layout overhead: v7 paid two xz container overheads (manifest block + bucket 0) where precomp pays one. Merged mode puts the manifest at the head of bucket 0's xz stream (first raw_mlen bytes of the decoded bucket). Which layout wins is input-dependent (pptx measured +44 B merged), so below 8 MB both candidates are finalized and the smaller kept — min-pack philosophy — making the layout race regression-proof. sample.jar 3,044 → **2,804** (beats precomp+xz's 3,012 by 6.9%); every affected fixture got smaller: zip-in.tar −256 B, docx −164 B, zip-with-png −188 B, mixed.tar.gz −180 B, xlsx −52 B, test.png −72 B.
+
+**Competitor scoreboard after these ships: zxle beats `precomp -cn | xz -9e` on all 10 combo fixtures** (margins +0.02% to +7.42% in zxle's favor), beats 7z -mx=9 by 15–47%, beats zpaq -m5 per-fixture on containers. No benched competitor produces a smaller archive than zxle on any bench fixture.
+
+Updated headline deltas vs xz-9e (66/66 RT OK; per-file 0.3383 / solid 0.3326 unchanged): sample.jar **−81.78%** (2,804 B), pptx −24.85%, mixed.tar.gz −23.72%, zip-with-png −23.51%, mixed.tar.zst3 −23.50%, docx −19.29%, xlsx −19.88%, synth.jpg −27.68%, mixed.tar −9.12%, zip-in.tar −5.69%.
+
 ## Current state (2026-07-14, v7 format + OP_ZIP_STORE + hardening + bench widening shipped)
 
 Five ships in one session, driven by the improvements review (`improvements.md` triage; surviving items folded into roadmap.md):
@@ -453,6 +464,19 @@ Predicted shape held: mixed-content `.tar.xz` ties xz-9e (xz already crushes mix
 ---
 
 ## Shipped milestone details
+
+### JPEG codec race — packJPG alongside brunsli (shipped 2026-07-15)
+- Motivation: the 2026-07-14 competitor bench showed `precomp -cn | xz -9e` beating our brunsli route by 0.70% on synth.jpg (precomp uses packJPG internally). packJPG round-trips byte-identically and is the same codebase family as our packMP3 route.
+- JPEG blobs gain a leading u8 codec byte (0 = brunsli, 1 = packJPG) in both the KIND_JPEG manifest blob and the OP_JPEG_STORE recipe payload. `try_jpeg_buf` (jpeg.c) runs both codecs with full verify-by-decode round-trips and keeps the smaller; `unpack_jpeg_blob` centralizes decode (was inline dbrunsli in zxle.c and recipe.c). If either tool is missing from PATH the other still engages.
+- `make packjpg-deps` clones/builds github.com/packjpg/packJPG (same `make RES=` pattern as packMP3); bench.sh and zxle's `prepend_third_party_to_path` auto-discover it.
+- Measured: synth.jpg 117,478 → **116,612** (−0.74%; beats precomp+xz 116,656), zip-with-jpeg.zip −866 B, mixed.tar −856 B (embedded JPEG via OP_JPEG_STORE). 66/66 RT OK.
+
+### Merged-manifest layout — flags bit 1 + small-input layout race (shipped 2026-07-15)
+- Diagnosis of the remaining JAR loss (3,044 vs precomp+xz 3,012): component dump showed 14 B header + 848 B manifest-xz + 9 B bucket header + 2,172 B bucket-xz — two xz streams, two container overheads, no shared context. Simulation (xz over manifest‖solid concat) predicted 2,804; shipped result matched exactly.
+- Merged mode (header flags bit 1): manifest is the first raw_mlen bytes of decoded bucket 0; no manifest block follows the header (comp_mlen written 0). Decode extracts the manifest prefix and offsets the bucket-0 solid view past it.
+- The winning layout is input-dependent — pptx measured +44 B under merged (context dilution beats the ~60 B container saving on that shape). Below 8 MB total, pack finalizes both candidates (merged stream vs split solid + split manifest-xz-with-raw-fallback) and keeps the smaller, so the layout can never regress a fixture; above the threshold merged wins by construction (fixed saving, context effects vanish at scale). `--slow` (zpaq bucket 0) and blob-only archives (empty bucket 0) always use the split path.
+- Bucket finalize extracted into `finalize_bucket()` (codec switch + --fast block scaling in one place) so the two candidates share one code path.
+- Measured sweep vs the JPEG-race commit — every changed fixture smaller, none larger: sample.jar 3,044 → **2,804**, zip-in.tar −256 B, sample.docx −164 B (flips DOCX from a 80 B loss to an 80 B win vs precomp+xz), zip-with-png −188 B, mixed.tar.gz −180 B, mixed.deb −56 B, xlsx −52 B, test.png −72 B. **zxle now beats precomp-cn|xz-9e on all 10 combo fixtures.** 66/66 RT OK; --slow RT OK.
 
 ### v7 format — compressed manifest, per-entry crc32, 64-bit IO, OP_ZIP_STORE (shipped 2026-07-14)
 - **Motivating measurement:** a script over `tests/baseline/*.zxle` showed manifest share of archive size at **100% (synth.mp3/jpg blobs), 65% (sample.jar), 12.3% (mixed.tar family), 8–9% (pptx, zip-with-jpeg)**. Recipes were storing raw container-structure bytes (`OP_STRUCT` tar headers, padding, zero-tails; ZIP LFH/CD/EOCD) plus brunsli/packMP3/preflate blobs directly in an uncompressed manifest region.
