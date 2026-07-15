@@ -12,7 +12,7 @@ items live in [roadmap.md](roadmap.md) marked **[2026-07-14 review]**.
 | 1.2 | Nested-dispatch asymmetry | **Partially shipped** (OP_ZIP_STORE: zip-in-tar/ar). Remaining axes in roadmap ("Nested-dispatch remaining axes") |
 | 1.3 | GNU/pax tar widening | Deferred → roadmap (priority raised; measure `git archive` output first) |
 | 1.4 | ZIP64 / ZIP variants | Deferred → roadmap (corpus-scan 50 real ZIPs first) |
-| 1.5 | Raw-deflate scan in opaque streams (PDF etc.) | Deferred → roadmap (new bullet under coverage gaps) |
+| 1.5 | Raw-deflate scan in opaque streams (PDF etc.) | **PDF shipped 2026-07-15** (M3k KIND_PDF: test.pdf −74%, arxiv.pdf −48.2% vs xz-9e, both beat precomp\|xz). Generic opaque-scan + OP_PDF_STORE nesting deferred → roadmap |
 | 1.6 | BCJ x86 filter applied to ARM64 PE/ELF | **Shipped** (machine-aware `bucket_for_bytes`) |
 | 1.7 | --fast fixed 8 MiB blocks overpay at scale | **Shipped** (input-scaled blocks; 1 GB size cost +3.24% → +0.58%) |
 | 1.8 | M4 rationale stale / 64 MiB dict ceiling | Documented → roadmap ("Solid window at scale" + note in M4 graveyard entry) |

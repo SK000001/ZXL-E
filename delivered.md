@@ -6,6 +6,25 @@ Historical record of shipped milestones, completed bench measurements, current-s
 
 ## Current-state log (most recent first)
 
+## Current state (2026-07-15b, adversarial bench + M3k KIND_PDF shipped — PDF loss flipped to a win)
+
+An adversarial bench (fixtures chosen to *expose* losses: real PDFs, pax tars, ZIP64, encrypted PDF) followed by one ship:
+
+**Adversarial findings:**
+- **pax tars parse today.** Both `git archive` (768 KB repo tar) and GNU `tar --format=pax` unwrap fine — pax extended-header entries ride as ordinary payloads. zxle beat xz-9e and 7z on both. The roadmap's "rejected → KIND_OPAQUE on real GNU tars" was too pessimistic; the actual rejections are base-256 size fields (>8 GB entries) and sparse layout.
+- **ZIP64 (python force_zip64 per-entry variant) parses today** — LFH zip64 extras don't trip zip_parse; the rejecting path is the zip64 EOCD (>65,535 entries / >4 GB), still untested against a real artifact.
+- **Encrypted PDFs are uncrackable for everyone.** The ISO 32000 spec PDF (22.5 MB, 943 FlateDecode streams) is RC4/AES-encrypted; stream bytes are ciphertext. precomp: 0/943 recompressed. zxle opaque ties xz-9e. Not a coverage gap — a physics limit (absent PDF-decryption support, which is out of scope).
+- **The one real loss: unencrypted PDFs.** test.pdf went opaque at 140,844 vs precomp-cn|xz **36,820** — a 3.8× loss on the whole unencrypted-PDF file class.
+
+**M3k KIND_PDF (shipped 2026-07-15):** FlateDecode scanner closes the loss and flips it:
+
+| PDF | orig | xz-9e | precomp+xz | zxle (M3k) | vs xz-9e | vs precomp+xz |
+|---|---:|---:|---:|---:|---:|---:|
+| test.pdf | 148,868 | 140,808 | 36,700 | **36,616** | **−74.0%** | −0.23% |
+| arxiv.pdf (1706.03762, real-world) | 2,215,244 | 1,033,444 | 543,300 | **535,212** | **−48.2%** | −1.49% |
+
+8-file corpus headline improves (test.pdf is in it): **per-file 0.3383 → 0.3232, solid 0.3326 → 0.3174**. 68/68 RT OK; all 26 container fixtures byte-identical. The clean competitor sweep from earlier today still holds, now including the PDF class.
+
 ## Current state (2026-07-15, JPEG codec race + merged-manifest layout shipped — clean competitor sweep)
 
 Two ships closing the last measured competitor losses (JAR −1.05%, JPEG −0.70% vs `precomp -cn | xz -9e` from the 2026-07-14 bench):
@@ -464,6 +483,12 @@ Predicted shape held: mixed-content `.tar.xz` ties xz-9e (xz already crushes mix
 ---
 
 ## Shipped milestone details
+
+### M3k — KIND_PDF FlateDecode scanner (shipped 2026-07-15)
+- **What it does:** `src/pdf.c` scans `%PDF-` files byte-wise for zlib headers — any CM=8 CMF, not just 0x78: real PDFs mix 32K-window streams with small-window CMFs like 0x48 on Type-1 font programs, and the 0x78-only first cut missed 40 of arxiv.pdf's 142 streams (the fonts — most of the compressible mass). Each candidate is inflated with a span-reporting zlib wrapper (learns the exact consumed length — no PDF `/Length` parsing, so indirect-reference lengths cost nothing), then verified via redeflate-L9 exact match or preflate split/join byte-identity. Embedded JPEGs (DCTDecode) are found by JPEG segment-walk (`jpeg_span`, handles progressive multi-SOS + RST/stuffing) and raced through `try_jpeg_buf`.
+- **Zero new unpack code:** the recipe is a plain OP_STRUCT / OP_REDEFLATE / OP_PREFLATE / OP_JPEG_STORE sequence — the zlib 2-byte header and 4-byte adler ride as STRUCT bytes around the deflate body, so `unpack_recipe` reconstructs everything. KIND_PDF = 11; unpack dispatch shares the ZIP/TAR/AR path.
+- **Guard rails:** magic-gated on `%PDF-`, per-stream round-trip verification, ≥64 B minimum stream size, FDICT candidates skipped, min-pack catches any net-regressing pathological input.
+- **Measured:** test.pdf 140,844 → 36,616 (−74.0% vs xz-9e; beats precomp+xz 36,700); arxiv.pdf 1,033,444 → 535,212 (−48.2% vs xz-9e; beats precomp+xz 543,300). Encrypted PDFs stay opaque (streams are ciphertext; precomp also gets 0/943 on the ISO 32000 spec PDF). 8-file corpus: per-file 0.3383 → **0.3232**, solid 0.3326 → **0.3174**. Bench gains PDF lines in the precomp / precomp|xz / 7z competitor sections. Known gaps, in roadmap: PDFs inside containers aren't dispatched (no OP_PDF_STORE in tar/ar/zip walkers), and the scanner is PDF-gated rather than running on all KIND_OPAQUE bytes (SWF/WOFF/PSD would need the generic version).
 
 ### JPEG codec race — packJPG alongside brunsli (shipped 2026-07-15)
 - Motivation: the 2026-07-14 competitor bench showed `precomp -cn | xz -9e` beating our brunsli route by 0.70% on synth.jpg (precomp uses packJPG internally). packJPG round-trips byte-identically and is the same codebase family as our packMP3 route.
