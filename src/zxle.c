@@ -16,6 +16,7 @@
 #include "ar.h"
 #include "jpeg.h"
 #include "mp3.h"
+#include "pdf.h"
 #include "recipe.h"
 #include <pthread.h>
 #include <zlib.h>
@@ -236,6 +237,15 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
                 buf_init(&ents[i].recipe);
             }
         }
+        if (!force_opaque && !unwrapped && fsz >= 32 && memcmp(fb, "%PDF-", 5) == 0) {
+            if (pack_pdf(fb, fsz, tp, &ents[i].recipe, &solid, &solid_x86) == 0) {
+                ents[i].kind = KIND_PDF;
+                unwrapped = 1;
+            } else {
+                buf_free(&ents[i].recipe);
+                buf_init(&ents[i].recipe);
+            }
+        }
         if (!unwrapped) {
             ents[i].kind = KIND_OPAQUE;
             ents[i].opaque_bucket = bucket_for_bytes(fb, fsz);
@@ -273,7 +283,8 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
         case KIND_AR:
         case KIND_BZIP2:
         case KIND_ZSTD:
-        case KIND_XZ:    blob = &ents[i].recipe; break;
+        case KIND_XZ:
+        case KIND_PDF:   blob = &ents[i].recipe; break;
         case KIND_JPEG:  blob = &ents[i].brn;    break;
         case KIND_MP3:   blob = &ents[i].pmp;    break;
         default: break;
@@ -790,7 +801,7 @@ static int do_unpack(int argc, char **argv) {
         uint8_t k = ents[count].kind;
         int has_recipe = (k == KIND_ZIP || k == KIND_PNG || k == KIND_GZIP ||
                           k == KIND_TAR || k == KIND_AR  || k == KIND_BZIP2 ||
-                          k == KIND_ZSTD || k == KIND_XZ);
+                          k == KIND_ZSTD || k == KIND_XZ || k == KIND_PDF);
         if (has_recipe) {
             if (mp + 4 > mlen) die("recipe len truncated");
             ents[count].recipe_len = r32(manifest + mp); mp += 4;
@@ -841,7 +852,8 @@ static int do_unpack(int argc, char **argv) {
                 die("fwrite opaque");
             sol.pos[b] += ents[i].orig_size;
             fclose(of);
-        } else if (ents[i].kind == KIND_ZIP || ents[i].kind == KIND_TAR || ents[i].kind == KIND_AR) {
+        } else if (ents[i].kind == KIND_ZIP || ents[i].kind == KIND_TAR ||
+                   ents[i].kind == KIND_AR  || ents[i].kind == KIND_PDF) {
             unpack_recipe(ents[i].recipe, ents[i].recipe_len, &sol, of, ents[i].orig_size, p);
             fclose(of);
         } else if (ents[i].kind == KIND_JPEG) {

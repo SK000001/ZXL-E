@@ -278,6 +278,7 @@ if [ -n "$PRECOMP" ]; then
     bench_precomp "JPEG (brunsli)"        tests/corpus/synth.jpg
     bench_precomp "PNG (IDAT zlib-L9)"    "$CORPUS/test.png"
     bench_precomp "MP3 (packMP3)"         tests/corpus/synth.mp3
+    bench_precomp "PDF (KIND_PDF)"        "$CORPUS/test.pdf"
 fi
 
 # Competitor: zpaq 7.15 with -m5 (max effort, context-mixing). Slower per
@@ -390,6 +391,7 @@ if [ -n "$SEVENZ" ]; then
     bench_7z "JPEG (brunsli)"        tests/corpus/synth.jpg
     bench_7z "PNG (IDAT zlib-L9)"    "$CORPUS/test.png"
     bench_7z "MP3 (packMP3)"         tests/corpus/synth.mp3
+    bench_7z "PDF (KIND_PDF)"        "$CORPUS/test.pdf"
 fi
 
 # Competitor combo: precomp -cn + xz -9e. Standalone precomp understates the
@@ -440,6 +442,7 @@ if [ -n "$PRECOMP" ]; then
     bench_precomp_xz "JPEG (brunsli)"        tests/corpus/synth.jpg
     bench_precomp_xz "PNG (IDAT zlib-L9)"    "$CORPUS/test.png"
     bench_precomp_xz "MP3 (packMP3)"         tests/corpus/synth.mp3
+    bench_precomp_xz "PDF (KIND_PDF)"        "$CORPUS/test.pdf"
 fi
 
 # ZXL-E --slow mode (zpaq -m5 final-step) on headline fixtures. Gated by

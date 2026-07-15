@@ -44,6 +44,10 @@
  * manifest is the first raw_mlen bytes of decoded bucket 0 and no manifest
  * block follows the header (comp_mlen written as 0). Saves one xz container
  * overhead and shares context between structural bytes and content.
+ * KIND_PDF (11): %PDF- files whose embedded zlib streams (FlateDecode)
+ * verify via redeflate-L9 or preflate. Recipe is a plain OP_STRUCT /
+ * OP_REDEFLATE / OP_PREFLATE sequence (zlib header + adler ride as STRUCT
+ * bytes) consumed by unpack_recipe -- no PDF-specific unpack code.
  * v3..v7 cannot interoperate. */
 #define ZXLE_VER 7
 
@@ -59,6 +63,7 @@
 #define KIND_BZIP2  8
 #define KIND_ZSTD   9
 #define KIND_XZ     10
+#define KIND_PDF    11
 
 /* Recipe ops walked by unpack_recipe (used by KIND_ZIP / KIND_TAR / KIND_AR
  * recipes; nested recipes inside KIND_GZIP / KIND_BZIP2 / KIND_ZSTD / KIND_XZ

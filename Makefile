@@ -25,7 +25,8 @@ SRC_C = \
     src/tar.c \
     src/ar.c \
     src/jpeg.c \
-    src/mp3.c
+    src/mp3.c \
+    src/pdf.c
 
 SRC_CXX = src/preflate_shim.cpp
 OBJ_C   = $(SRC_C:.c=.o)
