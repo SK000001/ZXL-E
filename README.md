@@ -55,7 +55,7 @@ Default mode (xz-9e final-step + BCJ-x86 sub-stream for x86/x64 PE/ELF content) 
 | **M3m generic opaque flate scan** | **shipped** — M3k scanner runs on bucket-0 opaque files (5% coverage gate, PE/ELF excluded to keep BCJ); flate-blob.bin −40.45% vs xz-9e; scan cost <1% of pack (130–930 MB/s) |
 | **Hostile-input bucket rollback** | **shipped** — mid-walk pack_zip/tar/ar failures no longer orphan solid bytes (crafted-ZIP repro: pre-fix RT FAIL → post-fix OK); guarded by tests/hostile.sh |
 | **GitHub Actions CI** | **shipped** — ubuntu build + self-contained fixtures + hostile.sh + bench gate; forced Linux portability fixes in preflate-deps and make_fixtures.sh; workflow unverified until first push |
-| **M7 step 5: pack_zip entry-loop worker pool** | **shipped** — per-entry fragments spliced in order, output byte-identical; pe-deflate-l6 pack −36%, pptx −38%; tar/ar loops still serial |
+| **M7 step 5: entry-loop worker pools (zip + tar + ar)** | **shipped** — per-entry fragments spliced in order, output byte-identical; zip: pe-deflate-l6 −36% / pptx −38% pack time; tar/ar: gz-in.tar −13% / mixed.deb −12%; every per-entry recompression loop now parallel |
 
 ## Headline numbers (2026-07-17, ZXLE_VER 7)
 
