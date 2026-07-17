@@ -49,6 +49,11 @@ $(PREFLATE_LIB):
 	@echo "preflate not built. Run 'make preflate-deps' first."
 	@exit 1
 
+# MinGW generator on Windows; cmake's default (Unix Makefiles) elsewhere.
+ifeq ($(OS),Windows_NT)
+CMAKE_GEN = -G "MinGW Makefiles"
+endif
+
 preflate-deps:
 	@if [ ! -d $(PREFLATE_DIR) ]; then \
 	  mkdir -p third_party && \
@@ -58,8 +63,8 @@ preflate-deps:
 	  sed -i 's|#include <algorithm>|#include <algorithm>\n#include <cstdint>|' $(PREFLATE_DIR)/preflate_seq_chain.h; \
 	fi
 	@mkdir -p $(PREFLATE_DIR)/build
-	@cd $(PREFLATE_DIR)/build && cmake -G "MinGW Makefiles" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ..
-	@cd $(PREFLATE_DIR)/build && mingw32-make preflate || true
+	@cd $(PREFLATE_DIR)/build && cmake $(CMAKE_GEN) -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ..
+	@cd $(PREFLATE_DIR)/build && cmake --build . --target preflate -j 4 || true
 
 BRUNSLI_DIR = third_party/brunsli
 

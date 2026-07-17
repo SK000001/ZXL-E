@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake zlib1g-dev zstd xz-utils bzip2 python-is-python3
+
+      - name: Cache preflate
+        uses: actions/cache@v4
+        with:
+          path: third_party/preflate
+          key: preflate-${{ runner.os }}-${{ hashFiles('Makefile') }}
+
+      - name: Build libpreflate
+        run: make preflate-deps
+
+      - name: Build zxle
+        run: make
+
+      - name: Generate fixtures
+        run: bash tests/make_fixtures.sh
+        # The 8-file corpus (../Zxl/tests) and ffmpeg are absent in CI;
+        # corpus-dependent fixtures skip themselves. Self-contained set:
+        # sample.docx/.xlsx/.pptx/.jar, flate-blob.bin.
+
+      - name: Hostile-container round-trip
+        run: bash tests/hostile.sh
+
+      - name: Bench (self-contained subset)
+        run: |
+          bash tests/bench.sh 2>&1 | tee bench-ci.log
+          ! grep -q "FAIL" bench-ci.log

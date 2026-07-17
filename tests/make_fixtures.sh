@@ -139,9 +139,13 @@ fi
 # Pure tones compress trivially under xz-9e and don't show packMP3's win, so we
 # use a content-rich signal that produces music-like MP3 frame entropy.
 if want synth.mp3; then
+    if ! command -v ffmpeg >/dev/null 2>&1; then
+        echo "skipping synth.mp3 -- ffmpeg not found"
+    else
     ffmpeg -y -loglevel error -f lavfi \
         -i "sine=f=220:d=30,asplit=2[a][b];[a]aphaser=type=t[c];[b]chorus=0.7:0.9:55:0.4:0.25:2[d];[c][d]amerge" \
         -ac 2 -b:a 128k synth.mp3
+    fi
 fi
 
 # zip-with-png.zip — 1 stored PNG + 2 deflate-9 DLLs. Mirrors zip-with-jpeg.zip
