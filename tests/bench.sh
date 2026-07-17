@@ -574,6 +574,57 @@ if [ "${ZXLE_SLOW:-0}" = "1" ] && [ -n "$ZPAQ" ]; then
     bench_slow "MP3 (packMP3)"         tests/corpus/synth.mp3
 fi
 
+# ZXL-E --fast mode (xz -T0, input-scaled blocks) vs default on headline
+# fixtures. Gated by ZXLE_FAST=1. Compares against the default archives the
+# sections above just produced, so the exact per-fixture size cost of the
+# speed trade is visible next to the wall-time gain.
+if [ "${ZXLE_FAST:-0}" = "1" ]; then
+    echo
+    echo "=== ZXL-E --fast (xz -T0 scaled blocks) vs default (size + RT) ==="
+    bench_fast() {
+        local label="$1" SRC="$2"
+        [ -f "$SRC" ] || return 0
+        local base; base=$(basename "$SRC")
+        local fout="tests/baseline/$base.fast.zxle"
+        local fd="tests/unpacked/$base.fast.d"
+        rm -f "$fout"; rm -rf "$fd"; mkdir -p "$fd"
+        local t0 fa_ms un_ms FA_RT
+        t0=$EPOCHREALTIME
+        "$BIN" pack --fast "$fout" "$SRC" >/dev/null 2>&1 || { echo "  $label: pack --fast failed"; return 0; }
+        fa_ms=$(elapsed_ms "$t0")
+        t0=$EPOCHREALTIME
+        "$BIN" unpack "$fout" "$fd" >/dev/null 2>&1 || { echo "  $label: unpack failed"; return 0; }
+        un_ms=$(elapsed_ms "$t0")
+        cmp -s "$SRC" "$fd/$base" && FA_RT=OK || FA_RT=FAIL
+        local ORIG FA DEFAULT XZ
+        ORIG=$(stat -c%s "$SRC")
+        FA=$(stat -c%s "$fout")
+        DEFAULT=$(stat -c%s "tests/baseline/$base.zxle" 2>/dev/null || echo 0)
+        XZ=$(xz9e_size "$SRC")
+        printf "  %s (%s):\n" "$label" "$base"
+        printf "    orig=%d  zxle=%d  zxle--fast=%d  xz-9e=%d  rt=%s\n" "$ORIG" "$DEFAULT" "$FA" "$XZ" "$FA_RT"
+        if [ "$DEFAULT" -gt 0 ]; then
+            printf "    --fast vs zxle: %s   --fast vs xz-9e: %s   perf: pack=%dms unpack=%dms\n" \
+                "$(awk -v a="$FA" -v b="$DEFAULT" 'BEGIN{printf "%+.2f%%", (a-b)*100/b}')" \
+                "$(awk -v a="$FA" -v b="$XZ" 'BEGIN{printf "%+.2f%%", (a-b)*100/b}')" \
+                "$fa_ms" "$un_ms"
+        fi
+        rm -f "$fout"; rm -rf "$fd"
+    }
+    bench_fast "ZIP unwrap"            tests/corpus/pe-deflate.zip
+    bench_fast "ZIP/L6 (preflate)"     tests/corpus/pe-deflate-l6.zip
+    bench_fast "DOCX (real ZIP/L6)"    tests/corpus/sample.docx
+    bench_fast "JAR (real ZIP/L6)"     tests/corpus/sample.jar
+    bench_fast "gzip wrapper"          tests/corpus/ntdll.dll.gz
+    bench_fast "mixed tar"             tests/corpus/mixed.tar
+    bench_fast "gz of mixed.tar"       tests/corpus/mixed.tar.gz
+    bench_fast "deb-shape ar"          tests/corpus/mixed.deb
+    bench_fast "PDF (KIND_PDF)"        "$CORPUS/test.pdf"
+    bench_fast "Opaque flate scan"     tests/corpus/flate-blob.bin
+    bench_fast "real .deb (zst data)"  tests/corpus/real_coreutils.deb
+    bench_fast "real src .tar.xz"      tests/corpus/real_coreutils_src.tar.xz
+fi
+
 # Silesia corpus (12 files, 211 MB) — the standard general-purpose codec
 # benchmark. Gated by ZXLE_SILESIA=1 because pack time on 211 MB through
 # xz-9e single-threaded is several minutes.
