@@ -18,23 +18,26 @@ int pack_ar(const uint8_t *p, size_t n, const char *tmp_prefix,
     buf_u32(recipe, 8);
     buf_append(recipe, p, 8);
 
+    /* Callers share b0/b1; a mid-walk failure must not leave orphan bytes
+     * that would desync every later op's solid position. */
+    size_t b0n = b0->n, b1n = b1->n;
     size_t cur = 8;
     int entries = 0, gzip_stored = 0, bz2_stored = 0, xz_stored = 0, zstd_stored = 0, png_stored = 0, jpeg_stored = 0, zip_stored = 0, pdf_stored = 0, stored_plain = 0;
 
     while (cur < n) {
-        if (cur + 60 > n) return -1;
+        if (cur + 60 > n) { b0->n = b0n; b1->n = b1n; return -1; }
         const uint8_t *hdr = p + cur;
-        if (hdr[58] != 0x60 || hdr[59] != 0x0A) return -1;
+        if (hdr[58] != 0x60 || hdr[59] != 0x0A) { b0->n = b0n; b1->n = b1n; return -1; }
 
         uint64_t size = 0;
         for (int i = 0; i < 10; i++) {
             uint8_t c = hdr[48 + i];
             if (c == ' ' || c == 0) break;
-            if (c < '0' || c > '9') return -1;
+            if (c < '0' || c > '9') { b0->n = b0n; b1->n = b1n; return -1; }
             size = size * 10 + (c - '0');
         }
-        if (size > 0xFFFFFFFFu) return -1;
-        if (cur + 60 + size > n) return -1;
+        if (size > 0xFFFFFFFFu) { b0->n = b0n; b1->n = b1n; return -1; }
+        if (cur + 60 + size > n) { b0->n = b0n; b1->n = b1n; return -1; }
 
         buf_u8(recipe, OP_STRUCT);
         buf_u32(recipe, 60);
@@ -176,7 +179,7 @@ int pack_ar(const uint8_t *p, size_t n, const char *tmp_prefix,
         }
 
         if (cur < n && (cur & 1) == 1) {
-            if (p[cur] != 0x0A) return -1;
+            if (p[cur] != 0x0A) { b0->n = b0n; b1->n = b1n; return -1; }
             buf_u8(recipe, OP_STRUCT);
             buf_u32(recipe, 1);
             buf_append(recipe, p + cur, 1);

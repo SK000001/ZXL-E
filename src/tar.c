@@ -15,6 +15,9 @@ int pack_tar(const uint8_t *p, size_t n, const char *tmp_prefix,
     if (n % 512 != 0) return -1;
     if (memcmp(p + 257, "ustar", 5) != 0) return -1;
 
+    /* Callers share b0/b1; a mid-walk failure must not leave orphan bytes
+     * that would desync every later op's solid position. */
+    size_t b0n = b0->n, b1n = b1->n;
     size_t cur = 0;
     int regulars = 0, jpeg_stored = 0, png_stored = 0, gzip_stored = 0, bz2_stored = 0, xz_stored = 0, zstd_stored = 0, zip_stored = 0, pdf_stored = 0, stored_plain = 0;
 
@@ -31,21 +34,21 @@ int pack_tar(const uint8_t *p, size_t n, const char *tmp_prefix,
             break;
         }
 
-        if (memcmp(hdr + 257, "ustar", 5) != 0) return -1;
-        if (hdr[124] & 0x80) return -1;
+        if (memcmp(hdr + 257, "ustar", 5) != 0) { b0->n = b0n; b1->n = b1n; return -1; }
+        if (hdr[124] & 0x80) { b0->n = b0n; b1->n = b1n; return -1; }
 
         uint64_t size = 0;
         for (int i = 124; i < 124 + 11; i++) {
             uint8_t c = hdr[i];
             if (c == 0 || c == ' ') break;
-            if (c < '0' || c > '7') return -1;
+            if (c < '0' || c > '7') { b0->n = b0n; b1->n = b1n; return -1; }
             size = size * 8 + (c - '0');
         }
-        if (size > 0xFFFFFFFFu) return -1;
+        if (size > 0xFFFFFFFFu) { b0->n = b0n; b1->n = b1n; return -1; }
 
         char tflag = (char)hdr[156];
         uint64_t padded = (size + 511) & ~(uint64_t)511;
-        if (cur + 512 + padded > n) return -1;
+        if (cur + 512 + padded > n) { b0->n = b0n; b1->n = b1n; return -1; }
 
         buf_u8(recipe, OP_STRUCT);
         buf_u32(recipe, 512);

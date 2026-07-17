@@ -107,6 +107,9 @@ int pack_zip(const uint8_t *p, size_t n, const char *tmp_prefix,
     size_t cd_off = 0, cd_len = 0, eocd_off = 0, eocd_len = 0;
     if (zip_parse(p, n, &ents, &count, &cd_off, &cd_len, &eocd_off, &eocd_len) != 0) return -1;
 
+    /* Callers share b0/b1; a mid-walk failure must not leave orphan bytes
+     * that would desync every later op's solid position. */
+    size_t b0n = b0->n, b1n = b1->n;
     size_t cursor = 0;
     int redeflated = 0, preflated = 0, store_orig = 0, stored_method = 0, jpeg_stored = 0, png_stored = 0, pdf_stored = 0;
 
@@ -123,7 +126,10 @@ int pack_zip(const uint8_t *p, size_t n, const char *tmp_prefix,
         buf_append(recipe, p + e->lfh_off, lfh_size);
 
         if (e->method == 0) {
-            if (e->raw_size != e->comp_size) { free(ents); return -1; }
+            if (e->raw_size != e->comp_size) {
+                b0->n = b0n; b1->n = b1n;
+                free(ents); return -1;
+            }
             int handled = 0;
             if (!handled && e->raw_size >= 8 &&
                 memcmp(p + e->payload_off, PNG_SIG, 8) == 0) {
