@@ -57,6 +57,57 @@ BIN=./zxle
 ratio() { awk -v a="$1" -v b="$2" 'BEGIN{ if (b==0) print "n/a"; else printf "%.4f", a/b }'; }
 elapsed_ms() { awk -v s="$1" -v e="$EPOCHREALTIME" 'BEGIN{printf "%d", (e-s)*1000}'; }
 
+# --- Deterministic-result cache ---------------------------------------------
+# Baseline/competitor results (xz-9e, zstd-19, precomp, zpaq, 7z sizes + their
+# RT verdicts and wall times) depend only on fixture bytes and tool versions,
+# so they're cached keyed by (basename, size, mtime) and invalidated per tool
+# family when the tool's version string changes. zxle pack/unpack is never
+# cached -- that's what the bench measures. ZXLE_FRESH=1 forces a full
+# recompute. Cached competitor perf times are from the run that populated the
+# cache; re-run with ZXLE_FRESH=1 before quoting competitor wall times.
+CACHE=tests/baseline/.cache
+mkdir -p "$CACHE"
+fkey() { stat -c '%s-%Y' "$1"; }
+cache_get() { # cache_get <src> <family>; prints cached content, rc 1 on miss
+    [ "${ZXLE_FRESH:-0}" = "1" ] && return 1
+    local f="$CACHE/$(basename "$1").$(fkey "$1").$2"
+    [ -f "$f" ] && cat "$f"
+}
+cache_put() { # cache_put <src> <family> <content>
+    local base; base=$(basename "$1")
+    rm -f "$CACHE/$base".*."$2"
+    printf '%s' "$3" > "$CACHE/$base.$(fkey "$1").$2"
+}
+ver_stamp() { # ver_stamp <family> <version-string>; nukes family on change
+    local f="$CACHE/ver.$1"
+    if [ ! -f "$f" ] || [ "$(cat "$f")" != "$2" ]; then
+        rm -f "$CACHE"/*."$1"
+        printf '%s' "$2" > "$f"
+    fi
+}
+ver_stamp xz9e  "$(xz --version 2>/dev/null | head -1)"
+ver_stamp zst19 "$(zstd --version 2>/dev/null)"
+ver_stamp zst19l "$(zstd --version 2>/dev/null)"
+
+xz9e_size() {
+    local v; v=$(cache_get "$1" xz9e) && { echo "$v"; return; }
+    v=$(xz -9e -c "$1" 2>/dev/null | wc -c)
+    cache_put "$1" xz9e "$v"
+    echo "$v"
+}
+zst19_size() { # plain zstd -19
+    local v; v=$(cache_get "$1" zst19) && { echo "$v"; return; }
+    v=$(zstd -19 -q -c "$1" 2>/dev/null | wc -c)
+    cache_put "$1" zst19 "$v"
+    echo "$v"
+}
+zst19l_size() { # zstd -19 --long=27
+    local v; v=$(cache_get "$1" zst19l) && { echo "$v"; return; }
+    v=$(zstd -19 --long=27 -q -c "$1" 2>/dev/null | wc -c)
+    cache_put "$1" zst19l "$v"
+    echo "$v"
+}
+
 if [ "$HAVE_CORPUS" = "1" ]; then
 printf "%-16s %10s %10s %10s %10s %10s  %-3s  %6s %6s\n" "file" "orig" "zxle" "zstd-19" "xz-9e" "ratio" "rt" "pk_ms" "un_ms"
 printf -- "----                  ----       ----       -------    -----      -----     --   ------ ------\n"
@@ -82,10 +133,10 @@ for f in $FILES; do
     unp_ms=$(elapsed_ms "$t0")
     if cmp -s "$src" "tests/unpacked/$f"; then rt=OK; else rt=FAIL; fi
 
-    # zstd-19 baseline
-    zstd_sz=$(zstd -19 --long=27 -q -f -o "tests/baseline/$f.zst" "$src" >/dev/null 2>&1; stat -c%s "tests/baseline/$f.zst")
-    # xz-9e baseline
-    xz_sz=$(xz -9e -c "$src" 2>/dev/null | wc -c)
+    # zstd-19 / xz-9e baselines (cached; size-only, the .zst artifact was
+    # never consumed by anything downstream)
+    zstd_sz=$(zst19l_size "$src")
+    xz_sz=$(xz9e_size "$src")
 
     printf "%-16s %10d %10d %10d %10d %10s  %-3s  %6d %6d\n" \
         "$f" "$orig" "$zxle_sz" "$zstd_sz" "$xz_sz" "$(ratio "$zxle_sz" "$orig")" "$rt" "$pack_ms" "$unp_ms"
@@ -144,8 +195,8 @@ bench_zip() {
     local Z_ORIG Z_ZXLE Z_XZ Z_ZSTD
     Z_ORIG=$(stat -c%s "$ZIP")
     Z_ZXLE=$(stat -c%s "tests/baseline/$base.zxle")
-    Z_XZ=$(xz -9e -c "$ZIP" 2>/dev/null | wc -c)
-    Z_ZSTD=$(zstd -19 --long=27 -q -c "$ZIP" 2>/dev/null | wc -c)
+    Z_XZ=$(xz9e_size "$ZIP")
+    Z_ZSTD=$(zst19l_size "$ZIP")
     printf "  orig=%d  zxle=%d  zstd-19=%d  xz-9e=%d  rt=%s\n" "$Z_ORIG" "$Z_ZXLE" "$Z_ZSTD" "$Z_XZ" "$ZRT"
     printf "  zxle vs xz-9e: %s\n" "$(awk -v a="$Z_ZXLE" -v b="$Z_XZ" 'BEGIN{printf "%.2f%%", (a-b)*100/b}')"
     printf "  perf: pack=%dms unpack=%dms\n" "$Z_PACK_MS" "$Z_UNP_MS"
@@ -180,8 +231,8 @@ bench_file() {
     local F_ORIG F_ZXLE F_XZ F_ZSTD
     F_ORIG=$(stat -c%s "$SRC")
     F_ZXLE=$(stat -c%s "tests/baseline/$base.zxle")
-    F_XZ=$(xz -9e -c "$SRC" 2>/dev/null | wc -c)
-    F_ZSTD=$(zstd -19 -q -c "$SRC" 2>/dev/null | wc -c)
+    F_XZ=$(xz9e_size "$SRC")
+    F_ZSTD=$(zst19_size "$SRC")
     printf "  orig=%d  zxle=%d  zstd-19=%d  xz-9e=%d  rt=%s\n" "$F_ORIG" "$F_ZXLE" "$F_ZSTD" "$F_XZ" "$F_RT"
     printf "  zxle vs xz-9e: %s\n" "$(awk -v a="$F_ZXLE" -v b="$F_XZ" 'BEGIN{printf "%.2f%%", (a-b)*100/b}')"
     printf "  perf: pack=%dms unpack=%dms\n" "$F_PACK_MS" "$F_UNP_MS"
@@ -224,8 +275,8 @@ if [ -f "$JPG" ]; then
     if cmp -s "$JPG" "tests/unpacked/$base.d/$base"; then JRT=OK; else JRT=FAIL; fi
     J_ORIG=$(stat -c%s "$JPG")
     J_ZXLE=$(stat -c%s "tests/baseline/$base.zxle")
-    J_XZ=$(xz -9e -c "$JPG" 2>/dev/null | wc -c)
-    J_ZSTD=$(zstd -19 -q -c "$JPG" 2>/dev/null | wc -c)
+    J_XZ=$(xz9e_size "$JPG")
+    J_ZSTD=$(zst19_size "$JPG")
     printf "  orig=%d  zxle=%d  zstd-19=%d  xz-9e=%d  rt=%s\n" "$J_ORIG" "$J_ZXLE" "$J_ZSTD" "$J_XZ" "$JRT"
     printf "  zxle vs xz-9e: %s\n" "$(awk -v a="$J_ZXLE" -v b="$J_XZ" 'BEGIN{printf "%.2f%%", (a-b)*100/b}')"
     printf "  perf: pack=%dms unpack=%dms\n" "$J_PACK_MS" "$J_UNP_MS"
@@ -245,20 +296,26 @@ if [ -n "$PRECOMP" ]; then
         [ -f "$SRC" ] || return 0
         local base; base=$(basename "$SRC")
         local pcf="tests/baseline/$base.pcf" rec="tests/unpacked/$base.precomp.bin"
-        rm -f "$pcf" "$rec"
-        local t0 pc_ms rec_ms PC_RT
-        t0=$EPOCHREALTIME
-        "$PRECOMP" -o"$pcf" "$SRC" >/dev/null 2>&1 || { echo "  $label: precomp failed"; return; }
-        pc_ms=$(elapsed_ms "$t0")
-        t0=$EPOCHREALTIME
-        "$PRECOMP" -r -o"$rec" "$pcf" >/dev/null 2>&1 || { echo "  $label: precomp -r failed"; return; }
-        rec_ms=$(elapsed_ms "$t0")
-        cmp -s "$SRC" "$rec" && PC_RT=OK || PC_RT=FAIL
-        local SZ ORIG XZ ZX
+        local t0 pc_ms rec_ms PC_RT SZ c
+        if c=$(cache_get "$SRC" precomp); then
+            set -- $c; SZ=$1; PC_RT=$2; pc_ms=$3; rec_ms=$4
+        else
+            rm -f "$pcf" "$rec"
+            t0=$EPOCHREALTIME
+            "$PRECOMP" -o"$pcf" "$SRC" >/dev/null 2>&1 || { echo "  $label: precomp failed"; return; }
+            pc_ms=$(elapsed_ms "$t0")
+            t0=$EPOCHREALTIME
+            "$PRECOMP" -r -o"$rec" "$pcf" >/dev/null 2>&1 || { echo "  $label: precomp -r failed"; return; }
+            rec_ms=$(elapsed_ms "$t0")
+            cmp -s "$SRC" "$rec" && PC_RT=OK || PC_RT=FAIL
+            SZ=$(stat -c%s "$pcf")
+            cache_put "$SRC" precomp "$SZ $PC_RT $pc_ms $rec_ms"
+            rm -f "$pcf" "$rec"
+        fi
+        local ORIG XZ ZX
         ORIG=$(stat -c%s "$SRC")
-        SZ=$(stat -c%s "$pcf")
         ZX=$(stat -c%s "tests/baseline/$base.zxle" 2>/dev/null || echo 0)
-        XZ=$(xz -9e -c "$SRC" 2>/dev/null | wc -c)
+        XZ=$(xz9e_size "$SRC")
         printf "  %s (%s):\n" "$label" "$base"
         printf "    orig=%d  zxle=%d  precomp=%d  xz-9e=%d  rt=%s\n" "$ORIG" "$ZX" "$SZ" "$XZ" "$PC_RT"
         if [ "$ZX" -gt 0 ]; then
@@ -267,8 +324,8 @@ if [ -n "$PRECOMP" ]; then
                 "$(awk -v a="$SZ" -v b="$XZ" 'BEGIN{printf "%+.2f%%", (a-b)*100/b}')" \
                 "$pc_ms" "$rec_ms"
         fi
-        rm -f "$pcf" "$rec"
     }
+    ver_stamp precomp "$("$PRECOMP" 2>&1 | head -1 | tr -d '\r')"
     # Headline-positive zxle fixtures: shapes where we beat xz-9e via unwrap.
     # Limited set chosen to span format families without bloating bench time.
     bench_precomp "ZIP unwrap"            tests/corpus/pe-deflate.zip
@@ -300,23 +357,29 @@ if [ -n "$ZPAQ" ]; then
         local base; base=$(basename "$SRC")
         local arc="tests/baseline/$base.zpaq"
         local recdir="tests/unpacked/$base.zpaq.d"
-        rm -f "$arc"; rm -rf "$recdir"; mkdir -p "$recdir"
-        local t0 zp_ms ext_ms ZP_RT
-        t0=$EPOCHREALTIME
-        "$ZPAQ" a "$arc" "$SRC" -m5 >/dev/null 2>&1 || { echo "  $label: zpaq a failed"; return 0; }
-        zp_ms=$(elapsed_ms "$t0")
-        t0=$EPOCHREALTIME
-        "$ZPAQ" x "$arc" -to "$recdir/" >/dev/null 2>&1 || { echo "  $label: zpaq x failed"; return 0; }
-        ext_ms=$(elapsed_ms "$t0")
-        # zpaq preserves the full input path inside the archive, so extract
-        # places the file at recdir/<original-path>. find the lone file.
-        local extracted; extracted=$(find "$recdir" -type f 2>/dev/null | head -1)
-        cmp -s "$SRC" "$extracted" && ZP_RT=OK || ZP_RT=FAIL
-        local SZ ORIG XZ ZX
+        local t0 zp_ms ext_ms ZP_RT SZ c
+        if c=$(cache_get "$SRC" zpaq); then
+            set -- $c; SZ=$1; ZP_RT=$2; zp_ms=$3; ext_ms=$4
+        else
+            rm -f "$arc"; rm -rf "$recdir"; mkdir -p "$recdir"
+            t0=$EPOCHREALTIME
+            "$ZPAQ" a "$arc" "$SRC" -m5 >/dev/null 2>&1 || { echo "  $label: zpaq a failed"; return 0; }
+            zp_ms=$(elapsed_ms "$t0")
+            t0=$EPOCHREALTIME
+            "$ZPAQ" x "$arc" -to "$recdir/" >/dev/null 2>&1 || { echo "  $label: zpaq x failed"; return 0; }
+            ext_ms=$(elapsed_ms "$t0")
+            # zpaq preserves the full input path inside the archive, so extract
+            # places the file at recdir/<original-path>. find the lone file.
+            local extracted; extracted=$(find "$recdir" -type f 2>/dev/null | head -1)
+            cmp -s "$SRC" "$extracted" && ZP_RT=OK || ZP_RT=FAIL
+            SZ=$(stat -c%s "$arc")
+            cache_put "$SRC" zpaq "$SZ $ZP_RT $zp_ms $ext_ms"
+            rm -f "$arc"; rm -rf "$recdir"
+        fi
+        local ORIG XZ ZX
         ORIG=$(stat -c%s "$SRC")
-        SZ=$(stat -c%s "$arc")
         ZX=$(stat -c%s "tests/baseline/$base.zxle" 2>/dev/null || echo 0)
-        XZ=$(xz -9e -c "$SRC" 2>/dev/null | wc -c)
+        XZ=$(xz9e_size "$SRC")
         printf "  %s (%s):\n" "$label" "$base"
         printf "    orig=%d  zxle=%d  zpaq-m5=%d  xz-9e=%d  rt=%s\n" "$ORIG" "$ZX" "$SZ" "$XZ" "$ZP_RT"
         if [ "$ZX" -gt 0 ]; then
@@ -325,8 +388,8 @@ if [ -n "$ZPAQ" ]; then
                 "$(awk -v a="$SZ" -v b="$XZ" 'BEGIN{printf "%+.2f%%", (a-b)*100/b}')" \
                 "$zp_ms" "$ext_ms"
         fi
-        rm -f "$arc"; rm -rf "$recdir"
     }
+    ver_stamp zpaq "$("$ZPAQ" 2>&1 | head -1 | tr -d '\r')"
     bench_zpaq "ZIP unwrap"            tests/corpus/pe-deflate.zip
     bench_zpaq "ZIP/L6 (preflate)"     tests/corpus/pe-deflate-l6.zip
     bench_zpaq "DOCX (real ZIP/L6)"    tests/corpus/sample.docx
@@ -359,21 +422,27 @@ if [ -n "$SEVENZ" ]; then
         local base; base=$(basename "$SRC")
         local arc="tests/baseline/$base.7z"
         local recdir="tests/unpacked/$base.7z.d"
-        rm -f "$arc"; rm -rf "$recdir"; mkdir -p "$recdir"
-        local t0 sz_ms ext_ms SZ_RT
-        t0=$EPOCHREALTIME
-        "$SEVENZ" a -t7z -mx=9 -ms=on "$arc" "$SRC" >/dev/null 2>&1 || { echo "  $label: 7z a failed"; return 0; }
-        sz_ms=$(elapsed_ms "$t0")
-        t0=$EPOCHREALTIME
-        "$SEVENZ" x -o"$recdir" -y "$arc" >/dev/null 2>&1 || { echo "  $label: 7z x failed"; return 0; }
-        ext_ms=$(elapsed_ms "$t0")
-        local extracted; extracted=$(find "$recdir" -type f 2>/dev/null | head -1)
-        cmp -s "$SRC" "$extracted" && SZ_RT=OK || SZ_RT=FAIL
-        local SZ ORIG XZ ZX
+        local t0 sz_ms ext_ms SZ_RT SZ c
+        if c=$(cache_get "$SRC" sevenz); then
+            set -- $c; SZ=$1; SZ_RT=$2; sz_ms=$3; ext_ms=$4
+        else
+            rm -f "$arc"; rm -rf "$recdir"; mkdir -p "$recdir"
+            t0=$EPOCHREALTIME
+            "$SEVENZ" a -t7z -mx=9 -ms=on "$arc" "$SRC" >/dev/null 2>&1 || { echo "  $label: 7z a failed"; return 0; }
+            sz_ms=$(elapsed_ms "$t0")
+            t0=$EPOCHREALTIME
+            "$SEVENZ" x -o"$recdir" -y "$arc" >/dev/null 2>&1 || { echo "  $label: 7z x failed"; return 0; }
+            ext_ms=$(elapsed_ms "$t0")
+            local extracted; extracted=$(find "$recdir" -type f 2>/dev/null | head -1)
+            cmp -s "$SRC" "$extracted" && SZ_RT=OK || SZ_RT=FAIL
+            SZ=$(stat -c%s "$arc")
+            cache_put "$SRC" sevenz "$SZ $SZ_RT $sz_ms $ext_ms"
+            rm -f "$arc"; rm -rf "$recdir"
+        fi
+        local ORIG XZ ZX
         ORIG=$(stat -c%s "$SRC")
-        SZ=$(stat -c%s "$arc")
         ZX=$(stat -c%s "tests/baseline/$base.zxle" 2>/dev/null || echo 0)
-        XZ=$(xz -9e -c "$SRC" 2>/dev/null | wc -c)
+        XZ=$(xz9e_size "$SRC")
         printf "  %s (%s):\n" "$label" "$base"
         printf "    orig=%d  zxle=%d  7z-mx9=%d  xz-9e=%d  rt=%s\n" "$ORIG" "$ZX" "$SZ" "$XZ" "$SZ_RT"
         if [ "$ZX" -gt 0 ]; then
@@ -382,8 +451,8 @@ if [ -n "$SEVENZ" ]; then
                 "$(awk -v a="$SZ" -v b="$XZ" 'BEGIN{printf "%+.2f%%", (a-b)*100/b}')" \
                 "$sz_ms" "$ext_ms"
         fi
-        rm -f "$arc"; rm -rf "$recdir"
     }
+    ver_stamp sevenz "$("$SEVENZ" 2>&1 | head -2 | tr -d '\r')"
     bench_7z "ZIP unwrap"            tests/corpus/pe-deflate.zip
     bench_7z "ZIP/L6 (preflate)"     tests/corpus/pe-deflate-l6.zip
     bench_7z "DOCX (real ZIP/L6)"    tests/corpus/sample.docx
@@ -411,22 +480,28 @@ if [ -n "$PRECOMP" ]; then
         [ -f "$SRC" ] || return 0
         local base; base=$(basename "$SRC")
         local pcf="tests/baseline/$base.cn.pcf" rec="tests/unpacked/$base.pcxz.bin"
-        rm -f "$pcf" "$pcf.xz" "$rec"
-        local t0 pc_ms rec_ms PC_RT
-        t0=$EPOCHREALTIME
-        "$PRECOMP" -cn -o"$pcf" "$SRC" >/dev/null 2>&1 || { echo "  $label: precomp -cn failed"; return 0; }
-        xz -9e --threads=1 -c "$pcf" > "$pcf.xz" 2>/dev/null
-        pc_ms=$(elapsed_ms "$t0")
-        t0=$EPOCHREALTIME
-        xz -d -c "$pcf.xz" > "$pcf.rt" 2>/dev/null
-        "$PRECOMP" -r -o"$rec" "$pcf.rt" >/dev/null 2>&1 || { echo "  $label: precomp -r failed"; return 0; }
-        rec_ms=$(elapsed_ms "$t0")
-        cmp -s "$SRC" "$rec" && PC_RT=OK || PC_RT=FAIL
-        local SZ ORIG XZ ZX
+        local t0 pc_ms rec_ms PC_RT SZ c
+        if c=$(cache_get "$SRC" pcxz); then
+            set -- $c; SZ=$1; PC_RT=$2; pc_ms=$3; rec_ms=$4
+        else
+            rm -f "$pcf" "$pcf.xz" "$rec"
+            t0=$EPOCHREALTIME
+            "$PRECOMP" -cn -o"$pcf" "$SRC" >/dev/null 2>&1 || { echo "  $label: precomp -cn failed"; return 0; }
+            xz -9e --threads=1 -c "$pcf" > "$pcf.xz" 2>/dev/null
+            pc_ms=$(elapsed_ms "$t0")
+            t0=$EPOCHREALTIME
+            xz -d -c "$pcf.xz" > "$pcf.rt" 2>/dev/null
+            "$PRECOMP" -r -o"$rec" "$pcf.rt" >/dev/null 2>&1 || { echo "  $label: precomp -r failed"; return 0; }
+            rec_ms=$(elapsed_ms "$t0")
+            cmp -s "$SRC" "$rec" && PC_RT=OK || PC_RT=FAIL
+            SZ=$(stat -c%s "$pcf.xz")
+            cache_put "$SRC" pcxz "$SZ $PC_RT $pc_ms $rec_ms"
+            rm -f "$pcf" "$pcf.xz" "$pcf.rt" "$rec"
+        fi
+        local ORIG XZ ZX
         ORIG=$(stat -c%s "$SRC")
-        SZ=$(stat -c%s "$pcf.xz")
         ZX=$(stat -c%s "tests/baseline/$base.zxle" 2>/dev/null || echo 0)
-        XZ=$(xz -9e -c "$SRC" 2>/dev/null | wc -c)
+        XZ=$(xz9e_size "$SRC")
         printf "  %s (%s):\n" "$label" "$base"
         printf "    orig=%d  zxle=%d  precomp+xz=%d  xz-9e=%d  rt=%s\n" "$ORIG" "$ZX" "$SZ" "$XZ" "$PC_RT"
         if [ "$ZX" -gt 0 ]; then
@@ -435,8 +510,8 @@ if [ -n "$PRECOMP" ]; then
                 "$(awk -v a="$SZ" -v b="$XZ" 'BEGIN{printf "%+.2f%%", (a-b)*100/b}')" \
                 "$pc_ms" "$rec_ms"
         fi
-        rm -f "$pcf" "$pcf.xz" "$pcf.rt" "$rec"
     }
+    ver_stamp pcxz "$("$PRECOMP" 2>&1 | head -1 | tr -d '\r') + $(xz --version 2>/dev/null | head -1)"
     bench_precomp_xz "ZIP unwrap"            tests/corpus/pe-deflate.zip
     bench_precomp_xz "ZIP/L6 (preflate)"     tests/corpus/pe-deflate-l6.zip
     bench_precomp_xz "DOCX (real ZIP/L6)"    tests/corpus/sample.docx
