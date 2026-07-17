@@ -5,6 +5,7 @@
 #include "png.h"
 #include "jpeg.h"
 #include "pdf.h"
+#include <pthread.h>
 
 size_t find_eocd(const uint8_t *p, size_t n) {
     if (n < 22) return (size_t)-1;
@@ -100,6 +101,151 @@ int zip_parse(const uint8_t *p, size_t n,
     return 0;
 }
 
+/* M7 step 5: per-entry payload results, computed on a worker pool and
+ * spliced into the shared recipe/buckets in entry order afterwards. */
+typedef struct {
+    Buf frag;   /* recipe ops for this entry's payload */
+    Buf f0, f1; /* solid-bucket fragments */
+    int redeflated, preflated, store_orig, stored_method;
+    int jpeg_stored, png_stored, pdf_stored;
+    int bad;    /* stored entry with comp_size != raw_size (hostile) */
+} ZipEntryOut;
+
+static void zip_entry_payload(const uint8_t *p, const char *tmp_prefix,
+                              const ZipEntry *e, uint32_t idx, ZipEntryOut *o) {
+    Buf *recipe = &o->frag, *b0 = &o->f0, *b1 = &o->f1;
+    if (e->method == 0) {
+        if (e->raw_size != e->comp_size) { o->bad = 1; return; }
+        int handled = 0;
+        if (!handled && e->raw_size >= 8 &&
+            memcmp(p + e->payload_off, PNG_SIG, 8) == 0) {
+            Buf png_recipe; buf_init(&png_recipe);
+            if (pack_png(p + e->payload_off, e->raw_size, &png_recipe, b0) == 0) {
+                buf_u8(recipe, OP_PNG_STORE);
+                buf_u32(recipe, e->raw_size);
+                buf_u32(recipe, (uint32_t)png_recipe.n);
+                buf_append(recipe, png_recipe.p, png_recipe.n);
+                o->png_stored++;
+                handled = 1;
+            }
+            buf_free(&png_recipe);
+        }
+        if (!handled && e->raw_size >= 4 &&
+            p[e->payload_off]   == 0xFF &&
+            p[e->payload_off+1] == 0xD8 &&
+            p[e->payload_off+2] == 0xFF) {
+            char tp[2048];
+            snprintf(tp, sizeof(tp), "%s.zj.%u", tmp_prefix, idx);
+            Buf brn; buf_init(&brn);
+            if (try_jpeg_buf(p + e->payload_off, e->raw_size, tp, &brn) == 0) {
+                buf_u8(recipe, OP_JPEG_STORE);
+                buf_u32(recipe, e->raw_size);
+                buf_u32(recipe, (uint32_t)brn.n);
+                buf_append(recipe, brn.p, brn.n);
+                o->jpeg_stored++;
+                handled = 1;
+            }
+            buf_free(&brn);
+        }
+        if (!handled && e->raw_size >= 32 &&
+            memcmp(p + e->payload_off, "%PDF-", 5) == 0) {
+            /* Nested PDF recipe shares the generic OP vocabulary, so it
+             * rides OP_ZIP_STORE (recurse-unpack_recipe semantics). */
+            char tp[2048];
+            snprintf(tp, sizeof(tp), "%s.zpdf.%u", tmp_prefix, idx);
+            Buf pdf_recipe; buf_init(&pdf_recipe);
+            if (pack_pdf(p + e->payload_off, e->raw_size, tp, &pdf_recipe, b0, b1) == 0) {
+                buf_u8(recipe, OP_ZIP_STORE);
+                buf_u32(recipe, e->raw_size);
+                buf_u32(recipe, (uint32_t)pdf_recipe.n);
+                buf_append(recipe, pdf_recipe.p, pdf_recipe.n);
+                o->pdf_stored++;
+                handled = 1;
+            }
+            buf_free(&pdf_recipe);
+        }
+        if (!handled) {
+            uint8_t bk = bucket_for_bytes(p + e->payload_off, e->raw_size);
+            buf_u8(recipe, OP_STORE);
+            buf_u32(recipe, e->raw_size);
+            buf_u8(recipe, bk);
+            buf_append(bk == 1 ? b1 : b0, p + e->payload_off, e->raw_size);
+            o->stored_method++;
+        }
+    } else {
+        uint8_t *raw = raw_inflate(p + e->payload_off, e->comp_size, e->raw_size);
+        if (!raw) {
+            buf_u8(recipe, OP_STRUCT);
+            buf_u32(recipe, e->comp_size);
+            buf_append(recipe, p + e->payload_off, e->comp_size);
+            o->store_orig++;
+        } else {
+            uint8_t bk = bucket_for_bytes(raw, e->raw_size);
+            size_t redef_len = 0;
+            uint8_t *redef = raw_deflate_l9(raw, e->raw_size, &redef_len);
+            if (redef && redef_len == e->comp_size && memcmp(redef, p + e->payload_off, e->comp_size) == 0) {
+                buf_u8(recipe, OP_REDEFLATE);
+                buf_u32(recipe, e->raw_size);
+                buf_u8(recipe, bk);
+                buf_append(bk == 1 ? b1 : b0, raw, e->raw_size);
+                o->redeflated++;
+                free(redef);
+                free(raw);
+            } else {
+                free(redef);
+                uint8_t *unp = NULL, *diff = NULL, *rejoin = NULL;
+                size_t unp_n = 0, diff_n = 0, rejoin_n = 0;
+                int pf_ok = 0;
+                if (zxle_preflate_split(p + e->payload_off, e->comp_size,
+                                        &unp, &unp_n, &diff, &diff_n)) {
+                    if (unp_n == e->raw_size &&
+                        zxle_preflate_join(unp, unp_n, diff, diff_n,
+                                           &rejoin, &rejoin_n) &&
+                        rejoin_n == e->comp_size &&
+                        memcmp(rejoin, p + e->payload_off, e->comp_size) == 0) {
+                        buf_u8(recipe, OP_PREFLATE);
+                        buf_u32(recipe, e->raw_size);
+                        buf_u8(recipe, bk);
+                        buf_u32(recipe, (uint32_t)diff_n);
+                        buf_append(recipe, diff, diff_n);
+                        buf_append(bk == 1 ? b1 : b0, unp, e->raw_size);
+                        o->preflated++;
+                        pf_ok = 1;
+                    }
+                }
+                zxle_preflate_free(unp);
+                zxle_preflate_free(diff);
+                zxle_preflate_free(rejoin);
+                if (!pf_ok) {
+                    buf_u8(recipe, OP_STRUCT);
+                    buf_u32(recipe, e->comp_size);
+                    buf_append(recipe, p + e->payload_off, e->comp_size);
+                    o->store_orig++;
+                }
+                free(raw);
+            }
+        }
+    }
+}
+
+typedef struct {
+    const uint8_t *p;
+    const char *tmp_prefix;
+    const ZipEntry *ents;
+    uint32_t count;
+    ZipEntryOut *outs;
+    long next;
+} ZipPool;
+
+static void *zip_pool_worker(void *arg) {
+    ZipPool *pl = (ZipPool *)arg;
+    for (;;) {
+        long i = __atomic_fetch_add(&pl->next, 1, __ATOMIC_SEQ_CST);
+        if (i >= (long)pl->count) return NULL;
+        zip_entry_payload(pl->p, pl->tmp_prefix, &pl->ents[i], (uint32_t)i, &pl->outs[i]);
+    }
+}
+
 int pack_zip(const uint8_t *p, size_t n, const char *tmp_prefix,
              Buf *recipe, Buf *b0, Buf *b1) {
     ZipEntry *ents = NULL;
@@ -107,141 +253,67 @@ int pack_zip(const uint8_t *p, size_t n, const char *tmp_prefix,
     size_t cd_off = 0, cd_len = 0, eocd_off = 0, eocd_len = 0;
     if (zip_parse(p, n, &ents, &count, &cd_off, &cd_len, &eocd_off, &eocd_len) != 0) return -1;
 
-    /* Callers share b0/b1; a mid-walk failure must not leave orphan bytes
-     * that would desync every later op's solid position. */
-    size_t b0n = b0->n, b1n = b1->n;
+    /* Entry payloads are independent; run them on a pool, then splice in
+     * entry order so output is byte-identical to the serial walk. Shared
+     * recipe/b0/b1 are untouched until every entry has succeeded -- which is
+     * also what keeps hostile mid-walk failures from orphaning solid bytes. */
+    ZipEntryOut *outs = calloc(count ? count : 1, sizeof(ZipEntryOut));
+    if (!outs) { free(ents); return -1; }
+    for (uint32_t i = 0; i < count; i++) {
+        buf_init(&outs[i].frag); buf_init(&outs[i].f0); buf_init(&outs[i].f1);
+    }
+    ZipPool pl = { p, tmp_prefix, ents, count, outs, 0 };
+    int nth = zxle_ncpus();
+    if (nth > (int)count) nth = (int)count;
+    if (nth > 64) nth = 64;
+    if (nth > 1) {
+        pthread_t th[64];
+        for (int t = 0; t < nth; t++) pthread_create(&th[t], NULL, zip_pool_worker, &pl);
+        for (int t = 0; t < nth; t++) pthread_join(th[t], NULL);
+    } else {
+        zip_pool_worker(&pl);
+    }
+
+    int bad = 0;
+    for (uint32_t i = 0; i < count; i++) if (outs[i].bad) bad = 1;
+
     size_t cursor = 0;
     int redeflated = 0, preflated = 0, store_orig = 0, stored_method = 0, jpeg_stored = 0, png_stored = 0, pdf_stored = 0;
 
-    for (uint32_t i = 0; i < count; i++) {
-        ZipEntry *e = &ents[i];
-        if (e->lfh_off > cursor) {
-            buf_u8(recipe, OP_STRUCT);
-            buf_u32(recipe, (uint32_t)(e->lfh_off - cursor));
-            buf_append(recipe, p + cursor, e->lfh_off - cursor);
-        }
-        size_t lfh_size = e->payload_off - e->lfh_off;
-        buf_u8(recipe, OP_STRUCT);
-        buf_u32(recipe, (uint32_t)lfh_size);
-        buf_append(recipe, p + e->lfh_off, lfh_size);
-
-        if (e->method == 0) {
-            if (e->raw_size != e->comp_size) {
-                b0->n = b0n; b1->n = b1n;
-                free(ents); return -1;
-            }
-            int handled = 0;
-            if (!handled && e->raw_size >= 8 &&
-                memcmp(p + e->payload_off, PNG_SIG, 8) == 0) {
-                Buf png_recipe; buf_init(&png_recipe);
-                if (pack_png(p + e->payload_off, e->raw_size, &png_recipe, b0) == 0) {
-                    buf_u8(recipe, OP_PNG_STORE);
-                    buf_u32(recipe, e->raw_size);
-                    buf_u32(recipe, (uint32_t)png_recipe.n);
-                    buf_append(recipe, png_recipe.p, png_recipe.n);
-                    png_stored++;
-                    handled = 1;
-                }
-                buf_free(&png_recipe);
-            }
-            if (!handled && e->raw_size >= 4 &&
-                p[e->payload_off]   == 0xFF &&
-                p[e->payload_off+1] == 0xD8 &&
-                p[e->payload_off+2] == 0xFF) {
-                char tp[2048];
-                snprintf(tp, sizeof(tp), "%s.zj.%u", tmp_prefix, i);
-                Buf brn; buf_init(&brn);
-                if (try_jpeg_buf(p + e->payload_off, e->raw_size, tp, &brn) == 0) {
-                    buf_u8(recipe, OP_JPEG_STORE);
-                    buf_u32(recipe, e->raw_size);
-                    buf_u32(recipe, (uint32_t)brn.n);
-                    buf_append(recipe, brn.p, brn.n);
-                    jpeg_stored++;
-                    handled = 1;
-                }
-                buf_free(&brn);
-            }
-            if (!handled && e->raw_size >= 32 &&
-                memcmp(p + e->payload_off, "%PDF-", 5) == 0) {
-                /* Nested PDF recipe shares the generic OP vocabulary, so it
-                 * rides OP_ZIP_STORE (recurse-unpack_recipe semantics). */
-                char tp[2048];
-                snprintf(tp, sizeof(tp), "%s.zpdf.%u", tmp_prefix, i);
-                Buf pdf_recipe; buf_init(&pdf_recipe);
-                if (pack_pdf(p + e->payload_off, e->raw_size, tp, &pdf_recipe, b0, b1) == 0) {
-                    buf_u8(recipe, OP_ZIP_STORE);
-                    buf_u32(recipe, e->raw_size);
-                    buf_u32(recipe, (uint32_t)pdf_recipe.n);
-                    buf_append(recipe, pdf_recipe.p, pdf_recipe.n);
-                    pdf_stored++;
-                    handled = 1;
-                }
-                buf_free(&pdf_recipe);
-            }
-            if (!handled) {
-                uint8_t bk = bucket_for_bytes(p + e->payload_off, e->raw_size);
-                buf_u8(recipe, OP_STORE);
-                buf_u32(recipe, e->raw_size);
-                buf_u8(recipe, bk);
-                buf_append(bk == 1 ? b1 : b0, p + e->payload_off, e->raw_size);
-                stored_method++;
-            }
-        } else {
-            uint8_t *raw = raw_inflate(p + e->payload_off, e->comp_size, e->raw_size);
-            if (!raw) {
+    if (!bad) {
+        for (uint32_t i = 0; i < count; i++) {
+            ZipEntry *e = &ents[i];
+            if (e->lfh_off > cursor) {
                 buf_u8(recipe, OP_STRUCT);
-                buf_u32(recipe, e->comp_size);
-                buf_append(recipe, p + e->payload_off, e->comp_size);
-                store_orig++;
-            } else {
-                uint8_t bk = bucket_for_bytes(raw, e->raw_size);
-                size_t redef_len = 0;
-                uint8_t *redef = raw_deflate_l9(raw, e->raw_size, &redef_len);
-                if (redef && redef_len == e->comp_size && memcmp(redef, p + e->payload_off, e->comp_size) == 0) {
-                    buf_u8(recipe, OP_REDEFLATE);
-                    buf_u32(recipe, e->raw_size);
-                    buf_u8(recipe, bk);
-                    buf_append(bk == 1 ? b1 : b0, raw, e->raw_size);
-                    redeflated++;
-                    free(redef);
-                    free(raw);
-                } else {
-                    free(redef);
-                    uint8_t *unp = NULL, *diff = NULL, *rejoin = NULL;
-                    size_t unp_n = 0, diff_n = 0, rejoin_n = 0;
-                    int pf_ok = 0;
-                    if (zxle_preflate_split(p + e->payload_off, e->comp_size,
-                                            &unp, &unp_n, &diff, &diff_n)) {
-                        if (unp_n == e->raw_size &&
-                            zxle_preflate_join(unp, unp_n, diff, diff_n,
-                                               &rejoin, &rejoin_n) &&
-                            rejoin_n == e->comp_size &&
-                            memcmp(rejoin, p + e->payload_off, e->comp_size) == 0) {
-                            buf_u8(recipe, OP_PREFLATE);
-                            buf_u32(recipe, e->raw_size);
-                            buf_u8(recipe, bk);
-                            buf_u32(recipe, (uint32_t)diff_n);
-                            buf_append(recipe, diff, diff_n);
-                            buf_append(bk == 1 ? b1 : b0, unp, e->raw_size);
-                            preflated++;
-                            pf_ok = 1;
-                        }
-                    }
-                    zxle_preflate_free(unp);
-                    zxle_preflate_free(diff);
-                    zxle_preflate_free(rejoin);
-                    if (!pf_ok) {
-                        buf_u8(recipe, OP_STRUCT);
-                        buf_u32(recipe, e->comp_size);
-                        buf_append(recipe, p + e->payload_off, e->comp_size);
-                        store_orig++;
-                    }
-                    free(raw);
-                }
+                buf_u32(recipe, (uint32_t)(e->lfh_off - cursor));
+                buf_append(recipe, p + cursor, e->lfh_off - cursor);
             }
+            size_t lfh_size = e->payload_off - e->lfh_off;
+            buf_u8(recipe, OP_STRUCT);
+            buf_u32(recipe, (uint32_t)lfh_size);
+            buf_append(recipe, p + e->lfh_off, lfh_size);
+
+            buf_append(recipe, outs[i].frag.p, outs[i].frag.n);
+            buf_append(b0, outs[i].f0.p, outs[i].f0.n);
+            buf_append(b1, outs[i].f1.p, outs[i].f1.n);
+
+            redeflated    += outs[i].redeflated;
+            preflated     += outs[i].preflated;
+            store_orig    += outs[i].store_orig;
+            stored_method += outs[i].stored_method;
+            jpeg_stored   += outs[i].jpeg_stored;
+            png_stored    += outs[i].png_stored;
+            pdf_stored    += outs[i].pdf_stored;
+            cursor = e->payload_off + e->comp_size;
         }
-        cursor = e->payload_off + e->comp_size;
     }
+
+    for (uint32_t i = 0; i < count; i++) {
+        buf_free(&outs[i].frag); buf_free(&outs[i].f0); buf_free(&outs[i].f1);
+    }
+    free(outs);
+    free(ents);
+    if (bad) return -1;
 
     if (cursor < n) {
         buf_u8(recipe, OP_STRUCT);
@@ -251,7 +323,5 @@ int pack_zip(const uint8_t *p, size_t n, const char *tmp_prefix,
 
     fprintf(stderr, "    zip: %u entries (%d redeflate, %d preflate, %d store-orig, %d stored, %d jpeg-store, %d png-store, %d pdf-store)\n",
             count, redeflated, preflated, store_orig, stored_method, jpeg_stored, png_stored, pdf_stored);
-
-    free(ents);
     return 0;
 }
