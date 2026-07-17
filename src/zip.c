@@ -4,6 +4,7 @@
 #include "preflate_shim.h"
 #include "png.h"
 #include "jpeg.h"
+#include "pdf.h"
 
 size_t find_eocd(const uint8_t *p, size_t n) {
     if (n < 22) return (size_t)-1;
@@ -107,7 +108,7 @@ int pack_zip(const uint8_t *p, size_t n, const char *tmp_prefix,
     if (zip_parse(p, n, &ents, &count, &cd_off, &cd_len, &eocd_off, &eocd_len) != 0) return -1;
 
     size_t cursor = 0;
-    int redeflated = 0, preflated = 0, store_orig = 0, stored_method = 0, jpeg_stored = 0, png_stored = 0;
+    int redeflated = 0, preflated = 0, store_orig = 0, stored_method = 0, jpeg_stored = 0, png_stored = 0, pdf_stored = 0;
 
     for (uint32_t i = 0; i < count; i++) {
         ZipEntry *e = &ents[i];
@@ -153,6 +154,23 @@ int pack_zip(const uint8_t *p, size_t n, const char *tmp_prefix,
                     handled = 1;
                 }
                 buf_free(&brn);
+            }
+            if (!handled && e->raw_size >= 32 &&
+                memcmp(p + e->payload_off, "%PDF-", 5) == 0) {
+                /* Nested PDF recipe shares the generic OP vocabulary, so it
+                 * rides OP_ZIP_STORE (recurse-unpack_recipe semantics). */
+                char tp[2048];
+                snprintf(tp, sizeof(tp), "%s.zpdf.%u", tmp_prefix, i);
+                Buf pdf_recipe; buf_init(&pdf_recipe);
+                if (pack_pdf(p + e->payload_off, e->raw_size, tp, &pdf_recipe, b0, b1) == 0) {
+                    buf_u8(recipe, OP_ZIP_STORE);
+                    buf_u32(recipe, e->raw_size);
+                    buf_u32(recipe, (uint32_t)pdf_recipe.n);
+                    buf_append(recipe, pdf_recipe.p, pdf_recipe.n);
+                    pdf_stored++;
+                    handled = 1;
+                }
+                buf_free(&pdf_recipe);
             }
             if (!handled) {
                 uint8_t bk = bucket_for_bytes(p + e->payload_off, e->raw_size);
@@ -225,8 +243,8 @@ int pack_zip(const uint8_t *p, size_t n, const char *tmp_prefix,
         buf_append(recipe, p + cursor, n - cursor);
     }
 
-    fprintf(stderr, "    zip: %u entries (%d redeflate, %d preflate, %d store-orig, %d stored, %d jpeg-store, %d png-store)\n",
-            count, redeflated, preflated, store_orig, stored_method, jpeg_stored, png_stored);
+    fprintf(stderr, "    zip: %u entries (%d redeflate, %d preflate, %d store-orig, %d stored, %d jpeg-store, %d png-store, %d pdf-store)\n",
+            count, redeflated, preflated, store_orig, stored_method, jpeg_stored, png_stored, pdf_stored);
 
     free(ents);
     return 0;

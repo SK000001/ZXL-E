@@ -155,6 +155,7 @@ bench_zip "M2 ZIP-unwrap"       tests/corpus/pe-deflate.zip
 bench_zip "M3 preflate (L6 ZIP)" tests/corpus/pe-deflate-l6.zip
 bench_zip "M3b JPEG-in-ZIP"      tests/corpus/zip-with-jpeg.zip
 bench_zip "M3c PNG-in-ZIP"       tests/corpus/zip-with-png.zip
+bench_zip "PDF-in-ZIP (stored)"  tests/corpus/zip-with-pdf.zip
 bench_zip "DOCX (ZIP/L6 XML)"    tests/corpus/sample.docx
 bench_zip "XLSX (ZIP/L6 XML)"    tests/corpus/sample.xlsx
 bench_zip "PPTX (ZIP/L6 XML)"    tests/corpus/sample.pptx
@@ -192,6 +193,7 @@ bench_file "M3e tar (mixed)"   tests/corpus/mixed.tar
 bench_file "M3e-targz (gz of mixed.tar)" tests/corpus/mixed.tar.gz
 bench_file "M3e-tar gzip-in-tar"         tests/corpus/gz-in.tar
 bench_file "v7 zip-in-tar"               tests/corpus/zip-in.tar
+bench_file "PDF-in-tar"                  tests/corpus/pdf-in.tar
 bench_file "M3f-ar (.deb shape)"          tests/corpus/mixed.deb
 [ -f tests/corpus/real_hello.deb ] && bench_file "M3f-ar real .deb (hello_2.10-3)" tests/corpus/real_hello.deb
 [ -f tests/corpus/real_coreutils.deb ] && bench_file "M3h real .deb zst (coreutils 9.5)" tests/corpus/real_coreutils.deb
@@ -392,6 +394,8 @@ if [ -n "$SEVENZ" ]; then
     bench_7z "PNG (IDAT zlib-L9)"    "$CORPUS/test.png"
     bench_7z "MP3 (packMP3)"         tests/corpus/synth.mp3
     bench_7z "PDF (KIND_PDF)"        "$CORPUS/test.pdf"
+    bench_7z "PDF-in-tar"            tests/corpus/pdf-in.tar
+    bench_7z "PDF-in-ZIP (stored)"   tests/corpus/zip-with-pdf.zip
 fi
 
 # Competitor combo: precomp -cn + xz -9e. Standalone precomp understates the
@@ -443,6 +447,8 @@ if [ -n "$PRECOMP" ]; then
     bench_precomp_xz "PNG (IDAT zlib-L9)"    "$CORPUS/test.png"
     bench_precomp_xz "MP3 (packMP3)"         tests/corpus/synth.mp3
     bench_precomp_xz "PDF (KIND_PDF)"        "$CORPUS/test.pdf"
+    bench_precomp_xz "PDF-in-tar"            tests/corpus/pdf-in.tar
+    bench_precomp_xz "PDF-in-ZIP (stored)"   tests/corpus/zip-with-pdf.zip
 fi
 
 # ZXL-E --slow mode (zpaq -m5 final-step) on headline fixtures. Gated by

@@ -48,6 +48,11 @@
  * verify via redeflate-L9 or preflate. Recipe is a plain OP_STRUCT /
  * OP_REDEFLATE / OP_PREFLATE sequence (zlib header + adler ride as STRUCT
  * bytes) consumed by unpack_recipe -- no PDF-specific unpack code.
+ * 2026-07-17 (still v7, no layout change): PDF entries inside tar/ar and
+ * stored ZIP entries dispatch through pack_pdf; the nested PDF recipe rides
+ * OP_ZIP_STORE, whose semantics were always "reconstruct len bytes by
+ * recursing unpack_recipe on the nested recipe" -- v7 decoders since
+ * 2026-07-14 handle these archives unchanged.
  * v3..v7 cannot interoperate. */
 #define ZXLE_VER 7
 
@@ -90,9 +95,10 @@
  *   0x07 BZ2_STORE  -- (u32 bz2_recipe_len)(bz2_recipe_bytes); call unpack_bz2.
  *   0x08 XZ_STORE   -- (u32 xz_recipe_len)(xz_recipe_bytes); call unpack_xz.
  *   0x09 ZSTD_STORE -- (u32 zst_recipe_len)(zst_recipe_bytes); call unpack_zst.
- *   0x0A ZIP_STORE  -- (u32 zip_recipe_len)(zip_recipe_bytes); the nested ZIP
- *                      recipe uses this same OP vocabulary; unpack_recipe
- *                      recurses to reconstruct `len` ZIP bytes in place.
+ *   0x0A ZIP_STORE  -- (u32 recipe_len)(recipe_bytes); the nested recipe
+ *                      (from pack_zip, or pack_pdf since 2026-07-17) uses
+ *                      this same OP vocabulary; unpack_recipe recurses to
+ *                      reconstruct `len` bytes in place.
  */
 #define OP_STRUCT     0x00
 #define OP_REDEFLATE  0x01

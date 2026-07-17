@@ -213,6 +213,38 @@ if want zip-in.tar; then
     fi
 fi
 
+# pdf-in.tar — tar containing a PDF (test.pdf) + a plain DLL. Tests pack_pdf
+# dispatch inside pack_tar (nested PDF recipe rides OP_ZIP_STORE, 2026-07-17).
+if want pdf-in.tar; then
+    CORPUS="${ZXLE_CORPUS:-../../../Zxl/tests}"
+    if [ -f "$CORPUS/test.pdf" ] && [ -f "$CORPUS/kernel32.dll" ]; then
+        TMP=$(mktemp -d)
+        cp "$CORPUS/test.pdf" "$CORPUS/kernel32.dll" "$TMP/"
+        (cd "$TMP" && tar cf pdf-in.tar test.pdf kernel32.dll)
+        mv "$TMP/pdf-in.tar" .
+        rm -rf "$TMP"
+    else
+        echo "skipping pdf-in.tar -- corpus test.pdf or DLL not found"
+    fi
+fi
+
+# zip-with-pdf.zip — 1 stored PDF + 1 deflate-9 DLL. Mirrors zip-with-png.zip
+# shape; tests pack_pdf dispatch on stored ZIP entries (2026-07-17).
+if want zip-with-pdf.zip; then
+    CORPUS="${ZXLE_CORPUS:-../../../Zxl/tests}"
+    if [ -f "$CORPUS/test.pdf" ] && [ -f "$CORPUS/kernel32.dll" ]; then
+        python - "$CORPUS" <<'PY'
+import sys, zipfile
+c = sys.argv[1]
+with zipfile.ZipFile('zip-with-pdf.zip', 'w') as z:
+    z.write(f'{c}/test.pdf', 'test.pdf', compress_type=zipfile.ZIP_STORED)
+    z.write(f'{c}/kernel32.dll', 'kernel32.dll', compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)
+PY
+    else
+        echo "skipping zip-with-pdf.zip -- corpus test.pdf or DLL not found"
+    fi
+fi
+
 # gz-in.tar — tar containing a .gz file + a plain DLL. Tests OP_GZIP_STORE
 # routing inside pack_tar.
 if want gz-in.tar; then
