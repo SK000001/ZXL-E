@@ -4,9 +4,9 @@ Recursive format-aware transform pipeline for general-purpose compression.
 
 Goal: be the smallest archive across **every** file type, not just one. Sister project to [ZXL](../Zxl) (which targets PE binaries specifically). ZXL-E uses ZXL as one of its backends when it detects PE streams.
 
-## Status (2026-07-17, M3l PDF-in-container shipped — clean competitor sweep holds)
+## Status (2026-07-17b — M3l PDF-in-container, M3m opaque flate scan, hostile-input hardening, CI, M7 step 5)
 
-Default mode (xz-9e final-step + BCJ-x86 sub-stream for x86/x64 PE/ELF content) ties or beats xz-9e on the standard Silesia corpus and beats it by 5–82% on container-shaped artifacts — now including **PDFs** (FlateDecode scanner: −74% on the corpus PDF, −48% on a real arXiv paper), both standalone and **inside tar/ar/ZIP containers** (−24% to −34% on the PDF-in-container fixtures, −48% on an arXiv paper in a tar). Optional `--slow` mode (zpaq -m5 final-step) matches the SOTA general-purpose codec on Silesia (ratio 0.1891) and stacks the gain on top of container unwrap. Optional `--fast` mode (xz -T0 with input-scaled blocks) gives **5.4–12× pack speedup** at +0.6% (1 GB) to +2.1% (211 MB) size cost. Measured up to 1 GB (`ZXLE_GIANT=1`). The v7 wire format compresses the manifest — merged into the solid stream when that wins — and crc32-verifies every entry at unpack. **No benched competitor produces a smaller archive than zxle on any bench fixture**: 7-Zip `-mx=9 -ms=on` loses by 15–285%; `precomp -cn | xz -9e` loses on all 11 shared fixtures. An adversarial bench also confirmed pax tars and per-entry-ZIP64 files unwrap today, and that encrypted PDFs are uncrackable for every tool (ciphertext streams). Remaining gaps: unmeasured competitors (freearc, kanzi, xtool-class) and zpaq-class density on long text — see roadmap.
+Default mode (xz-9e final-step + BCJ-x86 sub-stream for x86/x64 PE/ELF content) ties or beats xz-9e on the standard Silesia corpus and beats it by 5–82% on container-shaped artifacts — now including **PDFs** (FlateDecode scanner: −74% on the corpus PDF, −48% on a real arXiv paper), both standalone and **inside tar/ar/ZIP containers** (−24% to −34% on the PDF-in-container fixtures, −48% on an arXiv paper in a tar) — and the same scanner now sweeps **any opaque non-PE file** for embedded zlib streams (−40% on the asset-pack fixture). pack_zip's entry loop is parallel as of M7 step 5 (pe-deflate-l6 pack −36%), hostile malformed containers can no longer corrupt the solid stream (tests/hostile.sh), and a GitHub Actions workflow builds and benches the self-contained subset on Linux. Optional `--slow` mode (zpaq -m5 final-step) matches the SOTA general-purpose codec on Silesia (ratio 0.1891) and stacks the gain on top of container unwrap. Optional `--fast` mode (xz -T0 with input-scaled blocks) gives **5.4–12× pack speedup** at +0.6% (1 GB) to +2.1% (211 MB) size cost. Measured up to 1 GB (`ZXLE_GIANT=1`). The v7 wire format compresses the manifest — merged into the solid stream when that wins — and crc32-verifies every entry at unpack. **No benched competitor produces a smaller archive than zxle on any bench fixture**: 7-Zip `-mx=9 -ms=on` loses by 15–285%; `precomp -cn | xz -9e` loses on all 11 shared fixtures. An adversarial bench also confirmed pax tars and per-entry-ZIP64 files unwrap today, and that encrypted PDFs are uncrackable for every tool (ciphertext streams). Remaining gaps: unmeasured competitors (freearc, kanzi, xtool-class) and zpaq-class density on long text — see roadmap.
 
 | Stage | Status |
 |---|---|
@@ -52,6 +52,10 @@ Default mode (xz-9e final-step + BCJ-x86 sub-stream for x86/x64 PE/ELF content) 
 | **Merged-manifest layout + small-input layout race** | **shipped** — manifest rides in bucket 0's xz stream when that wins; sample.jar 2,804 beats precomp+xz 3,012; zxle now beats precomp\|xz on all 10 combo fixtures |
 | **M3k KIND_PDF (FlateDecode scanner)** | **shipped** — zlib-scan + redeflate/preflate verify + embedded-JPEG race; test.pdf −74.0%, real arxiv.pdf −48.2% vs xz-9e, both beat precomp\|xz; corpus headline per-file 0.3383 → 0.3232 |
 | **M3l PDF-in-container** | **shipped** — pack_pdf dispatch in tar/ar walkers + stored ZIP entries, nested recipe rides OP_ZIP_STORE (no format bump); pdf-in.tar −24.3%, zip-with-pdf.zip −34.0% vs xz-9e, both beat precomp\|xz and 7z |
+| **M3m generic opaque flate scan** | **shipped** — M3k scanner runs on bucket-0 opaque files (5% coverage gate, PE/ELF excluded to keep BCJ); flate-blob.bin −40.45% vs xz-9e; scan cost <1% of pack (130–930 MB/s) |
+| **Hostile-input bucket rollback** | **shipped** — mid-walk pack_zip/tar/ar failures no longer orphan solid bytes (crafted-ZIP repro: pre-fix RT FAIL → post-fix OK); guarded by tests/hostile.sh |
+| **GitHub Actions CI** | **shipped** — ubuntu build + self-contained fixtures + hostile.sh + bench gate; forced Linux portability fixes in preflate-deps and make_fixtures.sh; workflow unverified until first push |
+| **M7 step 5: pack_zip entry-loop worker pool** | **shipped** — per-entry fragments spliced in order, output byte-identical; pe-deflate-l6 pack −36%, pptx −38%; tar/ar loops still serial |
 
 ## Headline numbers (2026-07-17, ZXLE_VER 7)
 
@@ -85,6 +89,7 @@ Default mode (xz-9e final-step + BCJ-x86 sub-stream for x86/x64 PE/ELF content) 
 | zip-in.tar (OP_ZIP_STORE) | — | **−5.69%** | — |
 | pdf-in.tar (M3l) | — | **−24.29%** | — |
 | zip-with-pdf.zip (M3l) | — | **−34.04%** | — |
+| flate-blob.bin (M3m opaque flate scan) | — | **−40.45%** | — |
 | sample.jar | — | **−81.78%** (2,804 B) | −81.78% (--slow tier picks default) |
 
 (--slow percentages are from the 2026-05-14 measurement on the v6 format; v7 shifts them slightly in zxle's favor.)

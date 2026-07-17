@@ -6,6 +6,17 @@ Historical record of shipped milestones, completed bench measurements, current-s
 
 ## Current-state log (most recent first)
 
+## Current state (2026-07-17b, four ships: bucket rollback, M3m opaque flate scan, CI, M7 step 5 zip pool)
+
+Four ships in one session after M3l:
+
+1. **Bucket rollback on mid-walk pack failure (hardening).** pack_zip/tar/ar could fail partway through their entry walk (hostile size fields / corrupt headers) after earlier entries had appended to the shared solid buckets; no caller rolled back, so the fallback pack shipped orphaned bytes and the archive failed crc at unpack. Reproduced with a crafted 2-entry ZIP (pre-fix RT FAIL, post-fix RT OK). All three walkers now snapshot/restore b0/b1 at failure exits; gz/bz2/xz/zst were already safe (local-buf splice), png/pdf fail only before appending. New `tests/hostile.sh` keeps four hostile shapes covered.
+2. **M3m generic opaque flate scan** — details below. flate-blob.bin −40.45% vs xz-9e.
+3. **GitHub Actions CI** (`.github/workflows/ci.yml`): ubuntu build of libpreflate + zxle, self-contained fixtures (docx/xlsx/pptx/jar/flate-blob), hostile.sh, bench gated on no rt=FAIL. Portability fixes it forced: preflate-deps no longer hardcodes MinGW cmake generator/mingw32-make (OS-conditional, `cmake --build`); make_fixtures.sh no longer dies under `set -e` when ffmpeg is absent. **Workflow unverified until the repo is pushed.**
+4. **M7 step 5 (zip)** — pack_zip entry loop on a worker pool — details below. pe-deflate-l6 pack −36%, pptx −38%.
+
+76/76 bench RT OK throughout; every pre-existing archive byte-identical across all four ships (per-file 0.3232 / solid 0.3174 unchanged).
+
 ## Current state (2026-07-17, M3l PDF-in-container shipped)
 
 PDF entries inside containers now unwrap: `pack_pdf` dispatches per-entry in the tar/ar walkers and on stored ZIP entries. The nested PDF recipe rides the existing OP_ZIP_STORE recursion (its semantics were always "reconstruct len bytes by recursing unpack_recipe"), so there is **no wire-layout change and no version bump** — v7 decoders built since 2026-07-14 extract these archives unchanged; the decode path was untouched.
@@ -494,6 +505,17 @@ Predicted shape held: mixed-content `.tar.xz` ties xz-9e (xz already crushes mix
 ---
 
 ## Shipped milestone details
+
+### M3m — generic opaque flate scan (shipped 2026-07-17)
+- **What it does:** pack_pdf's scan core is now `pack_flate_scan(scan_from, min_cover_permille)` — scans any byte range for verified zlib streams (redeflate-L9 / preflate) and JPEGs, succeeding only when verified spans cover the permille threshold, with full b0/b1/recipe rollback otherwise. `pack_pdf` = the `(5, 0)` wrapper gated on `%PDF-` (byte-identical on all PDF fixtures). do_pack's opaque fallback runs `(0, 50)` on files headed to KIND_OPAQUE — the SWF/WOFF/PSD/save-game class. Recipes reuse KIND_PDF: identical format, no wire change, decode untouched.
+- **Probe-driven guards (scratch probe on DLL/text/media/tar corpora):** scan runs at 130–930 MB/s (<1% of xz-9e pack time); zero verified streams on DLLs/text/MP3/JPEG. Guard 1: bucket-1 (x86 PE/ELF) files skip the scan — STRUCT gap bytes can't carry a bucket byte, so scanning PEs would pull code out of the BCJ stream. Guard 2: the 5% coverage gate — silesia mozilla has 44 *real* embedded zlib streams but only 0.1% coverage; it stays opaque and byte-identical.
+- **Measured:** new fixture flate-blob.bin (synthetic asset-pack, 6 zlib streams L9+L6 in a binary shell) 79,766 vs xz-9e 133,940 (**−40.45%**), 6/6 streams verified. All pre-existing fixtures byte-identical.
+
+### M7 step 5 — worker pool over pack_zip's entry loop (shipped 2026-07-17; tar/ar pending)
+- **What it does:** per-entry payload work (inflate + redeflate/preflate verify + nested png/jpeg/pdf packs) runs on a pthread pool (min(ncpus, entries, 64), atomic next-index) into per-entry fragment bufs; pack_zip splices fragments in entry order afterwards, so output is byte-identical to the serial walk. Shared recipe/b0/b1 stay untouched until every entry succeeds — subsuming the hostile-input rollback for the zip walker.
+- **Prerequisite measured first:** libpreflate concurrency hammer (8 threads × 24 iters × 4 streams) — 0 mismatches; the shim is stateless.
+- **Measured pack-time deltas** (16 logical CPUs, whole pack incl. unchanged xz finalize): pe-deflate-l6 5,499 → 3,512 ms (**−36%**), pptx 2,308 → 1,420 (**−38%**), pe-deflate −19%, zip-with-jpeg −19%, zip-with-png −15%, jar −14%, docx −8% (one dominant entry — the per-entry pool can't help a single-entry hot spot). Output byte-identical everywhere.
+- **Remaining:** tar/ar entry loops stay serial (their entries dispatch whole nested container packs; same fragment-splice pattern applies but wants its own measurement pass).
 
 ### M3l — PDF-in-container (shipped 2026-07-17)
 - **What it does:** the tar/ar entry walkers and pack_zip's stored-entry (method 0) chain sniff `%PDF-` and recurse through `pack_pdf`, exactly the OP_ZIP_STORE pattern from v7's zip-in-tar work. The nested PDF recipe uses the same generic OP vocabulary `unpack_recipe` already walks, so it rides OP_ZIP_STORE unchanged — no new opcode, no wire-layout change, no ZXLE_VER bump, zero new unpack code. kinds.h documents the op as "nested recipe (from pack_zip or pack_pdf)".
