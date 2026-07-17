@@ -542,6 +542,180 @@ if [ -n "$PRECOMP" ]; then
     bench_precomp_xz "Docker layer (alpine)" tests/corpus/real_alpine_layer.tar.gz
 fi
 
+# Competitor: kanzi-cpp -l 9 (modern general-purpose codec; no container
+# unwrap, so this documents the unwrap wall class-by-class). make kanzi-deps.
+KANZI=""
+[ -x third_party/kanzi-cpp/build/kanzi_static.exe ] && KANZI='third_party\kanzi-cpp\build\kanzi_static.exe'
+case "$(uname -s)" in MINGW*|MSYS*) ;; *) KANZI="" ;; esac
+if [ -n "$KANZI" ]; then
+    echo
+    echo "=== Competitor: kanzi -l 9 vs zxle (size + RT) ==="
+    ver_stamp kanzi "$(cd third_party/kanzi-cpp 2>/dev/null && git describe --tags --always 2>/dev/null)"
+    bench_kanzi() {
+        local label="$1" SRC="$2"
+        [ -f "$SRC" ] || return 0
+        local base; base=$(basename "$SRC")
+        local arc="tests/baseline/$base.knz" rec="tests/unpacked/$base.knz.out"
+        local t0 kz_ms un_ms KZ_RT SZ c
+        if c=$(cache_get "$SRC" kanzi); then
+            set -- $c; SZ=$1; KZ_RT=$2; kz_ms=$3; un_ms=$4
+        else
+            rm -f "$arc" "$rec"
+            local wsrc="${SRC//\//\\}" warc="${arc//\//\\}" wrec="${rec//\//\\}"
+            t0=$EPOCHREALTIME
+            cmd //c "$KANZI -c -i $wsrc -o $warc -l 9 -j 8 -f" >/dev/null 2>&1 \
+                || { echo "  $label: kanzi -c failed"; return 0; }
+            kz_ms=$(elapsed_ms "$t0")
+            t0=$EPOCHREALTIME
+            cmd //c "$KANZI -d -i $warc -o $wrec -j 8 -f" >/dev/null 2>&1 \
+                || { echo "  $label: kanzi -d failed"; return 0; }
+            un_ms=$(elapsed_ms "$t0")
+            cmp -s "$SRC" "$rec" && KZ_RT=OK || KZ_RT=FAIL
+            SZ=$(stat -c%s "$arc")
+            cache_put "$SRC" kanzi "$SZ $KZ_RT $kz_ms $un_ms"
+            rm -f "$arc" "$rec"
+        fi
+        local ORIG XZ ZX
+        ORIG=$(stat -c%s "$SRC")
+        ZX=$(stat -c%s "tests/baseline/$base.zxle" 2>/dev/null || echo 0)
+        XZ=$(xz9e_size "$SRC")
+        printf "  %s (%s):\n" "$label" "$base"
+        printf "    orig=%d  zxle=%d  kanzi-l9=%d  xz-9e=%d  rt=%s\n" "$ORIG" "$ZX" "$SZ" "$XZ" "$KZ_RT"
+        if [ "$ZX" -gt 0 ]; then
+            printf "    kanzi vs zxle: %s   kanzi vs xz-9e: %s   perf: pack=%dms unpack=%dms\n" \
+                "$(awk -v a="$SZ" -v b="$ZX" 'BEGIN{printf "%+.2f%%", (a-b)*100/b}')" \
+                "$(awk -v a="$SZ" -v b="$XZ" 'BEGIN{printf "%+.2f%%", (a-b)*100/b}')" \
+                "$kz_ms" "$un_ms"
+        fi
+    }
+    bench_kanzi "ZIP unwrap"            tests/corpus/pe-deflate.zip
+    bench_kanzi "DOCX (real ZIP/L6)"    tests/corpus/sample.docx
+    bench_kanzi "JAR (real ZIP/L6)"     tests/corpus/sample.jar
+    bench_kanzi "gzip wrapper"          tests/corpus/ntdll.dll.gz
+    bench_kanzi "PDF (KIND_PDF)"        "$CORPUS/test.pdf"
+    bench_kanzi "Wheel pure-py (PyPI)"  tests/corpus/real_requests.whl
+    bench_kanzi "Wheel native (PyPI)"   tests/corpus/real_pydantic_core.whl
+    bench_kanzi "APK (NewPipe 0.27)"    tests/corpus/real_newpipe.apk
+    bench_kanzi "npm tarball (express)" tests/corpus/real_express.tgz
+    bench_kanzi "Docker layer (alpine)" tests/corpus/real_alpine_layer.tar.gz
+fi
+
+# Competitor combo: xtool precomp -mzlib | xz -9e (repacker-scene chain,
+# preflate-based like us). make xtool-deps. Windows-only (Delphi binary).
+XTOOL_DIR=third_party/xtool
+XTOOL_OK=0
+case "$(uname -s)" in MINGW*|MSYS*) [ -x "$XTOOL_DIR/xtool.exe" ] && XTOOL_OK=1 ;; esac
+if [ "$XTOOL_OK" = "1" ]; then
+    echo
+    echo "=== Competitor combo: xtool precomp -mzlib | xz -9e vs zxle (size + RT) ==="
+    ver_stamp xtoolxz "$(head -1 "$XTOOL_DIR/changes.txt" 2>/dev/null | tr -d '\r') + $(xz --version 2>/dev/null | head -1)"
+    bench_xtool_xz() {
+        local label="$1" SRC="$2"
+        [ -f "$SRC" ] || return 0
+        local base; base=$(basename "$SRC")
+        local t0 xt_ms rec_ms XT_RT SZ c
+        if c=$(cache_get "$SRC" xtoolxz); then
+            set -- $c; SZ=$1; XT_RT=$2; xt_ms=$3; rec_ms=$4
+        else
+            cp "$SRC" "$XTOOL_DIR/bench.in"
+            t0=$EPOCHREALTIME
+            ( cd "$XTOOL_DIR" && timeout 600 cmd //c ".\xtool.exe precomp -mzlib -c32mb -t100p-1 -bd.\_libraries bench.in bench.xtl" ) >/dev/null 2>&1 \
+                || { echo "  $label: xtool precomp failed"; rm -f "$XTOOL_DIR"/bench.*; return 0; }
+            xz -9e --threads=1 -c "$XTOOL_DIR/bench.xtl" > "$XTOOL_DIR/bench.xtl.xz" 2>/dev/null
+            xt_ms=$(elapsed_ms "$t0")
+            t0=$EPOCHREALTIME
+            xz -d -c "$XTOOL_DIR/bench.xtl.xz" > "$XTOOL_DIR/bench.rt.xtl" 2>/dev/null
+            ( cd "$XTOOL_DIR" && timeout 600 cmd //c ".\xtool.exe decode -t100p-1 -bd.\_libraries bench.rt.xtl bench.res" ) >/dev/null 2>&1 \
+                || { echo "  $label: xtool decode failed"; rm -f "$XTOOL_DIR"/bench.*; return 0; }
+            rec_ms=$(elapsed_ms "$t0")
+            cmp -s "$SRC" "$XTOOL_DIR/bench.res" && XT_RT=OK || XT_RT=FAIL
+            SZ=$(stat -c%s "$XTOOL_DIR/bench.xtl.xz")
+            cache_put "$SRC" xtoolxz "$SZ $XT_RT $xt_ms $rec_ms"
+            rm -f "$XTOOL_DIR"/bench.*
+        fi
+        local ORIG XZ ZX
+        ORIG=$(stat -c%s "$SRC")
+        ZX=$(stat -c%s "tests/baseline/$base.zxle" 2>/dev/null || echo 0)
+        XZ=$(xz9e_size "$SRC")
+        printf "  %s (%s):\n" "$label" "$base"
+        printf "    orig=%d  zxle=%d  xtool+xz=%d  xz-9e=%d  rt=%s\n" "$ORIG" "$ZX" "$SZ" "$XZ" "$XT_RT"
+        if [ "$ZX" -gt 0 ]; then
+            printf "    xtool+xz vs zxle: %s   vs xz-9e: %s   perf: pack=%dms restore=%dms\n" \
+                "$(awk -v a="$SZ" -v b="$ZX" 'BEGIN{printf "%+.2f%%", (a-b)*100/b}')" \
+                "$(awk -v a="$SZ" -v b="$XZ" 'BEGIN{printf "%+.2f%%", (a-b)*100/b}')" \
+                "$xt_ms" "$rec_ms"
+        fi
+    }
+    bench_xtool_xz "ZIP unwrap"            tests/corpus/pe-deflate.zip
+    bench_xtool_xz "ZIP/L6 (preflate)"     tests/corpus/pe-deflate-l6.zip
+    bench_xtool_xz "DOCX (real ZIP/L6)"    tests/corpus/sample.docx
+    bench_xtool_xz "JAR (real ZIP/L6)"     tests/corpus/sample.jar
+    bench_xtool_xz "gzip wrapper"          tests/corpus/ntdll.dll.gz
+    bench_xtool_xz "PDF (KIND_PDF)"        "$CORPUS/test.pdf"
+    bench_xtool_xz "Wheel pure-py (PyPI)"  tests/corpus/real_requests.whl
+    bench_xtool_xz "Wheel native (PyPI)"   tests/corpus/real_pydantic_core.whl
+    bench_xtool_xz "APK (NewPipe 0.27)"    tests/corpus/real_newpipe.apk
+    bench_xtool_xz "npm tarball (express)" tests/corpus/real_express.tgz
+    bench_xtool_xz "Docker layer (alpine)" tests/corpus/real_alpine_layer.tar.gz
+fi
+
+# Competitor: FreeArc 0.67 -mx (historical strongest general archiver;
+# bundled with the xtool release zip). Windows-only.
+FREEARC_DIR=third_party/xtool/Freearc
+FREEARC_OK=0
+case "$(uname -s)" in MINGW*|MSYS*) [ -x "$FREEARC_DIR/Arc.exe" ] && FREEARC_OK=1 ;; esac
+if [ "$FREEARC_OK" = "1" ]; then
+    echo
+    echo "=== Competitor: FreeArc 0.67 -mx vs zxle (size + RT) ==="
+    ver_stamp freearc "FreeArc 0.67 (March 15 2014)"
+    bench_freearc() {
+        local label="$1" SRC="$2"
+        [ -f "$SRC" ] || return 0
+        local base; base=$(basename "$SRC")
+        local t0 fa_ms un_ms FA_RT SZ c
+        if c=$(cache_get "$SRC" freearc); then
+            set -- $c; SZ=$1; FA_RT=$2; fa_ms=$3; un_ms=$4
+        else
+            rm -rf "$FREEARC_DIR/bench.tmp"; mkdir -p "$FREEARC_DIR/bench.tmp"
+            cp "$SRC" "$FREEARC_DIR/bench.tmp/bench.in"
+            t0=$EPOCHREALTIME
+            ( cd "$FREEARC_DIR/bench.tmp" && timeout 600 cmd //c "..\Arc.exe a -mx -w. bench.arc bench.in" ) >/dev/null 2>&1 \
+                || { echo "  $label: Arc a failed"; rm -rf "$FREEARC_DIR/bench.tmp"; return 0; }
+            fa_ms=$(elapsed_ms "$t0")
+            t0=$EPOCHREALTIME
+            ( cd "$FREEARC_DIR/bench.tmp" && rm -f bench.in && timeout 600 cmd //c "..\Arc.exe x -o+ bench.arc" ) >/dev/null 2>&1 \
+                || { echo "  $label: Arc x failed"; rm -rf "$FREEARC_DIR/bench.tmp"; return 0; }
+            un_ms=$(elapsed_ms "$t0")
+            cmp -s "$SRC" "$FREEARC_DIR/bench.tmp/bench.in" && FA_RT=OK || FA_RT=FAIL
+            SZ=$(stat -c%s "$FREEARC_DIR/bench.tmp/bench.arc")
+            cache_put "$SRC" freearc "$SZ $FA_RT $fa_ms $un_ms"
+            rm -rf "$FREEARC_DIR/bench.tmp"
+        fi
+        local ORIG XZ ZX
+        ORIG=$(stat -c%s "$SRC")
+        ZX=$(stat -c%s "tests/baseline/$base.zxle" 2>/dev/null || echo 0)
+        XZ=$(xz9e_size "$SRC")
+        printf "  %s (%s):\n" "$label" "$base"
+        printf "    orig=%d  zxle=%d  freearc-mx=%d  xz-9e=%d  rt=%s\n" "$ORIG" "$ZX" "$SZ" "$XZ" "$FA_RT"
+        if [ "$ZX" -gt 0 ]; then
+            printf "    freearc vs zxle: %s   freearc vs xz-9e: %s   perf: pack=%dms extract=%dms\n" \
+                "$(awk -v a="$SZ" -v b="$ZX" 'BEGIN{printf "%+.2f%%", (a-b)*100/b}')" \
+                "$(awk -v a="$SZ" -v b="$XZ" 'BEGIN{printf "%+.2f%%", (a-b)*100/b}')" \
+                "$fa_ms" "$un_ms"
+        fi
+    }
+    bench_freearc "ZIP unwrap"            tests/corpus/pe-deflate.zip
+    bench_freearc "DOCX (real ZIP/L6)"    tests/corpus/sample.docx
+    bench_freearc "JAR (real ZIP/L6)"     tests/corpus/sample.jar
+    bench_freearc "gzip wrapper"          tests/corpus/ntdll.dll.gz
+    bench_freearc "PDF (KIND_PDF)"        "$CORPUS/test.pdf"
+    bench_freearc "Wheel pure-py (PyPI)"  tests/corpus/real_requests.whl
+    bench_freearc "Wheel native (PyPI)"   tests/corpus/real_pydantic_core.whl
+    bench_freearc "APK (NewPipe 0.27)"    tests/corpus/real_newpipe.apk
+    bench_freearc "npm tarball (express)" tests/corpus/real_express.tgz
+    bench_freearc "Docker layer (alpine)" tests/corpus/real_alpine_layer.tar.gz
+fi
+
 # ZXL-E --slow mode (zpaq -m5 final-step) on headline fixtures. Gated by
 # ZXLE_SLOW=1 because per-fixture pack adds ~5-10x over default xz-9e, and
 # the typical bench run shouldn't double its wall time.

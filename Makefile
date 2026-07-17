@@ -129,6 +129,33 @@ SEVENZIP_DIR = third_party/7zip
 	fi
 	@echo "7zr ready at $(PWD)/$(SEVENZIP_DIR)/."
 
+KANZI_DIR = third_party/kanzi-cpp
+kanzi-deps:
+	@if [ ! -d $(KANZI_DIR) ]; then \
+	  git clone --depth 1 --branch 2.5.3 https://github.com/flanglet/kanzi-cpp.git $(KANZI_DIR); \
+	fi
+	@mkdir -p $(KANZI_DIR)/build
+	@cd $(KANZI_DIR)/build && cmake $(CMAKE_GEN) -DCMAKE_BUILD_TYPE=Release .. && cmake --build . -j 4
+	@# kanzi_static still imports the MinGW runtime DLLs; copy them next to
+	@# the exe so `cmd //c` from Git-Bash (bench harness) can load it.
+	@if [ "$(OS)" = "Windows_NT" ]; then \
+	  BIN=$$(dirname "$$(which g++)"); \
+	  for d in libgcc_s_seh-1.dll libwinpthread-1.dll libstdc++-6.dll; do \
+	    [ -f "$$BIN/$$d" ] && cp "$$BIN/$$d" $(KANZI_DIR)/build/ || true; \
+	  done; \
+	fi
+	@echo "kanzi ready under $(PWD)/$(KANZI_DIR)/build/."
+
+XTOOL_DIR = third_party/xtool
+xtool-deps:
+	@if [ ! -x $(XTOOL_DIR)/xtool.exe ]; then \
+	  mkdir -p $(XTOOL_DIR) && \
+	  curl -fsSL -o $(XTOOL_DIR)/xtool.zip https://github.com/Razor12911/xtool/releases/download/079/xtool_0.7.9_hotfix.zip && \
+	  unzip -o $(XTOOL_DIR)/xtool.zip -d $(XTOOL_DIR) >/dev/null && \
+	  rm -f $(XTOOL_DIR)/xtool.zip; \
+	fi
+	@echo "xtool ready under $(PWD)/$(XTOOL_DIR)/."
+
 PRECOMP_DIR = third_party/precomp
 
 # precomp-deps: required only for the precomp competitor section of bench.sh.
