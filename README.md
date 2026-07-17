@@ -102,6 +102,8 @@ Default mode (xz-9e final-step + BCJ-x86 sub-stream for x86/x64 PE/ELF content) 
 | silesia.tar 211 MB | 247 s | 20.6 s | **12×** | +2.10% |
 | giant 1.06 GB | 617 s | 113 s | **5.4×** | **+0.58%** |
 
+Per-fixture sweep (2026-07-17, `ZXLE_FAST=1 bash tests/bench.sh`): at container-fixture scale (≤10 MB) `--fast` costs **+8 bytes flat** (+0.00% to +0.29%) and changes pack time negligibly — buckets under the 8 MiB block clamp encode as one block either way. Its speedups begin once the solid bucket spans multiple blocks (tens of MB). Practical rule: `--fast` is always safe to use, and pays off on large inputs.
+
 ## Architecture
 
 Five-stage pipeline:

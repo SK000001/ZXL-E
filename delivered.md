@@ -6,6 +6,16 @@ Historical record of shipped milestones, completed bench measurements, current-s
 
 ## Current-state log (most recent first)
 
+## Current state (2026-07-17c, pack-speed session: M7 step 5 complete, bench cache, --fast sweep)
+
+Follow-up to 2026-07-17b, targeting "fast without losing best":
+
+- **M7 step 5 completed** — tar/ar entry pools joined zip (details in the step-5 block below). Every per-entry recompression loop is now parallel.
+- **Bench result cache** — deterministic tool work (xz/zstd baselines, competitor archives + RT) cached keyed by fixture + tool version; warm bench 292 s → **172 s**, output byte-identical, `ZXLE_FRESH=1` to force recompute. The remaining 172 s is zxle's own measured pack/unpack.
+- **`ZXLE_FAST=1` bench section + first sweep** — per-fixture `--fast` vs default: **+8 B flat** (+0.00–0.29%) at ≤10 MB fixture scale with negligible time change (single xz block either way); the 5.4–12× speedups begin when the solid bucket spans multiple blocks (tens of MB). Also measured: real_coreutils_src.tar.xz pack (~28 s) is bounded by the pack_xz wrapper-reproduce ladder (full-body re-encode per probe), not the final solid pass — `--fast` cannot touch it; a cheaper ladder or a predictor for tie-shaped xz inputs is the open lever.
+
+76/76 RT OK throughout; all archives byte-identical to 2026-07-17b.
+
 ## Current state (2026-07-17b, four ships: bucket rollback, M3m opaque flate scan, CI, M7 step 5 zip pool)
 
 Four ships in one session after M3l:
