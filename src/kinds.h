@@ -52,7 +52,10 @@
  * stored ZIP entries dispatch through pack_pdf; the nested PDF recipe rides
  * OP_ZIP_STORE, whose semantics were always "reconstruct len bytes by
  * recursing unpack_recipe on the nested recipe" -- v7 decoders since
- * 2026-07-14 handle these archives unchanged.
+ * 2026-07-14 handle these archives unchanged. KIND_PDF also tags generic
+ * flate-scanned opaque files (pack_flate_scan: any bucket-0 file whose
+ * verified zlib/JPEG spans cover >= 5%) -- identical recipe format, so
+ * decode is unchanged there too.
  * v3..v7 cannot interoperate. */
 #define ZXLE_VER 7
 

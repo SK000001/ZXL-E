@@ -65,15 +65,19 @@ static size_t jpeg_span(const uint8_t *p, size_t n) {
     return 0;
 }
 
-int pack_pdf(const uint8_t *p, size_t n, const char *tmp_prefix,
-             Buf *recipe, Buf *b0, Buf *b1) {
-    if (n < 32 || memcmp(p, "%PDF-", 5) != 0) return -1;
+int pack_flate_scan(const uint8_t *p, size_t n, const char *tmp_prefix,
+                    Buf *recipe, Buf *b0, Buf *b1,
+                    size_t scan_from, unsigned min_cover_permille) {
+    if (n < 32) return -1;
     if (n > 0xFFFFFFFFu) return -1;
 
-    size_t cursor = 0;
+    /* Appends happen as streams verify; if the coverage gate fails at the
+     * end, everything must roll back (callers share b0/b1). */
+    size_t b0n = b0->n, b1n = b1->n, rn = recipe->n;
+    size_t cursor = 0, covered = 0;
     int redeflated = 0, preflated = 0, jpegs = 0;
 
-    for (size_t i = 5; i + 12 < n; i++) {
+    for (size_t i = scan_from; i + 12 < n; i++) {
         /* Embedded JPEG (DCTDecode body): segment-walk to find the span,
          * then run the brunsli/packJPG race with round-trip verify. */
         if (p[i] == 0xFF && p[i + 1] == 0xD8 && p[i + 2] == 0xFF) {
@@ -91,6 +95,7 @@ int pack_pdf(const uint8_t *p, size_t n, const char *tmp_prefix,
                     buf_u32(recipe, (uint32_t)jb.n);
                     buf_append(recipe, jb.p, jb.n);
                     jpegs++;
+                    covered += jl;
                     cursor = i + jl;
                     i = cursor - 1;
                     buf_free(&jb);
@@ -174,13 +179,18 @@ int pack_pdf(const uint8_t *p, size_t n, const char *tmp_prefix,
         buf_u32(recipe, 4);
         buf_append(recipe, p + i + consumed - 4, 4);
 
+        covered += consumed;
         cursor = i + consumed;
         i = cursor - 1;
         free(raw);
         buf_free(&diff);
     }
 
-    if (redeflated + preflated + jpegs == 0) return -1;
+    if (redeflated + preflated + jpegs == 0 ||
+        (uint64_t)covered * 1000 < (uint64_t)n * min_cover_permille) {
+        b0->n = b0n; b1->n = b1n; recipe->n = rn;
+        return -1;
+    }
 
     if (cursor < n) {
         buf_u8(recipe, OP_STRUCT);
@@ -188,7 +198,13 @@ int pack_pdf(const uint8_t *p, size_t n, const char *tmp_prefix,
         buf_append(recipe, p + cursor, n - cursor);
     }
 
-    fprintf(stderr, "    pdf: %d streams (%d redeflate, %d preflate, %d jpeg)\n",
+    fprintf(stderr, "    flate: %d streams (%d redeflate, %d preflate, %d jpeg)\n",
             redeflated + preflated + jpegs, redeflated, preflated, jpegs);
     return 0;
+}
+
+int pack_pdf(const uint8_t *p, size_t n, const char *tmp_prefix,
+             Buf *recipe, Buf *b0, Buf *b1) {
+    if (n < 32 || memcmp(p, "%PDF-", 5) != 0) return -1;
+    return pack_flate_scan(p, n, tmp_prefix, recipe, b0, b1, 5, 0);
 }

@@ -213,6 +213,31 @@ if want zip-in.tar; then
     fi
 fi
 
+# flate-blob.bin — synthetic asset-pack: binary shell with embedded zlib
+# streams (L9 -> redeflate path, L6 -> preflate path), the SWF/WOFF/PSD/
+# save-game shape. Tests the generic opaque flate scan (2026-07-17).
+if want flate-blob.bin; then
+    python - <<'PY'
+import zlib, random, json
+random.seed(7)
+out = bytearray()
+out += b"ASSETPAK\x01\x00" + bytes(random.getrandbits(8) for _ in range(4096))
+words = "entity sprite shader mesh anim sound level trigger flag state".split()
+for i in range(6):
+    if i % 3 == 2:
+        payload = bytes(random.getrandbits(8) for _ in range(2000)) * 8
+    else:
+        doc = {f"{random.choice(words)}_{j}": {"id": j, "pos": [j * 3, j * 7, j % 5],
+               "props": [random.choice(words) for _ in range(12)]} for j in range(1200)}
+        payload = json.dumps(doc).encode()
+    level = 9 if i % 2 == 0 else 6
+    out += bytes(random.getrandbits(8) for _ in range(512))
+    out += zlib.compress(payload, level)
+out += bytes(random.getrandbits(8) for _ in range(2048))
+open("flate-blob.bin", "wb").write(bytes(out))
+PY
+fi
+
 # pdf-in.tar — tar containing a PDF (test.pdf) + a plain DLL. Tests pack_pdf
 # dispatch inside pack_tar (nested PDF recipe rides OP_ZIP_STORE, 2026-07-17).
 if want pdf-in.tar; then

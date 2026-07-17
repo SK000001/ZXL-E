@@ -246,6 +246,20 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
                 buf_init(&ents[i].recipe);
             }
         }
+        /* Last resort before opaque: generic flate scan (SWF/WOFF/PSD/
+         * save-game blobs). Bucket-1 files skip it -- STRUCT gap bytes
+         * can't carry a bucket, so scanning x86 PE/ELF would pull code
+         * bytes out of the BCJ stream. */
+        if (!force_opaque && !unwrapped && fsz >= 32 &&
+            bucket_for_bytes(fb, fsz) == 0) {
+            if (pack_flate_scan(fb, fsz, tp, &ents[i].recipe, &solid, &solid_x86, 0, 50) == 0) {
+                ents[i].kind = KIND_PDF;
+                unwrapped = 1;
+            } else {
+                buf_free(&ents[i].recipe);
+                buf_init(&ents[i].recipe);
+            }
+        }
         if (!unwrapped) {
             ents[i].kind = KIND_OPAQUE;
             ents[i].opaque_bucket = bucket_for_bytes(fb, fsz);
