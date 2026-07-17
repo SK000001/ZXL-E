@@ -6,6 +6,21 @@ Historical record of shipped milestones, completed bench measurements, current-s
 
 ## Current-state log (most recent first)
 
+## Current state (2026-07-18, Crown-A bench: real-world corpus + freearc/kanzi/xtool measured)
+
+Program step 1 (from the strategic program in roadmap.md): expanded the bench to the world's dominant archive classes and benched the three remaining serious competitors. Five real-world fixtures added (version-pinned, in `fetch_real_fixtures.sh`): PyPI wheels (requests pure-py, pydantic-core native win_amd64), express npm tarball, alpine Docker layer, NewPipe APK. Three competitors added (`make kanzi-deps` / `xtool-deps`, cached Windows-only bench sections): kanzi-cpp 2.5.3 `-l 9`, xtool 0.7.9 `precomp -mzlib | xz -9e`, FreeArc 0.67 `-mx`. razor stays unbenched (no public binary located).
+
+**Scoreboard — the good:**
+- **Real-world wins vs xz-9e:** pydantic-core wheel −28.6%, APK −22.6%, requests wheel −21.2%, express npm −10.6%. All RT OK.
+- **kanzi -l9** (strong modern raw codec, no container unwrap) loses to zxle on every fixture (+12% to +456%); ties only on the already-incompressible Docker layer. The unwrap thesis holds against a current-generation codec.
+- **FreeArc 0.67 -mx** loses to zxle everywhere — and even to xz-9e (+0.15% to +1.61%) — no deflate-reconstruction path. The "historically strongest general archiver" reputation doesn't hold on deflate-heavy container data.
+
+**Scoreboard — the losses (the point of the exercise):**
+- **xtool|xz** (the real repacker-scene peer, preflate-based like us): zxle wins containers by +2.4% to +456%, but **xtool beats zxle on three deflate-reproduction fixtures — PDF −0.98%, pure-py wheel −0.76%, APK −0.07%.** Same class as the earlier `precomp|xz` hairline losses (APK, express).
+- **Docker layer (Go-gzip) is opaque to us** — preflate cannot split Go `compress/flate` output at all (probe: split FAILED on the full 3.4 MB stream), so the layer stays KIND_OPAQUE and we tie xz-9e / lose to 7z by 0.14%.
+
+**Two concrete ratio levers surfaced, both roadmap'd:** (1) a **zlib parameter ladder** in the redeflate path — our fast-path tries only zlib L9-default before falling to a preflate diff; xtool/precomp search the zlib parameter space and find exact byte-reproductions more often (no diff → smaller). This one lever flips all three xtool losses. (2) a **Go-deflate reproducer** — flips the entire Docker-layer / Go-binary-release class from opaque to a large unwrap win. 121/122 bench RT OK (the one non-OK is precomp itself failing to precompress the Go-gzip layer — a competitor limitation, not ours).
+
 ## Current state (2026-07-17c, pack-speed session: M7 step 5 complete, bench cache, --fast sweep)
 
 Follow-up to 2026-07-17b, targeting "fast without losing best":
