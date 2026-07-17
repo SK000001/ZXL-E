@@ -54,7 +54,7 @@ Default mode (xz-9e final-step + BCJ-x86 sub-stream for x86/x64 PE/ELF content) 
 | **M3l PDF-in-container** | **shipped** — pack_pdf dispatch in tar/ar walkers + stored ZIP entries, nested recipe rides OP_ZIP_STORE (no format bump); pdf-in.tar −24.3%, zip-with-pdf.zip −34.0% vs xz-9e, both beat precomp\|xz and 7z |
 | **M3m generic opaque flate scan** | **shipped** — M3k scanner runs on bucket-0 opaque files (5% coverage gate, PE/ELF excluded to keep BCJ); flate-blob.bin −40.45% vs xz-9e; scan cost <1% of pack (130–930 MB/s) |
 | **Hostile-input bucket rollback** | **shipped** — mid-walk pack_zip/tar/ar failures no longer orphan solid bytes (crafted-ZIP repro: pre-fix RT FAIL → post-fix OK); guarded by tests/hostile.sh |
-| **GitHub Actions CI** | **shipped** — ubuntu build + self-contained fixtures + hostile.sh + bench gate; forced Linux portability fixes in preflate-deps and make_fixtures.sh; workflow unverified until first push |
+| **GitHub Actions CI** | **shipped** — ubuntu build + self-contained fixtures + hostile.sh + bench gate; forced Linux portability fixes in preflate-deps and make_fixtures.sh; **green on Linux** — first run caught the libpreflate _ftelli64 portability bug, patched in preflate-deps |
 | **M7 step 5: entry-loop worker pools (zip + tar + ar)** | **shipped** — per-entry fragments spliced in order, output byte-identical; zip: pe-deflate-l6 −36% / pptx −38% pack time; tar/ar: gz-in.tar −13% / mixed.deb −12%; every per-entry recompression loop now parallel |
 
 ## Headline numbers (2026-07-17, ZXLE_VER 7)
