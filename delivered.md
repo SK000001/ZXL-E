@@ -6,6 +6,17 @@ Historical record of shipped milestones, completed bench measurements, current-s
 
 ## Current-state log (most recent first)
 
+## Current state (2026-07-17, M3l PDF-in-container shipped)
+
+PDF entries inside containers now unwrap: `pack_pdf` dispatches per-entry in the tar/ar walkers and on stored ZIP entries. The nested PDF recipe rides the existing OP_ZIP_STORE recursion (its semantics were always "reconstruct len bytes by recursing unpack_recipe"), so there is **no wire-layout change and no version bump** — v7 decoders built since 2026-07-14 extract these archives unchanged; the decode path was untouched.
+
+| fixture | orig | xz-9e | 7z -mx9 | precomp+xz | zxle (M3l) | vs xz-9e | vs precomp+xz |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| pdf-in.tar (test.pdf + kernel32.dll) | 993,280 | 457,416 | 456,455 | 352,820 | **346,289** | **−24.3%** | −1.9% |
+| zip-with-pdf.zip (stored test.pdf + L9 DLL) | 532,456 | 524,940 | 524,255 | 353,272 | **346,261** | **−34.0%** | −2.0% |
+
+Scratch validations: real-world arxiv.pdf inside a tar → 534,992 vs xz-9e 1,034,180 (**−48.3%**, matching the bare-PDF M3k result); `ar rc` of test.pdf → 69,680 from 262,850, RT OK (covers the ar walker, which has no bench fixture). 75/75 bench RT checks OK; every pre-existing fixture byte-identical (per-file **0.3232** / solid **0.3174** unchanged). The clean competitor sweep extends to both new fixtures.
+
 ## Current state (2026-07-15b, adversarial bench + M3k KIND_PDF shipped — PDF loss flipped to a win)
 
 An adversarial bench (fixtures chosen to *expose* losses: real PDFs, pax tars, ZIP64, encrypted PDF) followed by one ship:
@@ -483,6 +494,12 @@ Predicted shape held: mixed-content `.tar.xz` ties xz-9e (xz already crushes mix
 ---
 
 ## Shipped milestone details
+
+### M3l — PDF-in-container (shipped 2026-07-17)
+- **What it does:** the tar/ar entry walkers and pack_zip's stored-entry (method 0) chain sniff `%PDF-` and recurse through `pack_pdf`, exactly the OP_ZIP_STORE pattern from v7's zip-in-tar work. The nested PDF recipe uses the same generic OP vocabulary `unpack_recipe` already walks, so it rides OP_ZIP_STORE unchanged — no new opcode, no wire-layout change, no ZXLE_VER bump, zero new unpack code. kinds.h documents the op as "nested recipe (from pack_zip or pack_pdf)".
+- **Coverage note:** deflated ZIP entries containing PDFs are *not* dispatched (their inflated bytes go to solid via REDEFLATE/PREFLATE; nesting a recipe under those ops is the recursive-`dispatch_stream()` end-state tracked in roadmap). Stored entries are the common case for PDFs in ZIPs when the zipper skips already-compressed files; deflated-PDF zips still get the container win, just not the FlateDecode unwrap.
+- **Fixtures:** `pdf-in.tar` (test.pdf + kernel32.dll) and `zip-with-pdf.zip` (stored test.pdf + deflate-9 DLL) in make_fixtures.sh; bench lines in the main + 7z + precomp|xz sections.
+- **Measured:** pdf-in.tar 346,289 (−24.3% vs xz-9e, −1.9% vs precomp+xz, −31.8% vs 7z); zip-with-pdf.zip 346,261 (−34.0% vs xz-9e, −2.0% vs precomp+xz, −51.4% vs 7z); arxiv.pdf-in-tar scratch 534,992 vs xz-9e 1,034,180 (−48.3%). ar walker verified by scratch round-trip. 75/75 RT OK; all pre-existing fixtures byte-identical.
 
 ### M3k — KIND_PDF FlateDecode scanner (shipped 2026-07-15)
 - **What it does:** `src/pdf.c` scans `%PDF-` files byte-wise for zlib headers — any CM=8 CMF, not just 0x78: real PDFs mix 32K-window streams with small-window CMFs like 0x48 on Type-1 font programs, and the 0x78-only first cut missed 40 of arxiv.pdf's 142 streams (the fonts — most of the compressible mass). Each candidate is inflated with a span-reporting zlib wrapper (learns the exact consumed length — no PDF `/Length` parsing, so indirect-reference lengths cost nothing), then verified via redeflate-L9 exact match or preflate split/join byte-identity. Embedded JPEGs (DCTDecode) are found by JPEG segment-walk (`jpeg_span`, handles progressive multi-SOS + RST/stuffing) and raced through `try_jpeg_buf`.

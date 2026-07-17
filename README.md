@@ -4,9 +4,9 @@ Recursive format-aware transform pipeline for general-purpose compression.
 
 Goal: be the smallest archive across **every** file type, not just one. Sister project to [ZXL](../Zxl) (which targets PE binaries specifically). ZXL-E uses ZXL as one of its backends when it detects PE streams.
 
-## Status (2026-07-15, M3k KIND_PDF shipped — clean competitor sweep incl. PDFs)
+## Status (2026-07-17, M3l PDF-in-container shipped — clean competitor sweep holds)
 
-Default mode (xz-9e final-step + BCJ-x86 sub-stream for x86/x64 PE/ELF content) ties or beats xz-9e on the standard Silesia corpus and beats it by 5–82% on container-shaped artifacts — now including **PDFs** (FlateDecode scanner: −74% on the corpus PDF, −48% on a real arXiv paper). Optional `--slow` mode (zpaq -m5 final-step) matches the SOTA general-purpose codec on Silesia (ratio 0.1891) and stacks the gain on top of container unwrap. Optional `--fast` mode (xz -T0 with input-scaled blocks) gives **5.4–12× pack speedup** at +0.6% (1 GB) to +2.1% (211 MB) size cost. Measured up to 1 GB (`ZXLE_GIANT=1`). The v7 wire format compresses the manifest — merged into the solid stream when that wins — and crc32-verifies every entry at unpack. **No benched competitor produces a smaller archive than zxle on any bench fixture**: 7-Zip `-mx=9 -ms=on` loses by 15–285%; `precomp -cn | xz -9e` loses on all 11 shared fixtures. An adversarial bench also confirmed pax tars and per-entry-ZIP64 files unwrap today, and that encrypted PDFs are uncrackable for every tool (ciphertext streams). Remaining gaps: unmeasured competitors (freearc, kanzi, xtool-class) and zpaq-class density on long text — see roadmap.
+Default mode (xz-9e final-step + BCJ-x86 sub-stream for x86/x64 PE/ELF content) ties or beats xz-9e on the standard Silesia corpus and beats it by 5–82% on container-shaped artifacts — now including **PDFs** (FlateDecode scanner: −74% on the corpus PDF, −48% on a real arXiv paper), both standalone and **inside tar/ar/ZIP containers** (−24% to −34% on the PDF-in-container fixtures, −48% on an arXiv paper in a tar). Optional `--slow` mode (zpaq -m5 final-step) matches the SOTA general-purpose codec on Silesia (ratio 0.1891) and stacks the gain on top of container unwrap. Optional `--fast` mode (xz -T0 with input-scaled blocks) gives **5.4–12× pack speedup** at +0.6% (1 GB) to +2.1% (211 MB) size cost. Measured up to 1 GB (`ZXLE_GIANT=1`). The v7 wire format compresses the manifest — merged into the solid stream when that wins — and crc32-verifies every entry at unpack. **No benched competitor produces a smaller archive than zxle on any bench fixture**: 7-Zip `-mx=9 -ms=on` loses by 15–285%; `precomp -cn | xz -9e` loses on all 11 shared fixtures. An adversarial bench also confirmed pax tars and per-entry-ZIP64 files unwrap today, and that encrypted PDFs are uncrackable for every tool (ciphertext streams). Remaining gaps: unmeasured competitors (freearc, kanzi, xtool-class) and zpaq-class density on long text — see roadmap.
 
 | Stage | Status |
 |---|---|
@@ -51,8 +51,9 @@ Default mode (xz-9e final-step + BCJ-x86 sub-stream for x86/x64 PE/ELF content) 
 | **JPEG codec race (brunsli vs packJPG)** | **shipped** — blobs carry a codec byte, both tried, smaller wins; synth.jpg 116,612 beats precomp+xz |
 | **Merged-manifest layout + small-input layout race** | **shipped** — manifest rides in bucket 0's xz stream when that wins; sample.jar 2,804 beats precomp+xz 3,012; zxle now beats precomp\|xz on all 10 combo fixtures |
 | **M3k KIND_PDF (FlateDecode scanner)** | **shipped** — zlib-scan + redeflate/preflate verify + embedded-JPEG race; test.pdf −74.0%, real arxiv.pdf −48.2% vs xz-9e, both beat precomp\|xz; corpus headline per-file 0.3383 → 0.3232 |
+| **M3l PDF-in-container** | **shipped** — pack_pdf dispatch in tar/ar walkers + stored ZIP entries, nested recipe rides OP_ZIP_STORE (no format bump); pdf-in.tar −24.3%, zip-with-pdf.zip −34.0% vs xz-9e, both beat precomp\|xz and 7z |
 
-## Headline numbers (2026-07-15, ZXLE_VER 7)
+## Headline numbers (2026-07-17, ZXLE_VER 7)
 
 | Fixture | xz-9e | zxle (default) | zxle --slow |
 |---|---|---|---|
@@ -82,6 +83,8 @@ Default mode (xz-9e final-step + BCJ-x86 sub-stream for x86/x64 PE/ELF content) 
 | xz-in.tar | — | **−4.56%** | — |
 | zst-in.tar | — | **−8.83%** | — |
 | zip-in.tar (OP_ZIP_STORE) | — | **−5.69%** | — |
+| pdf-in.tar (M3l) | — | **−24.29%** | — |
+| zip-with-pdf.zip (M3l) | — | **−34.04%** | — |
 | sample.jar | — | **−81.78%** (2,804 B) | −81.78% (--slow tier picks default) |
 
 (--slow percentages are from the 2026-05-14 measurement on the v6 format; v7 shifts them slightly in zxle's favor.)
@@ -98,7 +101,7 @@ Default mode (xz-9e final-step + BCJ-x86 sub-stream for x86/x64 PE/ELF content) 
 
 Five-stage pipeline:
 
-1. **Recursive container unwrap** — peel ZIP / tar / ar / .deb / gzip / bzip2 / zstd / xz down to raw streams plus a recipe to rebuild byte-identical originals. Since v7, ZIP/JAR entries *inside* tar/ar recurse through the ZIP unwrapper too (OP_ZIP_STORE), and PDFs are scanned for embedded FlateDecode zlib streams and DCTDecode JPEGs (M3k KIND_PDF).
+1. **Recursive container unwrap** — peel ZIP / tar / ar / .deb / gzip / bzip2 / zstd / xz down to raw streams plus a recipe to rebuild byte-identical originals. Since v7, ZIP/JAR entries *inside* tar/ar recurse through the ZIP unwrapper too (OP_ZIP_STORE), and PDFs are scanned for embedded FlateDecode zlib streams and DCTDecode JPEGs (M3k KIND_PDF) — including PDFs inside tar/ar and stored ZIP entries (M3l).
 2. **Per-stream format-aware recompression** — DEFLATE → preflate (or zlib-L9 redeflate fast path), JPEG → brunsli *and* packJPG raced per-image (smaller verified result wins), PNG IDAT → preflate over inflated pixels, MP3 → packMP3.
 3. **Per-OP bucket routing (M6 v3)** — every recipe op carries a u8 bucket byte; x86/x64 PE/ELF bytes (machine field parsed, not just magic) route to a dedicated sub-stream finalized with `xz -9e --x86` (BCJ filter); PNG pixel data, text, non-x86 binaries, and already-compressed bytes stay in the main bucket. Mixed-content containers (DLL+image inside one tar/deb) split across both buckets per-entry.
 4. **Cross-stream solid mode** — main bucket finalized with xz -9e (default) or zpaq -m5 (`--slow`); BCJ bucket always finalized with xz -9e --x86. The manifest (recipes + structural bytes) rides at the head of the main bucket's xz stream when that layout wins (below 8 MB both layouts are raced, smaller kept; v7 flags bit 1) or as its own xz block otherwise; every entry carries a crc32 that unpack verifies.
