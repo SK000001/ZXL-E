@@ -62,9 +62,12 @@ preflate-deps:
 	@if ! grep -q '<cstdint>' $(PREFLATE_DIR)/preflate_seq_chain.h; then \
 	  sed -i 's|#include <algorithm>|#include <algorithm>\n#include <cstdint>|' $(PREFLATE_DIR)/preflate_seq_chain.h; \
 	fi
+	@if ! grep -q '_ftelli64 ftello' $(PREFLATE_DIR)/support/filestream.cpp; then \
+	  sed -i '1s/^/#ifndef _WIN32\n#define _ftelli64 ftello\n#define _fseeki64 fseeko\n#endif\n/' $(PREFLATE_DIR)/support/filestream.cpp; \
+	fi
 	@mkdir -p $(PREFLATE_DIR)/build
 	@cd $(PREFLATE_DIR)/build && cmake $(CMAKE_GEN) -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ..
-	@cd $(PREFLATE_DIR)/build && cmake --build . --target preflate -j 4 || true
+	@cd $(PREFLATE_DIR)/build && cmake --build . --target preflate -j 4
 
 BRUNSLI_DIR = third_party/brunsli
 
