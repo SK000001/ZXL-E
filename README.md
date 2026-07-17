@@ -167,4 +167,4 @@ Default mode finalizes the solid stream with `xz -9e --threads=1`. `--slow` fina
 
 - [roadmap.md](roadmap.md) — current state, what's shipped, what's next, tried-and-reverted graveyard.
 - [graph.md](graph.md) — local-only source-tree index (gitignored).
-- [tests/bench.sh](tests/bench.sh) — bench script. Set `ZXLE_SILESIA=1` for the 211 MB Silesia corpus (default + --fast + optional --slow), `ZXLE_SLOW=1` to add `--slow` against headline fixtures, `ZXLE_GIANT=1` for the 1.06 GB constructed bench.
+- [tests/bench.sh](tests/bench.sh) — bench script. Set `ZXLE_SILESIA=1` for the 211 MB Silesia corpus (default + --fast + optional --slow), `ZXLE_SLOW=1` to add `--slow` against headline fixtures, `ZXLE_GIANT=1` for the 1.06 GB constructed bench. Deterministic tool results (xz/zstd baselines, competitor sizes + RT) are cached in `tests/baseline/.cache` keyed by fixture and tool version — warm runs only re-measure zxle itself (~172 s vs ~300 s cold); `ZXLE_FRESH=1` forces a full recompute.
