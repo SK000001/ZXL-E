@@ -2,7 +2,7 @@
 
 Recursive format-aware transform pipeline for general-purpose compression.
 
-Goal: be the smallest archive across **every** file type, not just one. Sister project to [ZXL](../Zxl) (which targets PE binaries specifically). ZXL-E uses ZXL as one of its backends when it detects PE streams.
+Goal: the smallest archive across **every** file type that **provably restores** — every result is byte-identical-verified (per-entry crc32, hostile-input-hardened, CI-tested), which distinguishes it from repacker-scene tools with known reconstruction-failure classes. Sister project to [ZXL](../Zxl) (which targets PE binaries specifically). ZXL-E uses ZXL as one of its backends when it detects PE streams.
 
 ## Status (2026-07-17b — M3l PDF-in-container, M3m opaque flate scan, hostile-input hardening, CI, M7 step 5)
 
@@ -164,6 +164,10 @@ zxle unpack out.zxle outdir/
 ```
 
 Default mode finalizes the solid stream with `xz -9e --threads=1`. `--slow` finalizes with `zpaq -m5` (cmix-class context mixing); 5–10× slower pack but dense enough to match zpaq -m5 on the standard Silesia corpus while still capturing the container-unwrap wins. `--fast` finalizes with `xz -9e --threads=0` and an input-scaled block size (`bucket/ncpus`, clamped [8 MiB, 64 MiB]); 5–12× faster pack at +0.6% (1 GB) to +2.8% (51 MB) size cost. `--slow` codec choice rides in the manifest header so `unpack` auto-detects; `--fast` only changes the encoder side and `xz -d` consumes the multi-block stream transparently. Unpack verifies a per-entry crc32 and refuses archives whose entry names would escape the output directory; pack refuses duplicate basenames.
+
+## Direction
+
+The target is owning the pareto frontier — nobody smaller at any time budget, nobody faster at our size — not a single "fastest" point (lz4-class speed at max ratio is off the table by physics). The strategic program (roadmap.md, set 2026-07-17), in funded order: (1) bench the remaining serious competitors (freearc, kanzi, xtool/razor) on the world's dominant archive classes (Python wheels, Docker layers, APKs, game assets); (2) fix whatever loses; (3) a text middle tier between default and `--slow`; (4) remaining pack-time cleanup; (5) the M8 line — own LZ pipeline + LZMA-class entropy + GPU match-finding, targeting xz-9e ratio at 3–10× xz speed; (6) format freeze + published reproducible results so the claim is checkable by anyone. The absolute-ratio crown (cmix-class neural, impractical by construction) is consciously deferred.
 
 ## See also
 

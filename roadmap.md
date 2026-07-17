@@ -16,9 +16,32 @@ Headline numbers and the milestone-by-milestone history are in [delivered.md](de
 
 ---
 
+## Strategic program — path to "fastest and best" (set 2026-07-17)
+
+"Fastest and best in the world" decomposes into three different crowns with different programs. The winnable claim is **owning the pareto frontier**: nobody smaller at any time budget, nobody faster at our size — plus a differentiator we already hold: every archive is *verified* (byte-identical RT, per-entry crc, hostile-input-proof, CI-tested). "Smallest archive that provably restores" is the headline claim; repacker-scene competitors have known reconstruction-failure classes.
+
+**Crown A — beat every practical archiver on real-world data (closest; weeks).** Opponents left unbenched: freearc, kanzi, xtool/razor-class. razor is the real threat — its LZMA-variant + binary filters could beat the xz --x86 bucket on executables; if it does, the fix is filter work (delta for structured tables, richer branch models) or a stronger bucket-1 backend. Equally important: bench on the world's dominant archive classes we've never touched — **Python wheels, npm tarballs, Docker layer tarballs, APKs, game asset packs** — all zlib/zstd-family containers, i.e. exactly the wheelhouse.
+
+**Crown B — own the max-ratio pareto frontier (1–3 months).** Beat zpaq at zpaq's time budget AND xz at xz's simultaneously: the text middle tier (libbsc/zpaq-m4, the 17% default↔slow gap) plus the M8c→M8b line ("xz-9e ratio at 3–10× xz speed" — see the DP-throughput risk noted in M8b/M8c below; the honest ceiling is 3–10×, not 30×).
+
+**Crown C — absolute ratio crown (LTCB/Hutter-style; optional, decide last).** Held by cmix/nncp neural mixers; beating them = M8e (months, GPU decode, impractical by construction). Only worth it for the trophy, not the product.
+
+**Funded order:**
+1. Competitor + corpus expansion bench (freearc/kanzi/xtool + wheels/Docker/APK/game fixtures) — proves Crown A or produces the exact loss list. 1–2 sessions.
+2. Fix whatever loses from #1 (budget by findings; likely binary-filter work if razor wins anywhere).
+3. Text middle tier (libbsc/zpaq-m4 raced under min-pack — regression-proof by construction). 1–2 sessions.
+4. Pack-time cleanup: KIND_XZ tie-predictor + liblzma/libzstd in-process. 1–2 sessions.
+5. M8c → M8b (1–2 month structural bet, gated like M8a was; DP throughput is the explicit gate).
+6. Credibility track, in parallel: format freeze (v8 + stability promise), structured fuzzing, published reproducible results — a crown nobody can verify isn't a crown.
+7. Crown C decision only after 1–6.
+
+**Explicitly off the table:** lz4-class speed at max ratio (physics of the frontier); beating cmix on text without going neural. **Long-term unclaimed territory (noted, not funded):** lossless video re-entropy (H.264/H.265 CABAC re-coding — the brunsli trick on the world's dominant byte mass); see the Video bullet under per-stream improvements.
+
+---
+
 ## Future work (coverage gaps and unknowns)
 
-Roughly ordered by real-world impact-to-effort ratio. The ones near the top should be funded first.
+Roughly ordered by real-world impact-to-effort ratio. The ones near the top should be funded first; the strategic program above sets the cross-section sequencing.
 
 ### What we haven't done that others have
 
@@ -44,6 +67,8 @@ Most of these are not novel research problems — they're engineering items that
 
 ### Coverage gaps the synthetic corpus doesn't surface
 
+- **Real-world archive classes never benched (program step 1).** Python wheels, npm package tarballs, Docker layer tarballs, APKs, game asset packs — the most economically relevant archive shapes on earth, all zlib/zstd-family containers (our wheelhouse; likely large wins). Add as fixtures with competitor rows; these also make the "best on real-world data" claim checkable by outsiders on data they recognize.
+
 - ~~**Real `.deb` re-fixture**~~ — **closed 2026-05-14.** `tests/corpus/real_hello.deb` (data layer `.tar.xz`, hello_2.10-3) and `tests/corpus/real_coreutils.deb` (data layer `.tar.zst`, coreutils 9.5) are wired into `tests/bench.sh` (lines 186-187). M3f-ar headline holds on both shipped layouts.
 - **Multi-member gzip / bzip2** — small extension; rare in practice; add only if the real-world bench shows a hit.
 - **GNU tar widening** — **measured 2026-07-15 (adversarial bench): pax tars parse today.** `git archive` output and GNU `tar --format=pax` both unwrap (pax 'x' entries ride as ordinary payloads); zxle beat xz-9e and 7z on both test tars. What actually rejects: base-256 size fields (entries >8 GB) and sparse files — both rare. Deprioritized back down; revisit only if a real corpus hits those.
@@ -66,17 +91,18 @@ Most of these are not novel research problems — they're engineering items that
 - **PE streams** — see "Tried and reverted" PE-via-ZXL. Revisit only if ZXL gains a solid/multi-stream input mode.
 - **JPEG XL (`.jxl`)** — emerging format; brunsli is the JPEG legacy path, jxl is its forward path. No urgency until real-world artifacts contain `.jxl` payloads.
 - **Modern audio (Opus, FLAC)** — packMP3 only handles MPEG-1 Layer III. FLAC has lossless reconstruction tooling; Opus does not.
-- **Video** — nontrivial. Out of scope for the current architecture.
+- **Video** — out of scope for the current architecture, but noted as the long-term unclaimed territory (2026-07-17): H.264/H.265 dominate the world's stored bytes and nobody ships lossless re-entropy at scale. CABAC re-coding (the brunsli trick applied to video) is a research project with double-digit upside on the dominant data type; revisit only after the strategic program's steps 1–6.
 
 ### Validation / quality gaps
 
-- **Competitor benchmark — precomp, zpaq, 7z, precomp|xz closed; freearc + kanzi + xtool-class pending.** `tests/bench.sh` runs precomp v0.4.7, zpaq v7.15 `-m5`, 7-Zip `-mx=9 -ms=on`, and the `precomp -cn | xz -9e` combo against zxle on the headline-positive fixtures, plus zpaq and 7z in the silesia baselines. 2026-07-15 signal after the JPEG race + merged-manifest ships: **zxle beats precomp|xz on all 10 combo fixtures** (+0.02% to +7.42%); 7z ties xz-9e on containers (zxle +15–47%). freearc, kanzi, and the repacker-scene chains (xtool/razor-class) remain unbenched — none is bundled or on Windows MinGW PATH; would need a setup ship before measurement. Likely outcome: zxle wins on container-heavy artifacts, loses to zpaq-class on long-text (already visible in the silesia zpaq baseline).
+- **Competitor benchmark — precomp, zpaq, 7z, precomp|xz closed; freearc + kanzi + xtool/razor pending (program step 1).** `tests/bench.sh` runs precomp v0.4.7, zpaq v7.15 `-m5`, 7-Zip `-mx=9 -ms=on`, and the `precomp -cn | xz -9e` combo against zxle on the headline-positive fixtures, plus zpaq and 7z in the silesia baselines. 2026-07-15 signal: **zxle beats precomp|xz on all combo fixtures**; 7z ties xz-9e on containers (zxle +15–47%). freearc, kanzi, and the repacker-scene chains remain unbenched — none is bundled or on Windows MinGW PATH; needs a setup ship. **razor is the one to take seriously**: its LZMA-variant + binary filters could beat our `xz --x86` bucket on executables — if it does, that's the Crown-A loss list (answer: filter work or a stronger bucket-1 backend). Likely elsewhere: zxle wins container-heavy artifacts, loses to zpaq-class on long text (visible in the silesia zpaq baseline; the text middle tier is the counter).
 - ~~**No size-scaling data.**~~ — **closed 2026-05-13.** Measured at 51 MB / 211 MB / 1.06 GB via `ZXLE_SILESIA=1` and `ZXLE_GIANT=1`. No solid-mode cliff at 1 GB; zxle matches tar+xz-9e byte-for-byte on opaque routing. Memory bottleneck is `read_whole_file` at ~3-4 GB on 64-bit Windows. See delivered.md "Large-corpus measurement".
 - **No memory numbers reported anywhere.** Pack/unpack wall time now ships in `tests/bench.sh` (per-file `pk_ms`/`un_ms` columns plus a `perf:` line per container case, via bash 5 `EPOCHREALTIME`). Peak RSS still pending — needs a platform-specific wrapper (`/usr/bin/time -v` on Linux; PowerShell `Get-Process` or `wmic` on MSYS2 — neither uniform). First wall-time signals surfaced (2026-05-07): M3h-zsttar level-3 ladder pack ~19.9 s on a 1.4 MB input — the 7-entry `(level, --long)` probe ladder is the dominant pack-time hot spot; M3e-targz / M3f-ar at ~7 s on similar-size inputs.
 - **Fuzz coverage is shallow.** `tests/fuzz.sh` (shipped 2026-05-09) does ~50 random mutations × 7 kinds; found 1 bug (`raw_inflate_dyn` truncated-stream hang). A structured AFL/libFuzzer pass on each `pack_*` with format-aware corpora would surface deeper issues.
 - **Corruption: detection shipped, recovery absent.** v7 (2026-07-14) added per-entry crc32 verified at unpack — corruption or decode-side tool-version drift now fails hard instead of silently emitting wrong bytes. Recovery still absent (solid stream: one bad byte loses everything after it); per-entry framing would cost ratio, so document rather than build. (The 2026-07-17 hostile-input finding — mid-walk pack_* failures orphaning solid-bucket bytes — is fixed: bucket rollback in all three walkers, guarded by `tests/hostile.sh`.)
 - **Decode-side tool-version coupling.** unpack_xz/zst/bz2 re-encode with PATH tools; a version whose output differs from pack-time breaks extraction (now detected by crc, not prevented). **[2026-07-14 review]** record tool version strings in the manifest and warn on mismatch; long-term fix is vendoring liblzma/libzstd statically (same work as the spawn-cost item above).
 - **CI green since 2026-07-17.** `.github/workflows/ci.yml`: ubuntu libpreflate+zxle build, self-contained fixtures, `tests/hostile.sh`, bench gated on no rt=FAIL. First run caught a real Linux bug (libpreflate MSVC-only _ftelli64/_fseeki64 — patched in preflate-deps); second run green end-to-end. Mac still unverified; no unit tests beyond bench/fuzz/hostile scripts.
+- **No published, third-party-runnable results (program step 6).** All numbers live in this repo's docs, produced on one machine. The "best in the world" claim needs witnesses: a published results table on recognizable corpora (wheels/Docker/APK from the corpus-expansion item) with the reproducible harness (bench.sh + CI already enforce the discipline). Pairs with the format-freeze item above — a claim on an unstable format doesn't stick either.
 - **No streaming pack/unpack.** Whole-file `read_whole_file` everywhere (64-bit since 2026-07-14; malloc ceiling ~3–4 GB remains). Fine for ≤1 GB; falls over above. Defer until a real workload demands it.
 - **Manifest format unstable.** ZXLE_VER bumped 2 → … → 6 in three days (M5/M6 era) → 7 (2026-07-14: compressed manifest + crc32 + u64 csize + OP_ZIP_STORE). No version-skew testing; no migration path. Cross-version interop will only matter if external tools consume `.zxle`; the current source-of-truth doc is the `kinds.h` header comment.
 - **Manifest STRUCT bytes: variant (b) mostly superseded.** **[2026-07-14 review, updated 2026-07-15]** The merged-manifest layout (manifest at the head of bucket 0's xz stream, small-input layout race) captures variant (b)'s main win — structural bytes and content share one stream and one container overhead. What remains of (b) is *placement*: STRUCT bytes sit as one block at the stream head rather than adjacent to their related content, and the concatenated-tars degenerate shape still routes a huge manifest through the stream. Only revisit if a fixture shows placement mattering.
@@ -185,6 +211,8 @@ None are research. All are documented in zstd-19's source. Together they're 1–
 #### M8b — GPU SA integration into the M8a pipeline (after M8a passes the gate)
 
 **Branch:** `feat/m8b-gpu-sa` · **Expected:** swap libsais (CPU SA, 31 MB/s) for libcubwt (GPU SA, 315 MB/s) inside the M8a pipeline. End-to-end pack wall time gain: roughly the SA-build fraction of M8a's CPU time (probably 30–50%), assuming the optimal-parse step doesn't dominate.
+
+**[2026-07-17 risk note]** The optimal-parse step *will* dominate: the forward DP runs ~1–10 MB/s on CPU (v3 measured ~290 ms at 1 MB). Once the SA is GPU-fast and the entropy stage is swapped (M8c), the DP is the throughput cap. GPU-parallelizing a cost-model DP is wavefront-style work and unpriced. Honest end-to-end landing zone for the M8 line: **xz-9e ratio at 3–10× xz speed**, not 30×. Gate M8b on a DP-throughput measurement the way M8a was gated on ratio.
 
 **Plan:**
 1. Patch libcubwt to expose its internal SA (currently only BWT). Either add `int64_t libcubwt_sa(storage, T, SA, n)` or accept GPU→CPU copy of SA after the existing internal sort and skip the BWT permutation.
