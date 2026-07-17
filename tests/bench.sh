@@ -207,6 +207,9 @@ bench_zip "M3 preflate (L6 ZIP)" tests/corpus/pe-deflate-l6.zip
 bench_zip "M3b JPEG-in-ZIP"      tests/corpus/zip-with-jpeg.zip
 bench_zip "M3c PNG-in-ZIP"       tests/corpus/zip-with-png.zip
 bench_zip "PDF-in-ZIP (stored)"  tests/corpus/zip-with-pdf.zip
+bench_zip "Wheel pure-py (PyPI)" tests/corpus/real_requests.whl
+bench_zip "Wheel native (PyPI)"  tests/corpus/real_pydantic_core.whl
+bench_zip "APK (NewPipe 0.27)"   tests/corpus/real_newpipe.apk
 bench_zip "DOCX (ZIP/L6 XML)"    tests/corpus/sample.docx
 bench_zip "XLSX (ZIP/L6 XML)"    tests/corpus/sample.xlsx
 bench_zip "PPTX (ZIP/L6 XML)"    tests/corpus/sample.pptx
@@ -246,6 +249,8 @@ bench_file "M3e-tar gzip-in-tar"         tests/corpus/gz-in.tar
 bench_file "v7 zip-in-tar"               tests/corpus/zip-in.tar
 bench_file "PDF-in-tar"                  tests/corpus/pdf-in.tar
 bench_file "Opaque flate scan"           tests/corpus/flate-blob.bin
+bench_file "npm tarball (express)"       tests/corpus/real_express.tgz
+bench_file "Docker layer (alpine, Go-gz)" tests/corpus/real_alpine_layer.tar.gz
 bench_file "M3f-ar (.deb shape)"          tests/corpus/mixed.deb
 [ -f tests/corpus/real_hello.deb ] && bench_file "M3f-ar real .deb (hello_2.10-3)" tests/corpus/real_hello.deb
 [ -f tests/corpus/real_coreutils.deb ] && bench_file "M3h real .deb zst (coreutils 9.5)" tests/corpus/real_coreutils.deb
@@ -466,6 +471,11 @@ if [ -n "$SEVENZ" ]; then
     bench_7z "PDF (KIND_PDF)"        "$CORPUS/test.pdf"
     bench_7z "PDF-in-tar"            tests/corpus/pdf-in.tar
     bench_7z "PDF-in-ZIP (stored)"   tests/corpus/zip-with-pdf.zip
+    bench_7z "Wheel pure-py (PyPI)"  tests/corpus/real_requests.whl
+    bench_7z "Wheel native (PyPI)"   tests/corpus/real_pydantic_core.whl
+    bench_7z "APK (NewPipe 0.27)"    tests/corpus/real_newpipe.apk
+    bench_7z "npm tarball (express)" tests/corpus/real_express.tgz
+    bench_7z "Docker layer (alpine)" tests/corpus/real_alpine_layer.tar.gz
 fi
 
 # Competitor combo: precomp -cn + xz -9e. Standalone precomp understates the
@@ -525,6 +535,11 @@ if [ -n "$PRECOMP" ]; then
     bench_precomp_xz "PDF (KIND_PDF)"        "$CORPUS/test.pdf"
     bench_precomp_xz "PDF-in-tar"            tests/corpus/pdf-in.tar
     bench_precomp_xz "PDF-in-ZIP (stored)"   tests/corpus/zip-with-pdf.zip
+    bench_precomp_xz "Wheel pure-py (PyPI)"  tests/corpus/real_requests.whl
+    bench_precomp_xz "Wheel native (PyPI)"   tests/corpus/real_pydantic_core.whl
+    bench_precomp_xz "APK (NewPipe 0.27)"    tests/corpus/real_newpipe.apk
+    bench_precomp_xz "npm tarball (express)" tests/corpus/real_express.tgz
+    bench_precomp_xz "Docker layer (alpine)" tests/corpus/real_alpine_layer.tar.gz
 fi
 
 # ZXL-E --slow mode (zpaq -m5 final-step) on headline fixtures. Gated by
