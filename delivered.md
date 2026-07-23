@@ -6,6 +6,21 @@ Historical record of shipped milestones, completed bench measurements, current-s
 
 ## Current-state log (most recent first)
 
+## Current state (2026-07-23, v8 redeflate ladder shipped — Crown-A losses flipped)
+
+The one competitor-loss class from the 2026-07-18 Crown-A bench is closed. A 2026-07-23 instrument-first probe (throwaway branch, abandoned) established that every xtool|xz *loss* — pure-py wheel −0.76%, APK −0.07%, PDF-class — is plain **zlib level-6** (Python zipfile / Android / git defaults) that our L9-only redeflate fast path missed, falling to a costlier preflate diff. A stock-zlib grid-search exact-reproduced 12/12 wheel, 16/16 APK, 4/4 test.pdf, 96/96 git-packfile preflate streams (0 misses); arxiv.pdf's 40 streams are non-zlib (pdfTeX/GS) and correctly stay preflate. The probe *reversed* the earlier preflate-rs plan — a ~40-line in-house ladder suffices for the losses, with no Rust/FFI dependency.
+
+**Shipped: v8 redeflate ladder (ZXLE_VER 7 → 8).** New recipe op `OP_REDEFLATE_P` (0x0B): when a deflate stream misses the L9 fast path, `redeflate_ladder_find` (deflate.c) searches a bounded zlib param set (level × memLevel × windowBits, default strategy; wbits −15 and level 6 first) for an exact byte-repro and stores two param bytes instead of the preflate diff; decode re-deflates at those params. Emitted by `pack_zip` and `pack_flate_scan`, decoded by `recipe.c`. RT-safe by construction (pack emits it only after an exact-match verify; decode re-runs the identical deflate).
+
+Measured (all RT OK, byte-identical):
+- **requests.whl 50,116 → 49,712** (−404 B) — flips xtool's −0.76%; now −21.83% vs xz-9e.
+- **newpipe.apk 5,407,816 → 5,397,884** (−9,932 B) — flips xtool's −0.07%; now −22.75% vs xz-9e; beats 7z by 29.4%.
+- **test.pdf 36,616 → 36,196** (−420 B) — now beats precomp+xz (36,700).
+- **git packfile (kanzi clone) 301,664 → 293,888** (−7,776 B) — all 96 preflate streams became exact redeflates; a new free win class (packfiles are wall-to-wall zlib, opaque to xz).
+- **arxiv.pdf 535,212 unchanged** — 40 non-zlib streams correctly untouched (no false positives).
+
+Full bench: **121/121 zxle RT OK**, solid ratio **0.3174** (2,193,621 → 2,193,241 B), per-file **0.3232** flat. No fixture regresses — the ladder only replaces a costlier diff or leaves a stream unchanged, and min-pack still races opaque. (The lone bench non-OK is precomp failing to precompress the Go-gzip alpine layer — a competitor limitation.) preflate-rs stays roadmap'd (funded item 2b) only for the classes the ladder can't reach: non-zlib producers and Go-flate Docker layers.
+
 ## Current state (2026-07-18, Crown-A bench: real-world corpus + freearc/kanzi/xtool measured)
 
 Program step 1 (from the strategic program in roadmap.md): expanded the bench to the world's dominant archive classes and benched the three remaining serious competitors. Five real-world fixtures added (version-pinned, in `fetch_real_fixtures.sh`): PyPI wheels (requests pure-py, pydantic-core native win_amd64), express npm tarball, alpine Docker layer, NewPipe APK. Three competitors added (`make kanzi-deps` / `xtool-deps`, cached Windows-only bench sections): kanzi-cpp 2.5.3 `-l 9`, xtool 0.7.9 `precomp -mzlib | xz -9e`, FreeArc 0.67 `-mx`. razor stays unbenched (no public binary located).
@@ -530,6 +545,13 @@ Predicted shape held: mixed-content `.tar.xz` ties xz-9e (xz already crushes mix
 ---
 
 ## Shipped milestone details
+
+### v8 redeflate ladder — Crown-A deflate-repro loss fix (shipped 2026-07-23)
+- **What it does:** when a raw-deflate stream misses the L9 fast path, `redeflate_ladder_find` (deflate.c) walks a bounded zlib parameter set — level {6,5,4,7,8,9,3,2,1} × memLevel {8,9} × windowBits {−15..−11}, default strategy, ordered so real-world zlib-L6 streams match in the first few tries — and returns the two packed param bytes of the first exact byte-repro. `pack_zip` and `pack_flate_scan` emit `OP_REDEFLATE_P` (0x0B: `OP_REDEFLATE` layout + `(u8 param0)(u8 param1)`) instead of falling to a preflate diff; `recipe.c` decodes it via `redeflate_ladder_apply`. ZXLE_VER 7 → 8.
+- **Probe-driven (throwaway branch `feat/preflate-rs-probe`, abandoned):** instrumented the redeflate/preflate/store decision and grid-searched stock zlib params against every stream currently paying a preflate diff. Result: 12/12 wheel, 16/16 APK, 4/4 test.pdf, 96/96 git-packfile preflate streams exact-reproduce at zlib **level-6** (memLevel 8/9, wbits −15); arxiv.pdf 0/40 (non-zlib producer). This reversed the round-2 preflate-rs recommendation — the losses need only the cheap ladder, no Rust/FFI. preflate-rs stays roadmap'd (item 2b) for the ladder's misses (non-zlib producers, Go-flate layers).
+- **RT-safe by construction:** pack emits `OP_REDEFLATE_P` only after verifying the candidate re-deflate equals the original bytes; decode re-runs the identical `deflate_at`. Cross-machine zlib drift is caught by the existing per-entry crc32 (same risk class as the pre-existing L9 OP_REDEFLATE).
+- **Measured (all RT OK):** requests.whl 50,116 → 49,712 (−404, flips xtool −0.76%); newpipe.apk 5,407,816 → 5,397,884 (−9,932, flips xtool −0.07%); test.pdf 36,616 → 36,196 (−420, beats precomp+xz 36,700); git packfile 301,664 → 293,888 (−7,776, 96 preflate → exact); arxiv.pdf unchanged. Full bench 121/121 RT OK, solid 0.3174 (2,193,621 → 2,193,241), per-file 0.3232 flat; no regressions.
+- **Deferred:** png.c / gz.c keep their own recipe layouts (mode 0/1) — no measured loss there, so the ladder wasn't wired into them; add if a fixture shows a KIND_PNG/KIND_GZIP deflate-repro loss. Filtered/huffman strategies and memLevel <8 aren't in the search set (0 need on measured data); the param encoding stores actual params (not a frozen table index), so the set can widen without a wire change.
 
 ### M3m — generic opaque flate scan (shipped 2026-07-17)
 - **What it does:** pack_pdf's scan core is now `pack_flate_scan(scan_from, min_cover_permille)` — scans any byte range for verified zlib streams (redeflate-L9 / preflate) and JPEGs, succeeding only when verified spans cover the permille threshold, with full b0/b1/recipe rollback otherwise. `pack_pdf` = the `(5, 0)` wrapper gated on `%PDF-` (byte-identical on all PDF fixtures). do_pack's opaque fallback runs `(0, 50)` on files headed to KIND_OPAQUE — the SWF/WOFF/PSD/save-game class. Recipes reuse KIND_PDF: identical format, no wire change, decode untouched.
