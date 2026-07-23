@@ -15,6 +15,12 @@ uint8_t *raw_inflate(const uint8_t *src, uint32_t comp_size, uint32_t raw_size);
 /* Raw-inflate src into a freshly allocated buffer of unknown size. */
 uint8_t *raw_inflate_dyn(const uint8_t *src, size_t src_n, size_t *out_n);
 
+/* Raw-inflate a deflate stream of unknown length; reports how many input bytes
+ * the stream consumed (*consumed) so the caller can find what follows (e.g. a
+ * gzip member trailer, then the next member). Returns malloc'd output or NULL. */
+uint8_t *raw_inflate_span(const uint8_t *src, size_t src_n,
+                          size_t *consumed, size_t *out_n);
+
 /* Raw-deflate raw_bytes at level 9 default strategy into a malloc'd buffer.
  * Sets *out_len. Returns NULL on failure. */
 uint8_t *raw_deflate_l9(const uint8_t *raw, uint32_t raw_size, size_t *out_len);

@@ -64,8 +64,16 @@
  * parameter set (typically level 6 -- Python zipfile / Android / git) exactly
  * reproduces it, replacing a costlier OP_PREFLATE diff. Decode re-deflates at
  * the stored params (deflate.c redeflate_ladder_apply). No other layout change.
- * v3..v8 cannot interoperate. */
-#define ZXLE_VER 8
+ * v9 (2026-07-23): multi-member gzip. The KIND_GZIP recipe now begins with a
+ * u32 member count, followed by that many member blocks (each block is the
+ * pre-v9 single-member layout: hdr, mode, raw_len, def_len, [diff], trailer,
+ * inner_kind, bucket, [tar_recipe]). Single-member gzips carry count = 1;
+ * multi-member gzips (BGZF/.bam, klauspost pgzip, concatenated .gz) unwrap
+ * every member and force inner_kind = 0 per member. Unwraps concatenated-gzip
+ * classes that previously fell to KIND_OPAQUE (measured ceiling −19% vs opaque
+ * on compressible content).
+ * v3..v9 cannot interoperate. */
+#define ZXLE_VER 9
 
 /* Top-level container kind tag (one byte per manifest entry). */
 #define KIND_OPAQUE 0
@@ -143,15 +151,18 @@
  *   u32 post_len  post_bytes       -- chunks after the last IDAT (incl. IEND)
  *
  * KIND_GZIP (5):
- *   u32 hdr_len  hdr_bytes
- *   u8  mode                      -- 0 = raw-deflate L9 redeflate matches; 1 = preflate
- *   u32 raw_len                   -- inflated body size
- *   u32 def_len                   -- length of original raw deflate body
- *   [if mode==1] u32 diff_len  diff_bytes
- *   u8  trailer[8]                -- CRC32 LE + ISIZE LE, verbatim
- *   u8  inner_kind                -- 0 = inflated bytes consumed verbatim; 1 = nested ustar tar
- *   u8  bucket                    -- v6: which solid bucket; only used when inner_kind==0
- *   [if inner_kind==1] u32 tar_recipe_len  tar_recipe_bytes
+ *   u32 n_members                 -- v9: gzip member count (1 = classic single)
+ *   per member (n_members blocks):
+ *     u32 hdr_len  hdr_bytes
+ *     u8  mode                    -- 0 = raw-deflate L9 redeflate matches; 1 = preflate
+ *     u32 raw_len                 -- inflated body size
+ *     u32 def_len                 -- length of original raw deflate body
+ *     [if mode==1] u32 diff_len  diff_bytes
+ *     u8  trailer[8]              -- CRC32 LE + ISIZE LE, verbatim
+ *     u8  inner_kind              -- 0 = inflated bytes consumed verbatim; 1 = nested ustar tar
+ *                                    (inner_kind==1 only occurs when n_members==1)
+ *     u8  bucket                  -- v6: which solid bucket; only used when inner_kind==0
+ *     [if inner_kind==1] u32 tar_recipe_len  tar_recipe_bytes
  *
  * KIND_BZIP2 (8):
  *   u8  block_size                -- '1'..'9'

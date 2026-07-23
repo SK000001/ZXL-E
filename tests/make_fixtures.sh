@@ -242,6 +242,28 @@ open("flate-blob.bin", "wb").write(bytes(out))
 PY
 fi
 
+# multi.gz — concatenated multi-member gzip (BGZF / pgzip / concatenated-log
+# shape). Tests v9 multi-member unwrap: each member is inflated + redeflated/
+# preflated and its body shares the solid stream, instead of the whole file
+# going opaque. Two compressible members at mixed levels (6 -> preflate,
+# 9 -> redeflate). mtime pinned so regen is stable.
+if want multi.gz; then
+    python - <<'PY'
+import gzip, io, json, random
+random.seed(11)
+words = "alpha beta gamma delta epsilon zeta eta theta iota kappa".split()
+def doc(n):
+    return json.dumps({f"{random.choice(words)}_{j}": {"id": j, "vals": [j*2, j*3, j%7],
+        "tags": [random.choice(words) for _ in range(10)]} for j in range(n)}).encode()
+def gz(data, level):
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode="wb", compresslevel=level, mtime=0) as f:
+        f.write(data)
+    return buf.getvalue()
+open("multi.gz", "wb").write(gz(doc(1500), 6) + gz(doc(1800), 9))
+PY
+fi
+
 # pdf-in.tar — tar containing a PDF (test.pdf) + a plain DLL. Tests pack_pdf
 # dispatch inside pack_tar (nested PDF recipe rides OP_ZIP_STORE, 2026-07-17).
 if want pdf-in.tar; then

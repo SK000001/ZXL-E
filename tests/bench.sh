@@ -249,6 +249,7 @@ bench_file "M3e-tar gzip-in-tar"         tests/corpus/gz-in.tar
 bench_file "v7 zip-in-tar"               tests/corpus/zip-in.tar
 bench_file "PDF-in-tar"                  tests/corpus/pdf-in.tar
 bench_file "Opaque flate scan"           tests/corpus/flate-blob.bin
+bench_file "v9 multi-member gzip"        tests/corpus/multi.gz
 bench_file "npm tarball (express)"       tests/corpus/real_express.tgz
 bench_file "Docker layer (alpine, Go-gz)" tests/corpus/real_alpine_layer.tar.gz
 bench_file "M3f-ar (.deb shape)"          tests/corpus/mixed.deb
