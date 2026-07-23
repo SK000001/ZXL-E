@@ -14,7 +14,10 @@
  * a u8 opaque_bucket immediately after the kind byte (manifest); the
  * trailing payload is now multi-bucket: u8 num_buckets, then per-bucket
  * (u8 codec_id, u32 csize, csize bytes). codec_id: 0=xz-9e, 1=xz-9e+x86,
- * 2=zpaq-m5.
+ * 2=zpaq-m5, 3=kanzi-l9 (added 2026-07-23 for --best; no layout change --
+ * decode dispatches on codec_id, so a decoder lacking codec 3 fails hard on
+ * such an archive rather than mis-decoding. Only bucket-0 of --best archives
+ * uses it; default/--slow archives are unaffected).
  * v5 (2026-05-08): M6 v2 extends bucket routing to non-OPAQUE container
  * kinds. Each of KIND_ZIP/TAR/AR/GZIP/BZIP2/ZSTD/XZ entries now stores a
  * u8 unwrap_bucket after the kind byte (and BEFORE the recipe length),

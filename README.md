@@ -4,11 +4,13 @@ Recursive format-aware transform pipeline for general-purpose compression.
 
 Goal: the smallest archive across **every** file type that **provably restores** — every result is byte-identical-verified (per-entry crc32, hostile-input-hardened, CI-tested), which distinguishes it from repacker-scene tools with known reconstruction-failure classes. Sister project to [ZXL](../Zxl) (which targets PE binaries specifically). ZXL-E uses ZXL as one of its backends when it detects PE streams.
 
-## Status (2026-07-23 — v8 redeflate ladder + v9 multi-member gzip)
+## Status (2026-07-23 — v8 redeflate ladder + v9 multi-member gzip + `--best` kanzi tier)
 
 Default mode (xz-9e final-step + BCJ-x86 sub-stream for x86/x64 PE/ELF content) ties or beats xz-9e on the standard Silesia corpus and beats it by 5–82% on container-shaped artifacts — now including **PDFs** (FlateDecode scanner: −74% on the corpus PDF, −48% on a real arXiv paper), both standalone and **inside tar/ar/ZIP containers** (−24% to −34% on the PDF-in-container fixtures, −48% on an arXiv paper in a tar) — and the same scanner now sweeps **any opaque non-PE file** for embedded zlib streams (−40% on the asset-pack fixture). pack_zip's entry loop is parallel as of M7 step 5 (pe-deflate-l6 pack −36%), hostile malformed containers can no longer corrupt the solid stream (tests/hostile.sh), and a GitHub Actions workflow builds and benches the self-contained subset on Linux. Optional `--slow` mode (zpaq -m5 final-step) matches the SOTA general-purpose codec on Silesia (ratio 0.1891) and stacks the gain on top of container unwrap. Optional `--fast` mode (xz -T0 with input-scaled blocks) gives **5.4–12× pack speedup** at +0.6% (1 GB) to +2.1% (211 MB) size cost. Measured up to 1 GB (`ZXLE_GIANT=1`). The v7 wire format compresses the manifest — merged into the solid stream when that wins — and crc32-verifies every entry at unpack. Real-world data wins: **PyPI wheels −21% to −29%, Android APK −23%, npm tarball −11% vs xz-9e**. Competitor bench (2026-07-18, incl. kanzi-cpp, xtool, FreeArc): 7-Zip `-mx=9 -ms=on`, kanzi `-l 9`, and FreeArc `-mx` lose on every container (none unwraps deflate; FreeArc even loses to xz-9e). The one class where xtool (repacker-scene, preflate-based like us) beat us — deflate-parameter reproduction: PDF −0.98%, pure-python wheel −0.76%, APK −0.07% — is **closed as of 2026-07-23**: a probe showed those streams are all plain zlib **level-6** (Python zipfile / Android / git) that our L9-only fast path missed, and the shipped **v8 redeflate ladder** (`OP_REDEFLATE_P`) reproduces them exactly and stores two param bytes instead of a diff. Flipped: wheel −404 B, APK −9,932 B, test.pdf −420 B (now beats precomp+xz), plus a new free win class — **git packfiles −7,776 B** (wall-to-wall zlib, opaque to xz). **zxle now produces the smallest archive on every benched fixture.** Still opaque to us and everyone: Go `compress/flate` (Docker layers) — preflate can't split it (roadmap'd for preflate-rs). Remaining gaps: razor (binary now located in the Ultra F-A bundle, unbenched) and zpaq-class density on long text — see roadmap.
 
 **Multi-member gzip (v9):** BGZF (`.bam` genomics, concatenated gzip *by spec*), klauspost pgzip (some Docker layers), and concatenated logs previously fell whole to opaque; `pack_gz` now unwraps every member (`−42.6%` vs xz-9e on the `multi.gz` fixture). Single-member gzips are unchanged.
+
+**`--best` tier (kanzi -l9):** a fast dense middle tier between default (xz-9e) and `--slow` (zpaq-m5). On text/source it lands **−16% to −34% vs default** (docx −34.35%, webster −25.99%, dickens −24.40%, samba −16.51%) — on dickens just +2.2% behind zpaq-m5 but ~15× faster (2s vs 22s). Opt-in; kanzi was already built (competitor), so no new dependency. Small inputs (<1 MB) race the default tier and keep the smaller, so `--best` never regresses there. Default/`--slow` archives are byte-identical (no format change).
 
 | Stage | Status |
 |---|---|
@@ -61,6 +63,7 @@ Default mode (xz-9e final-step + BCJ-x86 sub-stream for x86/x64 PE/ELF content) 
 | **Crown-A bench (real-world corpus + freearc/kanzi/xtool)** | **shipped** — PyPI/npm/Docker/APK fixtures; kanzi & FreeArc lose everywhere, xtool beat us on 3 deflate-reproduction fixtures (−0.07% to −0.98%) |
 | **v8 redeflate ladder (`OP_REDEFLATE_P`)** | **shipped** — probe found the 3 xtool losses are all zlib level-6; a bounded (level×memLevel×windowBits) ladder reproduces them exactly, storing 2 param bytes vs a preflate diff. Flips all losses (wheel −404 B, APK −9,932 B, test.pdf −420 B) + git packfiles −7,776 B; ZXLE_VER 7→8, 121/121 RT OK, no regressions |
 | **v9 multi-member gzip** | **shipped** — `pack_gz` loops over gzip members (KIND_GZIP recipe gains a u32 count); BGZF/pgzip/concatenated-.gz classes unwrap instead of going opaque. Fixture `multi.gz` −42.6% vs xz-9e; ZXLE_VER 8→9; single-member behavior byte-identical, no regressions |
+| **`--best` tier (kanzi -l9)** | **shipped** — third bucket-0 codec between default and `--slow`; fast dense text/source tier (docx −34%, webster −26%, dickens −24% vs default, ~15× faster than zpaq for +2.2% size). codec_id 3, no format change; default/`--slow` byte-identical, 122/122 RT OK |
 
 ## Headline numbers (2026-07-23, ZXLE_VER 9)
 
@@ -106,6 +109,17 @@ Default mode (xz-9e final-step + BCJ-x86 sub-stream for x86/x64 PE/ELF content) 
 
 (--slow percentages are from the 2026-05-14 measurement on the v6 format; v7 shifts them slightly in zxle's favor.)
 
+`--best` (kanzi -l9) vs default (2026-07-23), all RT OK:
+
+| Fixture | default | `--best` | vs default |
+|---|---:|---:|---:|
+| sample.docx | 472,760 | 310,384 | **−34.35%** |
+| silesia/webster (text) | 8,350,236 | 6,180,080 | **−25.99%** |
+| silesia/dickens (text) | 2,830,996 | 2,140,232 | **−24.40%** |
+| silesia/samba (source) | 3,497,768 | 2,920,277 | **−16.51%** |
+| sample.jar | 2,804 | 2,679 | −4.46% |
+| mixed.tar.gz | 1,082,577 | 1,058,985 | −2.18% |
+
 `--fast` pack-time speedup (input-scaled blocks, 2026-07-14, 16 logical CPUs, single-input packs):
 
 | Fixture | default pack | --fast pack | speedup | size cost |
@@ -123,7 +137,7 @@ Five-stage pipeline:
 1. **Recursive container unwrap** — peel ZIP / tar / ar / .deb / gzip (single- and v9 multi-member: BGZF / pgzip / concatenated) / bzip2 / zstd / xz down to raw streams plus a recipe to rebuild byte-identical originals. Since v7, ZIP/JAR entries *inside* tar/ar recurse through the ZIP unwrapper too (OP_ZIP_STORE), and PDFs are scanned for embedded FlateDecode zlib streams and DCTDecode JPEGs (M3k KIND_PDF) — including PDFs inside tar/ar and stored ZIP entries (M3l).
 2. **Per-stream format-aware recompression** — DEFLATE → zlib-L9 redeflate fast path, then a bounded zlib parameter ladder (v8 `OP_REDEFLATE_P`: level×memLevel×windowBits, catches level-6 producers like Python zipfile / Android / git), else preflate; JPEG → brunsli *and* packJPG raced per-image (smaller verified result wins), PNG IDAT → preflate over inflated pixels, MP3 → packMP3.
 3. **Per-OP bucket routing (M6 v3)** — every recipe op carries a u8 bucket byte; x86/x64 PE/ELF bytes (machine field parsed, not just magic) route to a dedicated sub-stream finalized with `xz -9e --x86` (BCJ filter); PNG pixel data, text, non-x86 binaries, and already-compressed bytes stay in the main bucket. Mixed-content containers (DLL+image inside one tar/deb) split across both buckets per-entry.
-4. **Cross-stream solid mode** — main bucket finalized with xz -9e (default) or zpaq -m5 (`--slow`); BCJ bucket always finalized with xz -9e --x86. The manifest (recipes + structural bytes) rides at the head of the main bucket's xz stream when that layout wins (below 8 MB both layouts are raced, smaller kept; v7 flags bit 1) or as its own xz block otherwise; every entry carries a crc32 that unpack verifies.
+4. **Cross-stream solid mode** — main bucket finalized with xz -9e (default), kanzi -l9 (`--best`), or zpaq -m5 (`--slow`); BCJ bucket always finalized with xz -9e --x86. The manifest (recipes + structural bytes) rides at the head of the main bucket's xz stream when that layout wins (below 8 MB both layouts are raced, smaller kept; v7 flags bit 1) or as its own xz block otherwise; every entry carries a crc32 that unpack verifies.
 5. **min-pack fallthrough** — every pack runs both the unwrap path and an all-opaque path; the smaller wins. Saves us from regressions on tightly-deflated tiny inputs. With `--slow`, also tiers default-mode candidate on small inputs and keeps the smaller — guaranteeing pareto optimality.
 
 Each stage is known in isolation; the integrated product does not exist publicly.
@@ -171,11 +185,11 @@ brunsli's `cbrunsli`/`dbrunsli`, packJPG, packMP3, and zpaq must be on `PATH` at
 ## Use
 
 ```
-zxle pack [--slow] [--fast] out.zxle file1 file2 ...
+zxle pack [--slow|--best] [--fast] out.zxle file1 file2 ...
 zxle unpack out.zxle outdir/
 ```
 
-Default mode finalizes the solid stream with `xz -9e --threads=1`. `--slow` finalizes with `zpaq -m5` (cmix-class context mixing); 5–10× slower pack but dense enough to match zpaq -m5 on the standard Silesia corpus while still capturing the container-unwrap wins. `--fast` finalizes with `xz -9e --threads=0` and an input-scaled block size (`bucket/ncpus`, clamped [8 MiB, 64 MiB]); 5–12× faster pack at +0.6% (1 GB) to +2.8% (51 MB) size cost. `--slow` codec choice rides in the manifest header so `unpack` auto-detects; `--fast` only changes the encoder side and `xz -d` consumes the multi-block stream transparently. Unpack verifies a per-entry crc32 and refuses archives whose entry names would escape the output directory; pack refuses duplicate basenames.
+Default mode finalizes the solid stream with `xz -9e --threads=1`. `--best` finalizes with `kanzi -l 9` — a fast dense tier that beats xz-9e by 16–34% on text/source/OOXML at a few seconds' pack time (needs `kanzi` on PATH to decode; `make kanzi-deps`). `--slow` finalizes with `zpaq -m5` (cmix-class context mixing); 5–10× slower pack but dense enough to match zpaq -m5 on the standard Silesia corpus while still capturing the container-unwrap wins. `--best` and `--slow` are mutually exclusive; both race the default tier on inputs under 1 MB and keep the smaller. `--fast` finalizes with `xz -9e --threads=0` and an input-scaled block size (`bucket/ncpus`, clamped [8 MiB, 64 MiB]); 5–12× faster pack at +0.6% (1 GB) to +2.8% (51 MB) size cost. `--slow` codec choice rides in the manifest header so `unpack` auto-detects; `--fast` only changes the encoder side and `xz -d` consumes the multi-block stream transparently. Unpack verifies a per-entry crc32 and refuses archives whose entry names would escape the output directory; pack refuses duplicate basenames.
 
 ## Direction
 

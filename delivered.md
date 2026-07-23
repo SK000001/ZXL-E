@@ -6,6 +6,15 @@ Historical record of shipped milestones, completed bench measurements, current-s
 
 ## Current-state log (most recent first)
 
+## Current state (2026-07-23c, --best tier shipped — kanzi -l9 bucket-0, the fast dense text/source tier)
+
+Third ship of the day. Program item 3 (text middle tier). Instrument-first, kanzi -l9 (already built as a competitor, zero new dependency) was measured as a pareto point between default (xz-9e) and --slow (zpaq-m5): on dickens it lands −24.4% vs xz in ~2s, just +2.2% behind zpaq-m5's −26.0% but ~15× faster (2s vs 22s). Shipped as a new bucket-0 finalize codec.
+
+- **`zxle pack --best`** finalizes bucket 0 with kanzi -l9 (`CODEC_KANZI_L9=3`, split-manifest path like --slow). The bucket-0 codec generalized from a `slow` bool to a `codec0` int (xz/zpaq/kanzi) through `pack_run`/`min_pack_for_tier`/the tier race. kanzi's stream is stored verbatim and decoded with `kanzi -d` (self-describing — no decode-time version coupling). No manifest-layout change / no ZXLE_VER bump: decode dispatches on the per-bucket codec_id, so a decoder lacking codec 3 fails hard (crc-guarded), never mis-decodes.
+- **Measured (all RT OK, vs default):** docx **−34.35%** (kanzi on unwrapped OOXML text), webster −25.99%, dickens −24.40%, samba source −16.51%, jar −4.46%, mixed.tar.gz −2.18%. Every fixture is smaller than default — small inputs (<1 MB) race the default tier and keep the smaller, so --best never regresses there.
+- **No regression to default/--slow:** the `codec0` refactor left them byte-identical — full default bench **122/122 RT OK**, solid **0.3174** (2,193,241), per-file **0.3232** unchanged; --slow verified RT OK. New gated `ZXLE_BEST=1` bench section (Windows-only, presence-gated on the kanzi binary). kanzi is opt-in; default-mode decode deps are unchanged.
+- **Not guaranteed pareto on large already-compressed inputs** (like --slow): >1 MB inputs commit to kanzi without a default race; kanzi wins broadly (incl. the 51 MB mozilla binary, −ratio) but a pre-compressed large input could lose — documented, opt-in.
+
 ## Current state (2026-07-23b, v9 multi-member gzip shipped — BGZF/pgzip/concatenated .gz unwrap)
 
 Second ship of the day (after the v8 ladder). Multi-member gzip files — BGZF (`.bam` genomics, concatenated gzip *by spec*), klauspost pgzip (some Docker layers), concatenated logs — previously fell whole to KIND_OPAQUE (tie xz). `pack_gz`/`unpack_gz` now loop over members: the KIND_GZIP recipe gains a leading `u32` member count, each member keeps the pre-v9 block layout, and every member is inflated (new `raw_inflate_span` reports bytes consumed to find member boundaries), redeflated-L9/preflated, and its body shares the solid stream. ZXLE_VER 8 → 9.
@@ -554,6 +563,14 @@ Predicted shape held: mixed-content `.tar.xz` ties xz-9e (xz already crushes mix
 ---
 
 ## Shipped milestone details
+
+### --best tier — kanzi -l9 bucket-0 (shipped 2026-07-23)
+- **What it does:** a third bucket-0 finalize codec between default (xz-9e) and --slow (zpaq-m5). `zxle pack --best` finalizes the main solid bucket with `kanzi -l 9 -j <ncpus>`; the stream is stored verbatim (self-describing) and decoded with `kanzi -d`. `finalize_bucket`/`decompress_bucket` gain a `CODEC_KANZI_L9` case; the bucket-0 codec became a `codec0` int (was a `slow` bool) threaded through `pack_run`, `min_pack_for_tier`, `TierJob`, and the small-input tier race. kanzi's build dir joins the PATH prepend.
+- **No format bump:** the trailing-payload layout is unchanged; codec_id 3 is a new *value* in the existing per-bucket codec byte. Decode dispatches on codec_id (flags bit 0 is informational), so default/--slow archives are untouched and a decoder without codec 3 fails hard (crc-guarded) rather than mis-decoding. Documented in kinds.h.
+- **Instrument-first placement:** kanzi -l9 measured on silesia text/source before wiring — dickens −24.4%, webster −26.2%, reymont −26.1%, samba −14.7% vs xz-9e; and vs zpaq-m5 on dickens: kanzi 2,140,181 (2s) vs zpaq 2,094,771 (22s) → +2.2% size at ~15× the speed. A genuine pareto middle tier.
+- **Regression-proof on small inputs:** non-default tiers (zpaq/kanzi) race the default xz tier when total input < 1 MB and keep the smaller (reuses the M7-step-2 machinery generalized from --slow). >1 MB inputs commit to the chosen codec (same as --slow); kanzi wins broadly but isn't guaranteed pareto on large pre-compressed data — opt-in, documented.
+- **Measured (RT OK):** vs default — docx −34.35%, webster −25.99%, dickens −24.40%, samba(src) −16.51%, jar −4.46%, mixed.tar.gz −2.18%. Default bench 122/122 RT OK, solid 0.3174 / per-file 0.3232 byte-identical (codec0 refactor is behavior-preserving for xz).
+- **Follow-ups noted:** (1) auto-race kanzi in *default* mode (not just as a flag) would capture the win without opt-in, but touches the intricate merged-manifest finalize — deferred; (2) bucket 1 (x86) still always xz+BCJ; (3) libbsc remains the roadmap's alternative middle-tier vehicle if a kanzi limitation surfaces.
 
 ### v9 multi-member gzip — BGZF / pgzip / concatenated .gz (shipped 2026-07-23)
 - **What it does:** `pack_gz` walks gzip members instead of assuming one. It parses each member header (`gz_hdr_len`), inflates the body with `raw_inflate_span` (new deflate.c primitive that reports bytes consumed, so the member trailer + next member can be located), verifies the crc32/isize trailer, and reproduces the body via L9-redeflate or preflate (`gz_member_mode`). The KIND_GZIP recipe now leads with a `u32` member count followed by that many blocks; `unpack_gz` loops and concatenates member outputs. ZXLE_VER 8 → 9.
