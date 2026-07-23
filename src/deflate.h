@@ -12,9 +12,6 @@ void     w32be(uint8_t *p, uint32_t v);
  * Returns NULL on failure. Caller frees. */
 uint8_t *raw_inflate(const uint8_t *src, uint32_t comp_size, uint32_t raw_size);
 
-/* Raw-inflate src into a freshly allocated buffer of unknown size. */
-uint8_t *raw_inflate_dyn(const uint8_t *src, size_t src_n, size_t *out_n);
-
 /* Raw-inflate a deflate stream of unknown length; reports how many input bytes
  * the stream consumed (*consumed) so the caller can find what follows (e.g. a
  * gzip member trailer, then the next member). Returns malloc'd output or NULL. */
