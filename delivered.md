@@ -6,6 +6,15 @@ Historical record of shipped milestones, completed bench measurements, current-s
 
 ## Current-state log (most recent first)
 
+## Current state (2026-07-23b, v9 multi-member gzip shipped — BGZF/pgzip/concatenated .gz unwrap)
+
+Second ship of the day (after the v8 ladder). Multi-member gzip files — BGZF (`.bam` genomics, concatenated gzip *by spec*), klauspost pgzip (some Docker layers), concatenated logs — previously fell whole to KIND_OPAQUE (tie xz). `pack_gz`/`unpack_gz` now loop over members: the KIND_GZIP recipe gains a leading `u32` member count, each member keeps the pre-v9 block layout, and every member is inflated (new `raw_inflate_span` reports bytes consumed to find member boundaries), redeflated-L9/preflated, and its body shares the solid stream. ZXLE_VER 8 → 9.
+
+- **Single-member gzips (count=1)** keep full prior behavior incl. inner-tar dispatch; **multi-member members** force `inner_kind=0`.
+- **Measured:** new self-contained fixture `tests/corpus/multi.gz` (two compressible JSON members, L6+L9) 76,876 → **zxle 44,120 vs xz-9e 76,916 (−42.6%)**, RT OK. Scratch 2-member text −19.3% (matches the pre-implementation ceiling). Edge cases RT OK: 3-member, single-member-L6, inner-tar single-member.
+- **No regressions:** full bench **121/121 RT OK**, solid **0.3174** (2,193,241) and per-file **0.3232** byte-identical to v8 — the +4 B count prefix compresses to nothing and existing single-member gz fixtures are unchanged. New CI-safe `multi.gz` bench row added.
+- Follow-up noted: gz members don't yet use the v8 redeflate ladder (they use L9/preflate) — a BGZF producer at level 6 goes preflate rather than exact-redeflate; wiring the ladder into gz members is a future ratio tick.
+
 ## Current state (2026-07-23, v8 redeflate ladder shipped — Crown-A losses flipped)
 
 The one competitor-loss class from the 2026-07-18 Crown-A bench is closed. A 2026-07-23 instrument-first probe (throwaway branch, abandoned) established that every xtool|xz *loss* — pure-py wheel −0.76%, APK −0.07%, PDF-class — is plain **zlib level-6** (Python zipfile / Android / git defaults) that our L9-only redeflate fast path missed, falling to a costlier preflate diff. A stock-zlib grid-search exact-reproduced 12/12 wheel, 16/16 APK, 4/4 test.pdf, 96/96 git-packfile preflate streams (0 misses); arxiv.pdf's 40 streams are non-zlib (pdfTeX/GS) and correctly stay preflate. The probe *reversed* the earlier preflate-rs plan — a ~40-line in-house ladder suffices for the losses, with no Rust/FFI dependency.
@@ -545,6 +554,13 @@ Predicted shape held: mixed-content `.tar.xz` ties xz-9e (xz already crushes mix
 ---
 
 ## Shipped milestone details
+
+### v9 multi-member gzip — BGZF / pgzip / concatenated .gz (shipped 2026-07-23)
+- **What it does:** `pack_gz` walks gzip members instead of assuming one. It parses each member header (`gz_hdr_len`), inflates the body with `raw_inflate_span` (new deflate.c primitive that reports bytes consumed, so the member trailer + next member can be located), verifies the crc32/isize trailer, and reproduces the body via L9-redeflate or preflate (`gz_member_mode`). The KIND_GZIP recipe now leads with a `u32` member count followed by that many blocks; `unpack_gz` loops and concatenates member outputs. ZXLE_VER 8 → 9.
+- **Compatibility of behavior:** single-member gzips (count=1) preserve the pre-v9 path exactly, including the inner-tar dispatch (`inner_kind=1`, e.g. `mixed.tar.gz`). Multi-member files force `inner_kind=0` per member (a member of a concatenated gzip is not separately tar-dispatched). Verified byte-identical: solid 0.3174 / per-file 0.3232 unchanged after the v9 bump.
+- **Instrument-first:** before implementing, measured the ceiling on compressible content — opaque (≈ xz-9e of the .gz) vs solid-xz of the inflated members = **−19.4%**; that justified the milestone (a v9 wire bump) over leaving the class opaque.
+- **Measured (all RT OK):** `tests/corpus/multi.gz` (self-contained fixture, two JSON members L6+L9) 76,876 → **44,120 vs xz-9e 76,916 (−42.6%)**. Scratch 2-member text −19.3%; edge cases (3-member, single-L6, inner-tar single-member) all RT OK. Full bench 121/121 RT OK.
+- **Deferred:** gz members use L9/preflate, not the v8 redeflate ladder — a level-6 BGZF member goes preflate (still a win vs opaque) rather than exact-redeflate; wiring the ladder into gz members (adding a mode-2 param path to the KIND_GZIP block) is a future ratio tick, no measured loss forcing it yet.
 
 ### v8 redeflate ladder — Crown-A deflate-repro loss fix (shipped 2026-07-23)
 - **What it does:** when a raw-deflate stream misses the L9 fast path, `redeflate_ladder_find` (deflate.c) walks a bounded zlib parameter set — level {6,5,4,7,8,9,3,2,1} × memLevel {8,9} × windowBits {−15..−11}, default strategy, ordered so real-world zlib-L6 streams match in the first few tries — and returns the two packed param bytes of the first exact byte-repro. `pack_zip` and `pack_flate_scan` emit `OP_REDEFLATE_P` (0x0B: `OP_REDEFLATE` layout + `(u8 param0)(u8 param1)`) instead of falling to a preflate diff; `recipe.c` decodes it via `redeflate_ladder_apply`. ZXLE_VER 7 → 8.
