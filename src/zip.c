@@ -193,6 +193,19 @@ static void zip_entry_payload(const uint8_t *p, const char *tmp_prefix,
                 free(raw);
             } else {
                 free(redef);
+                uint8_t lp0 = 0, lp1 = 0;
+                if (redeflate_ladder_find(raw, e->raw_size, p + e->payload_off,
+                                          e->comp_size, &lp0, &lp1)) {
+                    buf_u8(recipe, OP_REDEFLATE_P);
+                    buf_u32(recipe, e->raw_size);
+                    buf_u8(recipe, bk);
+                    buf_u8(recipe, lp0);
+                    buf_u8(recipe, lp1);
+                    buf_append(bk == 1 ? b1 : b0, raw, e->raw_size);
+                    o->redeflated++;
+                    free(raw);
+                    return;
+                }
                 uint8_t *unp = NULL, *diff = NULL, *rejoin = NULL;
                 size_t unp_n = 0, diff_n = 0, rejoin_n = 0;
                 int pf_ok = 0;

@@ -134,6 +134,11 @@ int pack_flate_scan(const uint8_t *p, size_t n, const char *tmp_prefix,
             op = OP_REDEFLATE;
         free(redef);
 
+        uint8_t lp0 = 0, lp1 = 0;
+        if (op < 0 && redeflate_ladder_find(raw, (uint32_t)raw_n, def,
+                                            (uint32_t)def_n, &lp0, &lp1))
+            op = OP_REDEFLATE_P;
+
         if (op < 0) {
             uint8_t *unp = NULL, *df = NULL, *rejoin = NULL;
             size_t unp_n = 0, df_n = 0, rejoin_n = 0;
@@ -169,6 +174,10 @@ int pack_flate_scan(const uint8_t *p, size_t n, const char *tmp_prefix,
             buf_u32(recipe, (uint32_t)diff.n);
             buf_append(recipe, diff.p, diff.n);
             preflated++;
+        } else if (op == OP_REDEFLATE_P) {
+            buf_u8(recipe, lp0);
+            buf_u8(recipe, lp1);
+            redeflated++;
         } else {
             redeflated++;
         }

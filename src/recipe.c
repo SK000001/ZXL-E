@@ -36,6 +36,20 @@ void unpack_recipe(const uint8_t *recipe, size_t rlen,
             free(df);
             s->pos[bk] += len;
             written += df_len;
+        } else if (op == OP_REDEFLATE_P) {
+            if (r + 1 > rlen) die("recipe REDEFLATE_P bucket truncated");
+            uint8_t bk = recipe[r]; r += 1;
+            if (bk >= ZXLE_NUM_BUCKETS) die("REDEFLATE_P bucket oob");
+            if (r + 2 > rlen) die("recipe REDEFLATE_P params truncated");
+            uint8_t p0 = recipe[r], p1 = recipe[r + 1]; r += 2;
+            if (s->pos[bk] + len > s->len[bk]) die("solid REDEFLATE_P overflow");
+            size_t df_len = 0;
+            uint8_t *df = redeflate_ladder_apply(s->p[bk] + s->pos[bk], len, p0, p1, &df_len);
+            if (!df) die("redeflate_ladder_apply");
+            if (fwrite(df, 1, df_len, out) != df_len) die("fwrite REDEFLATE_P");
+            free(df);
+            s->pos[bk] += len;
+            written += df_len;
         } else if (op == OP_STORE) {
             if (r + 1 > rlen) die("recipe STORE bucket truncated");
             uint8_t bk = recipe[r]; r += 1;

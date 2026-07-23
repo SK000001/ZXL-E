@@ -56,8 +56,16 @@
  * flate-scanned opaque files (pack_flate_scan: any bucket-0 file whose
  * verified zlib/JPEG spans cover >= 5%) -- identical recipe format, so
  * decode is unchanged there too.
- * v3..v7 cannot interoperate. */
-#define ZXLE_VER 7
+ * v8 (2026-07-23): redeflate ladder. New recipe op OP_REDEFLATE_P (0x0B):
+ * like OP_REDEFLATE but carries two param bytes after (u32 raw_size)(u8 bucket)
+ * that encode the zlib (level, memLevel, strategy, windowBits) set which
+ * re-deflates the solid bytes byte-identically. Emitted by pack_zip /
+ * pack_flate_scan when a stream misses the L9 fast path but a stock-zlib
+ * parameter set (typically level 6 -- Python zipfile / Android / git) exactly
+ * reproduces it, replacing a costlier OP_PREFLATE diff. Decode re-deflates at
+ * the stored params (deflate.c redeflate_ladder_apply). No other layout change.
+ * v3..v8 cannot interoperate. */
+#define ZXLE_VER 8
 
 /* Top-level container kind tag (one byte per manifest entry). */
 #define KIND_OPAQUE 0
@@ -102,6 +110,10 @@
  *                      (from pack_zip, or pack_pdf since 2026-07-17) uses
  *                      this same OP vocabulary; unpack_recipe recurses to
  *                      reconstruct `len` bytes in place.
+ *   0x0B REDEFLATE_P -- (u32 raw_size)(u8 bucket)(u8 param0)(u8 param1);
+ *                      consume raw_size bytes from solid bucket, re-deflate at
+ *                      the zlib params packed in param0/param1 (v8; see the
+ *                      version-history note and deflate.c ladder_pack), emit.
  */
 #define OP_STRUCT     0x00
 #define OP_REDEFLATE  0x01
@@ -114,6 +126,7 @@
 #define OP_XZ_STORE   0x08
 #define OP_ZSTD_STORE 0x09
 #define OP_ZIP_STORE  0x0A
+#define OP_REDEFLATE_P 0x0B
 
 /* Per-kind recipe layouts (parsed by their respective pack_<kind> and
  * unpack_<kind>):
