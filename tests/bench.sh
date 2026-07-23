@@ -764,6 +764,47 @@ if [ "${ZXLE_SLOW:-0}" = "1" ] && [ -n "$ZPAQ" ]; then
     bench_slow "MP3 (packMP3)"         tests/corpus/synth.mp3
 fi
 
+# ZXL-E --best mode (kanzi -l9 bucket-0, the fast text/source tier) vs default.
+# Gated by ZXLE_BEST=1 and presence of the kanzi binary (Windows-only build).
+# On small container fixtures the tier races default and keeps the smaller
+# (must be <= default); the big win is on large text/source (silesia).
+if [ "${ZXLE_BEST:-0}" = "1" ] && [ -x third_party/kanzi-cpp/build/kanzi_static.exe ]; then
+    echo
+    echo "=== ZXL-E --best (kanzi -l9 final-step) vs default (size + RT) ==="
+    bench_best() {
+        local label="$1" SRC="$2"
+        [ -f "$SRC" ] || return 0
+        local base; base=$(basename "$SRC")
+        local bout="tests/baseline/$base.best.zxle" bd="tests/unpacked/$base.best.d"
+        rm -f "$bout"; rm -rf "$bd"; mkdir -p "$bd"
+        local t0 be_ms un_ms BE_RT
+        t0=$EPOCHREALTIME
+        "$BIN" pack --best "$bout" "$SRC" >/dev/null 2>&1 || { echo "  $label: pack --best failed"; return 0; }
+        be_ms=$(elapsed_ms "$t0")
+        t0=$EPOCHREALTIME
+        "$BIN" unpack "$bout" "$bd" >/dev/null 2>&1 || { echo "  $label: unpack failed"; return 0; }
+        un_ms=$(elapsed_ms "$t0")
+        cmp -s "$SRC" "$bd/$base" && BE_RT=OK || BE_RT=FAIL
+        local ORIG BE DEFAULT XZ
+        ORIG=$(stat -c%s "$SRC"); BE=$(stat -c%s "$bout")
+        DEFAULT=$(stat -c%s "tests/baseline/$base.zxle" 2>/dev/null || echo 0)
+        XZ=$(xz -9e -c "$SRC" 2>/dev/null | wc -c)
+        printf "  %s (%s):\n" "$label" "$base"
+        printf "    orig=%d  zxle=%d  zxle--best=%d  xz-9e=%d  rt=%s\n" "$ORIG" "$DEFAULT" "$BE" "$XZ" "$BE_RT"
+        [ "$DEFAULT" -gt 0 ] && printf "    --best vs zxle: %s   --best vs xz-9e: %s   perf: pack=%dms unpack=%dms\n" \
+            "$(awk -v a="$BE" -v b="$DEFAULT" 'BEGIN{printf "%+.2f%%", (a-b)*100/b}')" \
+            "$(awk -v a="$BE" -v b="$XZ" 'BEGIN{printf "%+.2f%%", (a-b)*100/b}')" "$be_ms" "$un_ms"
+        rm -f "$bout"; rm -rf "$bd"
+    }
+    bench_best "DOCX (real ZIP/L6)"  tests/corpus/sample.docx
+    bench_best "JAR (real ZIP/L6)"   tests/corpus/sample.jar
+    bench_best "gz of mixed.tar"     tests/corpus/mixed.tar.gz
+    # Large text/source: the tier's raison d'etre (present with ZXLE_SILESIA).
+    bench_best "text (dickens)"      tests/corpus/silesia/dickens
+    bench_best "text (webster)"      tests/corpus/silesia/webster
+    bench_best "source (samba)"      tests/corpus/silesia/samba
+fi
+
 # ZXL-E --fast mode (xz -T0, input-scaled blocks) vs default on headline
 # fixtures. Gated by ZXLE_FAST=1. Compares against the default archives the
 # sections above just produced, so the exact per-fixture size cost of the

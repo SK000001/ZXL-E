@@ -38,6 +38,7 @@ typedef struct {
 #define CODEC_XZ_9E       0
 #define CODEC_XZ_9E_X86   1
 #define CODEC_ZPAQ_M5     2
+#define CODEC_KANZI_L9    3   /* --best: kanzi -l 9 bucket-0 (fast text/source tier) */
 
 /* Compress one solid bucket's bytes with the given codec into *payload.
  * `tag` keys the temp filenames (callers may finalize competing candidates
@@ -72,6 +73,13 @@ static void finalize_bucket(const Buf *in_buf, int codec, int fast,
         snprintf(cmd, sizeof(cmd),
                  "zpaq a \"%s\" \"%s\" -m5 >%s 2>&1",
                  tmp_payload, tmp_concat, ZXLE_DEVNULL);
+        break;
+    case CODEC_KANZI_L9:
+        /* Store the kanzi stream verbatim (self-describing; decoded with
+         * kanzi -d), like the zpaq path -- no decode-time version coupling. */
+        snprintf(cmd, sizeof(cmd),
+                 "kanzi_static -c -i \"%s\" -o \"%s\" -l 9 -j %d -f >%s 2>&1",
+                 tmp_concat, tmp_payload, zxle_ncpus(), ZXLE_DEVNULL);
         break;
     case CODEC_XZ_9E_X86:
         /* BCJ filter is recorded in the xz block header, so plain `xz -d`
@@ -119,7 +127,7 @@ static uint32_t crc32_buf(const uint8_t *p, size_t n) {
  * anything other than KIND_OPAQUE) on success. *out_size receives the
  * produced file size. */
 static int pack_run(const char *out, int n, char **files, int force_opaque,
-                    int slow, int fast, long long *out_size, uint64_t *out_total) {
+                    int codec0, int fast, long long *out_size, uint64_t *out_total) {
     PackEntry *ents = calloc((size_t)n, sizeof(PackEntry));
     if (!ents) die("calloc ents");
     /* M6: two solid buckets. solid (bucket 0) holds main-codec bytes (xz or
@@ -314,7 +322,7 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
      * always uses xz-9e with the BCJ x86 filter regardless of slow because
      * BCJ's win is filter-not-codec, and the bucket only contains x86 code. */
     int  bucket_codec[2] = {
-        slow ? CODEC_ZPAQ_M5 : CODEC_XZ_9E,
+        codec0,
         CODEC_XZ_9E_X86,
     };
     Buf  bucket_payload[2];
@@ -373,7 +381,7 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
      * Bucket-0-empty archives (blob-only) and --slow (zpaq bucket) always
      * take the split path with its raw-manifest fallback. */
     int merged = 0;
-    if (!slow && solid.n > 0) {
+    if (codec0 == CODEC_XZ_9E && solid.n > 0) {
         Buf merged0; buf_init(&merged0);
         buf_append(&merged0, mbuf.p, mbuf.n);
         buf_append(&merged0, solid.p, solid.n);
@@ -405,10 +413,11 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
     if (!o) die("fopen out");
     fwrite(ZXLE_MAGIC, 1, 4, o);
     fputc(ZXLE_VER, o);
-    /* Flags byte: bit 0 = bucket-0 codec (0 = xz-9e, 1 = zpaq -m5); bit 1 =
-     * manifest merged into bucket 0 (no manifest block after the header --
-     * the first raw_mlen bytes of decoded bucket 0 are the manifest). */
-    fputc((slow ? 0x01 : 0x00) | (merged ? 0x02 : 0x00), o);
+    /* Flags byte: bit 0 = non-default bucket-0 codec (informational only --
+     * decode dispatches on the per-bucket codec_id in the trailing payload,
+     * so xz/zpaq/kanzi are all distinguished there); bit 1 = manifest merged
+     * into bucket 0 (the first raw_mlen bytes of decoded bucket 0). */
+    fputc((codec0 != CODEC_XZ_9E ? 0x01 : 0x00) | (merged ? 0x02 : 0x00), o);
     wu32(o, (uint32_t)mbuf.n);
     wu32(o, (uint32_t)comp_mlen);
     if (!merged) {
@@ -452,10 +461,10 @@ static int pack_run(const char *out, int n, char **files, int force_opaque,
  * primary unwrap pass (>= 0 on success). *out_osz / *out_total receive the
  * final size and input total. The caller can then compare two tiers (slow
  * vs default) and keep whichever produced the smaller blob. */
-static int min_pack_for_tier(const char *out, int n, char **files, int slow,
+static int min_pack_for_tier(const char *out, int n, char **files, int codec0,
                              int fast, long long *out_osz, uint64_t *out_total) {
     long long osz = -1; uint64_t total = 0;
-    int unwrapped = pack_run(out, n, files, 0, slow, fast, &osz, &total);
+    int unwrapped = pack_run(out, n, files, 0, codec0, fast, &osz, &total);
 
     int run_opaque_pass =
         (unwrapped > 0 &&
@@ -464,7 +473,7 @@ static int min_pack_for_tier(const char *out, int n, char **files, int slow,
         char opq[1024];
         snprintf(opq, sizeof(opq), "%s.opq.tmp", out);
         long long opq_osz = -1; uint64_t opq_total = 0;
-        pack_run(opq, n, files, 1, slow, fast, &opq_osz, &opq_total);
+        pack_run(opq, n, files, 1, codec0, fast, &opq_osz, &opq_total);
         if (opq_osz > 0 && opq_osz < osz) {
             fprintf(stderr, "min-pack: opaque %lld < unwrap %lld -> using opaque\n",
                     opq_osz, osz);
@@ -488,7 +497,7 @@ typedef struct {
     const char *out;
     int          n;
     char       **files;
-    int          slow;
+    int          codec0;
     int          fast;
     long long    osz;
     uint64_t     total;
@@ -496,7 +505,7 @@ typedef struct {
 
 static void *tier_worker(void *arg) {
     TierJob *j = (TierJob *)arg;
-    min_pack_for_tier(j->out, j->n, j->files, j->slow, j->fast, &j->osz, &j->total);
+    min_pack_for_tier(j->out, j->n, j->files, j->codec0, j->fast, &j->osz, &j->total);
     return NULL;
 }
 
@@ -504,13 +513,14 @@ static int do_pack(int argc, char **argv) {
     /* Parse leading flags: --slow finalizes the solid stream with zpaq -m5
      * (cmix-class context-mixing) instead of xz -9e. 5-10x slower on raw
      * streams; closes the Silesia gap surfaced by the 2026-05-08 measurement. */
-    int slow = 0, fast = 0;
+    int codec0 = CODEC_XZ_9E, fast = 0;
     while (argc > 0 && argv[0][0] == '-') {
-        if (strcmp(argv[0], "--slow") == 0) { slow = 1; argc--; argv++; continue; }
+        if (strcmp(argv[0], "--slow") == 0) { codec0 = CODEC_ZPAQ_M5;  argc--; argv++; continue; }
+        if (strcmp(argv[0], "--best") == 0) { codec0 = CODEC_KANZI_L9; argc--; argv++; continue; }
         if (strcmp(argv[0], "--fast") == 0) { fast = 1; argc--; argv++; continue; }
         break;
     }
-    if (argc < 2) { fprintf(stderr, "usage: zxle pack [--slow] [--fast] <out.zxle> <files...>\n"); return 1; }
+    if (argc < 2) { fprintf(stderr, "usage: zxle pack [--slow|--best] [--fast] <out.zxle> <files...>\n"); return 1; }
     const char *out = argv[0];
     int n = argc - 1;
     char **files = argv + 1;
@@ -541,34 +551,34 @@ static int do_pack(int argc, char **argv) {
     long long osz; uint64_t total;
 
     /* M7 step 2: decide cross-codec eligibility upfront (sum input sizes via
-     * stat) so we can spawn the slow + default tiers concurrently rather than
-     * serially. Non-eligible runs (no --slow, or total >= 1 MB) fall through
-     * to a single sequential tier as before. */
+     * stat) so we can spawn the non-default (zpaq/kanzi) + default tiers
+     * concurrently rather than serially. Non-eligible runs (default codec, or
+     * total >= 1 MB) fall through to a single sequential tier as before. */
     uint64_t total_in = 0;
-    if (slow) {
+    if (codec0 != CODEC_XZ_9E) {
         for (int i = 0; i < n; i++) {
             struct stat st;
             if (stat(files[i], &st) == 0) total_in += (uint64_t)st.st_size;
         }
     }
 
-    if (slow && total_in < (uint64_t)1024 * 1024) {
+    if (codec0 != CODEC_XZ_9E && total_in < (uint64_t)1024 * 1024) {
         char def_path[1024];
         snprintf(def_path, sizeof(def_path), "%s.def.tmp", out);
-        TierJob slow_job = { out,      n, files, 1, fast, -1, 0 };
-        TierJob def_job  = { def_path, n, files, 0, fast, -1, 0 };
-        pthread_t th_slow, th_def;
-        int spawn_slow = pthread_create(&th_slow, NULL, tier_worker, &slow_job);
-        int spawn_def  = pthread_create(&th_def,  NULL, tier_worker, &def_job);
-        if (spawn_slow != 0) tier_worker(&slow_job);
-        if (spawn_def  != 0) tier_worker(&def_job);
-        if (spawn_slow == 0) pthread_join(th_slow, NULL);
-        if (spawn_def  == 0) pthread_join(th_def,  NULL);
-        osz   = slow_job.osz;
-        total = slow_job.total;
-        if (def_job.osz > 0 && def_job.osz < slow_job.osz) {
-            fprintf(stderr, "min-pack: default %lld < slow %lld -> using default\n",
-                    def_job.osz, slow_job.osz);
+        TierJob nd_job  = { out,      n, files, codec0,      fast, -1, 0 };
+        TierJob def_job = { def_path, n, files, CODEC_XZ_9E, fast, -1, 0 };
+        pthread_t th_nd, th_def;
+        int spawn_nd  = pthread_create(&th_nd,  NULL, tier_worker, &nd_job);
+        int spawn_def = pthread_create(&th_def, NULL, tier_worker, &def_job);
+        if (spawn_nd  != 0) tier_worker(&nd_job);
+        if (spawn_def != 0) tier_worker(&def_job);
+        if (spawn_nd  == 0) pthread_join(th_nd,  NULL);
+        if (spawn_def == 0) pthread_join(th_def, NULL);
+        osz   = nd_job.osz;
+        total = nd_job.total;
+        if (def_job.osz > 0 && def_job.osz < nd_job.osz) {
+            fprintf(stderr, "min-pack: default %lld < tier %lld -> using default\n",
+                    def_job.osz, nd_job.osz);
             unlink(out);
             if (rename(def_path, out) != 0) die("rename def->out");
             osz = def_job.osz;
@@ -576,7 +586,7 @@ static int do_pack(int argc, char **argv) {
             unlink(def_path);
         }
     } else {
-        min_pack_for_tier(out, n, files, slow, fast, &osz, &total);
+        min_pack_for_tier(out, n, files, codec0, fast, &osz, &total);
     }
 
     fprintf(stderr, "packed %d file(s), orig=%llu zxle=%lld ratio=%.4f\n",
@@ -662,6 +672,12 @@ static uint8_t *decompress_bucket(FILE *f, uint64_t csize, uint8_t codec_id,
         char rmcmd[2048];
         snprintf(rmcmd, sizeof(rmcmd), "rm -rf \"%s\" >%s 2>&1", recdir, ZXLE_DEVNULL);
         run(rmcmd);
+    } else if (codec_id == CODEC_KANZI_L9) {
+        /* kanzi is a straight file->file codec (self-describing stream). */
+        snprintf(cmd, sizeof(cmd),
+                 "kanzi_static -d -i \"%s\" -o \"%s\" -j %d -f >%s 2>&1",
+                 tmp_in, tmp_out, zxle_ncpus(), ZXLE_DEVNULL);
+        run(cmd);
     } else {
         /* CODEC_XZ_9E and CODEC_XZ_9E_X86 both decode via plain `xz -d` --
          * the BCJ filter is recorded in the xz block header so the decoder
@@ -949,6 +965,7 @@ static void prepend_third_party_to_path(const char *argv0) {
         "third_party/packmp3/source",
         "third_party/packjpg/source",
         "third_party/zpaq",
+        "third_party/kanzi-cpp/build",
     };
     for (size_t i = 0; i < sizeof(subdirs)/sizeof(subdirs[0]); i++) {
         char candidate[2048];
