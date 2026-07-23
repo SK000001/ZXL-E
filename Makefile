@@ -4,6 +4,15 @@ CFLAGS  ?= -O3 -march=native -Wall -Wextra -Wno-unused-parameter -std=c11
 CXXFLAGS ?= -O3 -march=native -Wall -Wextra -std=c++14
 LDFLAGS ?= -lz -lstdc++ -lpthread
 
+# MinGW: build against the ANSI/C99 stdio so `%zu` and friends both work at
+# runtime and are recognized by gcc's format checker (silences spurious
+# -Wformat warnings on the size_t debug prints). No-op / not needed elsewhere;
+# glibc handles %zu natively.
+ifeq ($(OS),Windows_NT)
+CFLAGS   += -D__USE_MINGW_ANSI_STDIO=1
+CXXFLAGS += -D__USE_MINGW_ANSI_STDIO=1
+endif
+
 PREFLATE_DIR = third_party/preflate
 PREFLATE_LIB = $(PREFLATE_DIR)/build/libpreflate.a
 PREFLATE_INC = -I$(PREFLATE_DIR)
