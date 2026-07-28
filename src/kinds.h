@@ -75,8 +75,16 @@
  * every member and force inner_kind = 0 per member. Unwraps concatenated-gzip
  * classes that previously fell to KIND_OPAQUE (measured ceiling −19% vs opaque
  * on compressible content).
- * v3..v9 cannot interoperate. */
-#define ZXLE_VER 9
+ * v10 (2026-07-27): gzip members gain the v8 redeflate ladder. The KIND_GZIP
+ * member `mode` byte adds value 2: when a member body misses the raw-deflate
+ * L9 fast path but a stock-zlib parameter set (typically level 6 -- BGZF,
+ * pgzip, Android/git-produced .gz) exactly reproduces it, the member stores
+ * two ladder param bytes (u8 param0)(u8 param1) in place of the mode==1
+ * preflate diff and decode re-deflates at those params (deflate.c
+ * redeflate_ladder_apply), replacing the costlier preflate diff. Same param
+ * packing as OP_REDEFLATE_P. No other layout change.
+ * v3..v10 cannot interoperate. */
+#define ZXLE_VER 10
 
 /* Top-level container kind tag (one byte per manifest entry). */
 #define KIND_OPAQUE 0
@@ -157,10 +165,12 @@
  *   u32 n_members                 -- v9: gzip member count (1 = classic single)
  *   per member (n_members blocks):
  *     u32 hdr_len  hdr_bytes
- *     u8  mode                    -- 0 = raw-deflate L9 redeflate matches; 1 = preflate
+ *     u8  mode                    -- 0 = raw-deflate L9 redeflate matches;
+ *                                    1 = preflate; 2 = redeflate ladder (v10)
  *     u32 raw_len                 -- inflated body size
  *     u32 def_len                 -- length of original raw deflate body
  *     [if mode==1] u32 diff_len  diff_bytes
+ *     [if mode==2] u8 param0  u8 param1   -- v10 ladder zlib params
  *     u8  trailer[8]              -- CRC32 LE + ISIZE LE, verbatim
  *     u8  inner_kind              -- 0 = inflated bytes consumed verbatim; 1 = nested ustar tar
  *                                    (inner_kind==1 only occurs when n_members==1)

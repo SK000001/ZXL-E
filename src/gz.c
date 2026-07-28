@@ -26,14 +26,20 @@ static size_t gz_hdr_len(const uint8_t *p, size_t n, size_t cur) {
 }
 
 /* Decide the reproduction mode for one member's deflate body: 0 = raw-deflate
- * L9 matches, 1 = preflate (fills *diff), -1 = neither. */
+ * L9 matches, 2 = redeflate ladder (fills p0,p1), 1 = preflate (fills diff),
+ * -1 = neither. */
 static int gz_member_mode(const uint8_t *def, size_t def_n,
-                          const uint8_t *raw, size_t raw_n, Buf *diff) {
+                          const uint8_t *raw, size_t raw_n, Buf *diff,
+                          uint8_t *p0, uint8_t *p1) {
+    *p0 = 0; *p1 = 0;
     size_t rn = 0;
     uint8_t *redef = raw_deflate_l9(raw, (uint32_t)raw_n, &rn);
     int mode = -1;
     if (redef && rn == def_n && memcmp(redef, def, def_n) == 0) mode = 0;
     free(redef);
+    if (mode < 0 && def_n <= 0xFFFFFFFFu &&
+        redeflate_ladder_find(raw, (uint32_t)raw_n, def, (uint32_t)def_n, p0, p1))
+        mode = 2;
     if (mode < 0) {
         uint8_t *unp = NULL, *df = NULL, *rj = NULL;
         size_t un = 0, dn = 0, rjn = 0;
@@ -54,13 +60,15 @@ static int gz_member_mode(const uint8_t *def, size_t def_n,
 static void emit_gz_member(Buf *recipe, Buf *b0, Buf *b1,
                            const uint8_t *hdr, size_t hdr_len, int mode,
                            const uint8_t *raw, size_t raw_n, size_t def_n,
-                           const Buf *diff, const uint8_t *trailer, uint8_t bucket) {
+                           const Buf *diff, uint8_t p0, uint8_t p1,
+                           const uint8_t *trailer, uint8_t bucket) {
     buf_u32(recipe, (uint32_t)hdr_len);
     buf_append(recipe, hdr, hdr_len);
     buf_u8(recipe, (uint8_t)mode);
     buf_u32(recipe, (uint32_t)raw_n);
     buf_u32(recipe, (uint32_t)def_n);
     if (mode == 1) { buf_u32(recipe, (uint32_t)diff->n); buf_append(recipe, diff->p, diff->n); }
+    else if (mode == 2) { buf_u8(recipe, p0); buf_u8(recipe, p1); }
     buf_append(recipe, trailer, 8);
     buf_u8(recipe, 0);          /* inner_kind = 0 */
     buf_u8(recipe, bucket);
@@ -102,7 +110,8 @@ int pack_gz(const uint8_t *p, size_t n, const char *tmp_prefix,
     if (member1_end == n) {
         /* ---- single member: full behavior incl. inner-tar dispatch ---- */
         Buf diff; buf_init(&diff);
-        int mode = gz_member_mode(def, def_n, raw, raw_n, &diff);
+        uint8_t p0 = 0, p1 = 0;
+        int mode = gz_member_mode(def, def_n, raw, raw_n, &diff, &p0, &p1);
         if (mode < 0) { free(raw); buf_free(&diff); return -1; }
         uint8_t bk = bucket_for_bytes(raw, raw_n);
 
@@ -128,6 +137,7 @@ int pack_gz(const uint8_t *p, size_t n, const char *tmp_prefix,
             buf_u32(recipe, (uint32_t)raw_n);
             buf_u32(recipe, (uint32_t)def_n);
             if (mode == 1) { buf_u32(recipe, (uint32_t)diff.n); buf_append(recipe, diff.p, diff.n); }
+            else if (mode == 2) { buf_u8(recipe, p0); buf_u8(recipe, p1); }
             buf_append(recipe, trailer, 8);
             buf_u8(recipe, 1);        /* inner_kind */
             buf_u8(recipe, bk);
@@ -136,7 +146,7 @@ int pack_gz(const uint8_t *p, size_t n, const char *tmp_prefix,
             buf_append(b0, tar_b0.p, tar_b0.n);
             buf_append(b1, tar_b1.p, tar_b1.n);
         } else {
-            emit_gz_member(recipe, b0, b1, p, hdr_len, mode, raw, raw_n, def_n, &diff, trailer, bk);
+            emit_gz_member(recipe, b0, b1, p, hdr_len, mode, raw, raw_n, def_n, &diff, p0, p1, trailer, bk);
         }
         fprintf(stderr, "    gz: 1 member def=%lu raw=%lu mode=%d%s b=%u\n",
                 (unsigned long)def_n, (unsigned long)raw_n, mode,
@@ -154,11 +164,12 @@ int pack_gz(const uint8_t *p, size_t n, const char *tmp_prefix,
     /* member 1 (already inflated above) */
     {
         Buf diff; buf_init(&diff);
-        int mode = gz_member_mode(def, def_n, raw, raw_n, &diff);
+        uint8_t p0 = 0, p1 = 0;
+        int mode = gz_member_mode(def, def_n, raw, raw_n, &diff, &p0, &p1);
         if (mode < 0) { ok = 0; }
         else {
             uint8_t bk = bucket_for_bytes(raw, raw_n);
-            emit_gz_member(&rtmp, &tb0, &tb1, p, hdr_len, mode, raw, raw_n, def_n, &diff, trailer, bk);
+            emit_gz_member(&rtmp, &tb0, &tb1, p, hdr_len, mode, raw, raw_n, def_n, &diff, p0, p1, trailer, bk);
             n_members = 1;
         }
         buf_free(&diff);
@@ -170,11 +181,12 @@ int pack_gz(const uint8_t *p, size_t n, const char *tmp_prefix,
         size_t hk = 0, ck = 0, rk = 0; uint8_t *rawk = NULL; const uint8_t *tk = NULL;
         if (gz_read_member(p, n, cur, &hk, &rawk, &rk, &ck, &tk) != 0) { ok = 0; break; }
         Buf diff; buf_init(&diff);
-        int mode = gz_member_mode(p + cur + hk, ck, rawk, rk, &diff);
+        uint8_t p0 = 0, p1 = 0;
+        int mode = gz_member_mode(p + cur + hk, ck, rawk, rk, &diff, &p0, &p1);
         if (mode < 0) { ok = 0; }
         else {
             uint8_t bk = bucket_for_bytes(rawk, rk);
-            emit_gz_member(&rtmp, &tb0, &tb1, p + cur, hk, mode, rawk, rk, ck, &diff, tk, bk);
+            emit_gz_member(&rtmp, &tb0, &tb1, p + cur, hk, mode, rawk, rk, ck, &diff, p0, p1, tk, bk);
             n_members++;
             cur += hk + ck + 8;
         }
@@ -213,11 +225,15 @@ void unpack_gz(const uint8_t *recipe, size_t rlen,
         uint32_t raw_len = r32(recipe + r); r += 4;
         uint32_t def_len = r32(recipe + r); r += 4;
         const uint8_t *diff = NULL; uint32_t diff_len = 0;
+        uint8_t lp0 = 0, lp1 = 0;
         if (mode == 1) {
             if (r + 4 > rlen) die("gz diff len truncated");
             diff_len = r32(recipe + r); r += 4;
             if (r + diff_len > rlen) die("gz diff overflow");
             diff = recipe + r; r += diff_len;
+        } else if (mode == 2) {
+            if (r + 2 > rlen) die("gz ladder params truncated");
+            lp0 = recipe[r]; lp1 = recipe[r + 1]; r += 2;
         }
         if (r + 8 > rlen) die("gz trailer truncated");
         const uint8_t *trailer = recipe + r; r += 8;
@@ -257,6 +273,9 @@ void unpack_gz(const uint8_t *recipe, size_t rlen,
         if (mode == 0) {
             def_buf = raw_deflate_l9(raw, raw_len, &def_n);
             if (!def_buf) die("gz raw_deflate_l9");
+        } else if (mode == 2) {
+            def_buf = redeflate_ladder_apply(raw, raw_len, lp0, lp1, &def_n);
+            if (!def_buf) die("gz redeflate_ladder_apply");
         } else {
             if (!zxle_preflate_join(raw, raw_len, diff, diff_len, &def_buf, &def_n))
                 die("gz preflate_join");
@@ -267,7 +286,7 @@ void unpack_gz(const uint8_t *recipe, size_t rlen,
         if (def_n > 0 && fwrite(def_buf, 1, def_n, out) != def_n) die("fwrite gz body");
         if (fwrite(trailer, 1, 8, out) != 8) die("fwrite gz trailer");
 
-        if (mode == 0) free(def_buf); else zxle_preflate_free(def_buf);
+        if (mode == 1) zxle_preflate_free(def_buf); else free(def_buf);
         free(raw_buf);
         written += (uint64_t)hdr_len + def_n + 8;
     }
