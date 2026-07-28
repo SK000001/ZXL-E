@@ -6,6 +6,14 @@ Historical record of shipped milestones, completed bench measurements, current-s
 
 ## Current-state log (most recent first)
 
+## Current state (2026-07-29, v10 — redeflate ladder wired into gzip members)
+
+Closes the v9 follow-up flagged in the 2026-07-23b entry below: multi-member gzip members reproduced their deflate bodies with raw-deflate L9 or, on a miss, a preflate diff — so level-6 members (BGZF `.bam` genomics, klauspost pgzip, Android/git-produced `.gz`) fell to the costlier preflate diff instead of an exact re-deflate. That is the exact class the v8 `OP_REDEFLATE_P` ladder already fixed for zip/pdf streams; this ship extends it to gzip members.
+
+- **`gz_member_mode` (gz.c)** now tries `redeflate_ladder_find` between the L9 check and the preflate fallback. A match stores **`mode=2`** plus two zlib param bytes (level/memLevel/strategy/windowBits, same packing as `OP_REDEFLATE_P`) in place of the preflate diff; `unpack_gz` re-deflates at those params via `redeflate_ladder_apply`. No new op — the v8 ladder primitives are reused. **ZXLE_VER 9 → 10** (the KIND_GZIP member `mode` byte gains value 2).
+- **Measured (all RT OK, byte-identical):** `multi.gz` 44,120 → **44,104** (−16 B; its one L6 member flips preflate→ladder), −42.66% vs xz-9e. An 8-member all-L6 BGZF-shaped scratch fixture: **−92 B** (~11.5 B/member) — the saving scales with member count, so a real BGZF file with thousands of members benefits proportionally.
+- **No regressions:** full bench **122/122 RT OK**, solid **0.3174** (2,193,241) and per-file **0.3232** byte-identical to v9 — single-member gzips that hit L9/preflate are unchanged; only L9-miss members the ladder can reproduce flip to a smaller `mode=2`. (Lone bench non-OK stays precomp failing to precompress the Go-gzip alpine layer — a competitor limitation.)
+
 ## Current state (2026-07-23c, --best tier shipped — kanzi -l9 bucket-0, the fast dense text/source tier)
 
 Third ship of the day. Program item 3 (text middle tier). Instrument-first, kanzi -l9 (already built as a competitor, zero new dependency) was measured as a pareto point between default (xz-9e) and --slow (zpaq-m5): on dickens it lands −24.4% vs xz in ~2s, just +2.2% behind zpaq-m5's −26.0% but ~15× faster (2s vs 22s). Shipped as a new bucket-0 finalize codec.
